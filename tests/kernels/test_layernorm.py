@@ -15,6 +15,7 @@ SEEDS = [0]
 @pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cuda')])
 @torch.inference_mode()
 def test_rms_norm(
     num_tokens: int,
@@ -22,14 +23,17 @@ def test_rms_norm(
     add_residual: bool,
     dtype: torch.dtype,
     seed: int,
+    device: torch.device,
 ) -> None:
     torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
 
-    layer = RMSNorm(hidden_size).to(dtype).cuda()
+    if device == torch.device('cuda'):
+        torch.cuda.manual_seed(seed)
+
+    layer = RMSNorm(hidden_size).to(dtype=dtype, device=device)
     layer.weight.data.normal_(mean=1.0, std=0.1)
     scale = 1 / (2 * hidden_size)
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
     x *= scale
     residual = torch.randn_like(x) * scale if add_residual else None
 
@@ -45,3 +49,21 @@ def test_rms_norm(
         assert torch.allclose(out[1], ref_out[1], atol=1e-2, rtol=1e-2)
     else:
         assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("hidden_size", [64, 768, 2048, 5120, 8192])
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@pytest.mark.parametrize("dtype", [torch.float, torch.bfloat16])
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cpu')])
+@torch.inference_mode()
+def test_rms_norm_cpu(
+    num_tokens: int,
+    hidden_size: int,
+    add_residual: bool,
+    dtype: torch.dtype,
+    seed: int,
+    device: torch.device,
+) -> None:
+    test_rms_norm(num_tokens, hidden_size, add_residual, dtype, seed, device)

@@ -227,11 +227,11 @@ class LLMEngine:
         logger.info(f"# GPU blocks: {num_gpu_blocks}, "
                     f"# CPU blocks: {num_cpu_blocks}")
 
-        if num_gpu_blocks <= 0:
+        if num_gpu_blocks < 0 or (not self.cache_config.cpu_only and num_gpu_blocks == 0):
             raise ValueError("No available memory for the cache blocks. "
                              "Try increasing `gpu_memory_utilization` when "
                              "initializing the engine.")
-        max_seq_len = self.cache_config.block_size * num_gpu_blocks
+        max_seq_len = self.cache_config.block_size * (num_gpu_blocks if not self.cache_config.cpu_only else num_cpu_blocks)
         if self.model_config.max_model_len > max_seq_len:
             raise ValueError(
                 f"The model's max seq len ({self.model_config.max_model_len}) "

@@ -23,6 +23,7 @@ SEEDS = [0]
 @pytest.mark.parametrize("rotary_dim", ROTARY_DIMS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cuda')])
 @torch.inference_mode()
 def test_rotary_embedding(
     is_neox_style: bool,
@@ -32,6 +33,7 @@ def test_rotary_embedding(
     head_size: int,
     rotary_dim: Optional[int],
     dtype: torch.dtype,
+    device: torch.device,
     seed: int,
     max_position: int = 8192,
     base: int = 10000,
@@ -39,21 +41,23 @@ def test_rotary_embedding(
     if rotary_dim is None:
         rotary_dim = head_size
     torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+
+    if device == torch.device('cuda'):
+        torch.cuda.manual_seed(seed)
 
     if rotary_dim is None:
         rotary_dim = head_size
     rope = get_rope(head_size, rotary_dim, max_position, base, is_neox_style)
-    rope = rope.to(dtype).cuda()
+    rope = rope.to(dtype=dtype, device=device)
 
     positions = torch.randint(0,
                               max_position, (batch_size, seq_len),
-                              device="cuda")
+                              device=device)
     query = torch.randn(batch_size,
                         seq_len,
                         num_heads * head_size,
                         dtype=dtype,
-                        device="cuda")
+                        device=device)
     key = torch.randn_like(query)
 
     # NOTE(woosuk): The reference implementation should be executed first
@@ -63,3 +67,31 @@ def test_rotary_embedding(
     # Compare the results.
     assert torch.allclose(out_query, ref_query, atol=1e-5, rtol=1e-5)
     assert torch.allclose(out_key, ref_key, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("is_neox_style", [True])
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("seq_len", SEQ_LENS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("rotary_dim", ROTARY_DIMS)
+@pytest.mark.parametrize("dtype", [torch.float, torch.bfloat16])
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cpu')])
+@torch.inference_mode()
+def test_rotary_embedding_cpu(
+    is_neox_style: bool,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_size: int,
+    rotary_dim: Optional[int],
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+    max_position: int = 8192,
+    base: int = 10000,
+) -> None:
+    test_rotary_embedding(is_neox_style, batch_size, seq_len, num_heads,
+                          head_size, rotary_dim, dtype, device, seed,
+                          max_position, base)

@@ -58,8 +58,8 @@ def ref_single_query_cached_kv_attention(
     block_size = value_cache.shape[3]
     num_seqs = query.shape[0]
 
-    block_tables = block_tables.cpu().tolist()
-    context_lens = context_lens.cpu().tolist()
+    block_tables = block_tables.cpu()
+    context_lens = context_lens.cpu()
     for i in range(num_seqs):
         q = query[i].unsqueeze(0)
         block_table = block_tables[i]
@@ -105,6 +105,8 @@ def ref_single_query_cached_kv_attention(
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cuda')])
+@torch.inference_mode()
 def test_paged_attention(
     kv_cache_factory,
     version: str,
@@ -114,11 +116,14 @@ def test_paged_attention(
     use_alibi: bool,
     block_size: int,
     dtype: torch.dtype,
+    device: torch.device,
     seed: int,
 ) -> None:
     random.seed(seed)
     torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+
+    if device == torch.device("cuda"):
+        torch.cuda.manual_seed(seed)
 
     scale = float(1.0 / (head_size**0.5))
     num_query_heads, num_kv_heads = num_heads
@@ -126,7 +131,7 @@ def test_paged_attention(
                         num_query_heads,
                         head_size,
                         dtype=dtype,
-                        device="cuda")
+                        device=device)
     query.uniform_(-scale, scale)
 
     assert num_query_heads % num_kv_heads == 0
@@ -135,12 +140,12 @@ def test_paged_attention(
     if use_alibi:
         alibi_slopes = torch.randn(num_query_heads,
                                    dtype=torch.float,
-                                   device="cuda")
+                                   device=device)
 
     context_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
     context_lens[-1] = MAX_SEQ_LEN
     max_context_len = max(context_lens)
-    context_lens = torch.tensor(context_lens, dtype=torch.int, device="cuda")
+    context_lens = torch.tensor(context_lens, dtype=torch.int, device=device)
 
     # Create the block tables.
     max_num_blocks_per_seq = (max_context_len + block_size - 1) // block_size
@@ -151,12 +156,12 @@ def test_paged_attention(
             for _ in range(max_num_blocks_per_seq)
         ]
         block_tables.append(block_table)
-    block_tables = torch.tensor(block_tables, dtype=torch.int, device="cuda")
+    block_tables = torch.tensor(block_tables, dtype=torch.int, device=device)
 
     # Create the KV caches.
     key_caches, value_caches = kv_cache_factory(NUM_BLOCKS, block_size, 1,
                                                 num_kv_heads, head_size, dtype,
-                                                seed)
+                                                device, seed)
     key_cache, value_cache = key_caches[0], value_caches[0]
 
     # Call the paged attention kernel.
@@ -230,6 +235,34 @@ def test_paged_attention(
     assert torch.allclose(output, ref_output, atol=1e-3, rtol=1e-5)
 
 
+@pytest.mark.parametrize("version", ["v1"])
+@pytest.mark.parametrize("num_seqs", NUM_GEN_SEQS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("use_alibi", [False])
+@pytest.mark.parametrize(
+    "block_size", [16]
+)  # FIXME: Currently we only use 16 due to the limitation of the YMM register number.
+@pytest.mark.parametrize("dtype", [torch.float, torch.bfloat16])
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cpu')])
+@torch.inference_mode()
+def test_paged_attention_cpu(
+    kv_cache_factory,
+    version: str,
+    num_seqs: int,
+    num_heads: Tuple[int, int],
+    head_size: int,
+    use_alibi: bool,
+    block_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+) -> None:
+    test_paged_attention(kv_cache_factory, version, num_seqs, num_heads,
+                         head_size, use_alibi, block_size, dtype, device, seed)
+
+
 def ref_multi_query_kv_attention(
     cu_seq_lens: List[int],
     query: torch.Tensor,
@@ -237,6 +270,7 @@ def ref_multi_query_kv_attention(
     value: torch.Tensor,
     scale: float,
     dtype: torch.dtype,
+    device: torch.device,
 ) -> torch.Tensor:
     num_seqs = len(cu_seq_lens) - 1
     ref_outputs = []
@@ -249,7 +283,7 @@ def ref_multi_query_kv_attention(
         attn_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=dtype),
                                diagonal=1)
         attn_mask = attn_mask * torch.finfo(dtype).min
-        attn_mask = attn_mask.to(dtype=dtype, device="cuda")
+        attn_mask = attn_mask.to(dtype=dtype, device=device)
 
         ref_output = ref_masked_attention(
             query[start_idx:end_idx],
@@ -269,17 +303,21 @@ def ref_multi_query_kv_attention(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cuda')])
 @torch.inference_mode()
 def test_multi_query_kv_attention(
     num_seqs: int,
     num_heads: Tuple[int, int],
     head_size: int,
     dtype: torch.dtype,
+    device: torch.device,
     seed: int,
 ) -> None:
     random.seed(seed)
     torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+
+    if device == torch.device('cuda'):
+        torch.cuda.manual_seed(seed)
 
     # MAX_SEQ_LEN sometimes causes OOM in the reference implementation.
     # As the xformers library is already tested with its own tests, we can use
@@ -294,7 +332,7 @@ def test_multi_query_kv_attention(
                       num_query_heads + 2 * num_kv_heads,
                       head_size,
                       dtype=dtype,
-                      device="cuda")
+                      device=device)
     qkv.uniform_(-scale, scale)
     query, key, value = qkv.split(
         [num_query_heads, num_kv_heads, num_kv_heads], dim=1)
@@ -304,26 +342,48 @@ def test_multi_query_kv_attention(
         # Handle MQA and GQA
         key = torch.repeat_interleave(key, num_queries_per_kv, dim=1)
         value = torch.repeat_interleave(value, num_queries_per_kv, dim=1)
+
+    output = None
     attn_bias = BlockDiagonalCausalMask.from_seqlens(seq_lens)
-    output = xops.memory_efficient_attention_forward(
-        query.unsqueeze(0),
-        key.unsqueeze(0),
-        value.unsqueeze(0),
-        attn_bias=attn_bias,
-        p=0.0,
-        scale=scale,
-    )
-    output = output.squeeze(0)
+    if device == torch.device("cuda"):
+        output = xops.memory_efficient_attention_forward(
+            query.unsqueeze(0),
+            key.unsqueeze(0),
+            value.unsqueeze(0),
+            attn_bias=attn_bias,
+            p=0.0,
+            scale=scale,
+        )
+        output = output.squeeze(0)
+    else:
+        output = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1),
+            attn_bias.materialize((1, num_tokens, num_tokens), dtype=dtype),
+            0.0).transpose(0, 1)
 
     cu_seq_lens = [0]
     for seq_len in seq_lens:
         cu_seq_lens.append(cu_seq_lens[-1] + seq_len)
-    ref_output = ref_multi_query_kv_attention(
-        cu_seq_lens,
-        query,
-        key,
-        value,
-        scale,
-        dtype,
-    )
-    assert torch.allclose(output, ref_output, atol=1e-3, rtol=1e-5)
+    ref_output = ref_multi_query_kv_attention(cu_seq_lens, query, key, value,
+                                              scale, dtype, device)
+    assert torch.allclose(output, ref_output, atol=1e-3,
+                          rtol=1e-5)  # type: ignore
+
+
+@pytest.mark.parametrize("num_seqs", NUM_PREFILL_SEQS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("dtype", [torch.float, torch.bfloat16])
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cpu')])
+@torch.inference_mode()
+def test_multi_query_kv_attention_cpu(
+    num_seqs: int,
+    num_heads: Tuple[int, int],
+    head_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+) -> None:
+    test_multi_query_kv_attention(num_seqs, num_heads, head_size, dtype,
+                                  device, seed)

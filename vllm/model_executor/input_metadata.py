@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 
@@ -32,8 +32,7 @@ class InputMetadata:
 
         self.is_prompt = len(prompt_lens) > 0
         # Set during the execution of the first attention op.
-        # FIXME(woosuk): This is a hack.
-        self.attn_bias = None
+        self.attn_bias: Union[torch.Tensor, None] = None
 
     def __repr__(self) -> str:
         return ("InputMetadata("
