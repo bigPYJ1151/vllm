@@ -53,8 +53,9 @@ class PagedAttention(nn.Module):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_mapping = torch.repeat_interleave(
-            torch.arange(self.num_kv_heads, dtype=torch.int32, device="cuda"),
+            torch.arange(self.num_kv_heads, dtype=torch.int32),
             self.num_queries_per_kv)
+        self.cpu_only = self.head_mapping.is_cpu
 
         if self.head_size not in _SUPPORTED_HEAD_SIZES:
             raise ValueError(f"head_size ({self.head_size}) is not supported. "
@@ -65,7 +66,6 @@ class PagedAttention(nn.Module):
         input_metadata: InputMetadata,
         dtype: torch.dtype,
     ) -> None:
-        del dtype  # Unused.
         if input_metadata.attn_bias is not None:
             # Already set by a previous layer.
             return
@@ -73,7 +73,13 @@ class PagedAttention(nn.Module):
                        ] * input_metadata.num_prompts
         attn_bias = BlockDiagonalCausalMask.from_seqlens(prompt_lens)
         if self.sliding_window is not None:
+            assert not self.cpu_only
             attn_bias = attn_bias.make_local_attention(self.sliding_window)
+        if self.cpu_only:
+            attn_bias = attn_bias.materialize(
+                (1, input_metadata.num_prompt_tokens,
+                 input_metadata.num_prompt_tokens),
+                dtype=dtype)
         input_metadata.attn_bias = attn_bias
 
     def multi_query_kv_attention(
@@ -113,7 +119,11 @@ class PagedAttention(nn.Module):
             attn_bias=input_metadata.attn_bias,
             p=0.0,
             scale=self.scale,
-        )
+        ).squeeze(
+            0
+        ) if not self.cpu_only else torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1),
+            input_metadata.attn_bias, 0.0).transpose(0, 1)
         # TODO(woosuk): Unnecessary copy. Optimize.
         output.copy_(out.view_as(output))
         return output
@@ -161,7 +171,7 @@ class PagedAttention(nn.Module):
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
         use_v1 = input_metadata.max_context_len <= 8192 and (
             max_num_partitions == 1 or num_seqs * num_heads > 512)
-        if use_v1:
+        if use_v1 or self.cpu_only:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
                 output,
@@ -178,6 +188,7 @@ class PagedAttention(nn.Module):
             )
         else:
             # Run PagedAttention V2.
+            assert not self.cpu_only
             assert _PARTITION_SIZE % block_size == 0
             tmp_output = torch.empty(
                 size=(num_seqs, num_heads, max_num_partitions, head_size),

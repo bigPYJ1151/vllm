@@ -141,7 +141,24 @@ if nvcc_cuda_version >= Version("11.2"):
     num_threads = min(os.cpu_count(), 8)
     NVCC_FLAGS += ["--threads", str(num_threads)]
 
+# Setup CPU Operations
+BUILD_CPU_OPS = os.getenv('VLLM_BUILD_CPU_OPS', "0") == "1"
+CPU_OPS_SOURCES = []
+if BUILD_CPU_OPS:
+    CXX_FLAGS += [
+        "-DVLLM_BUILD_CPU_OPS", "-fopenmp", "-mavx512f", "-mavx512bf16",
+        "-mavx512vl"
+    ]
+    CPU_OPS_SOURCES += [
+        "csrc/cpu/activation_impl.cpp",
+        "csrc/cpu/attention_impl.cpp",
+        "csrc/cpu/cache_impl.cpp",
+        "csrc/cpu/layernorm_impl.cpp",
+        "csrc/cpu/pos_encoding_impl.cpp",
+    ]
+
 ext_modules = []
+
 vllm_extension = CUDAExtension(
     name="vllm._C",
     sources=[
@@ -154,7 +171,7 @@ vllm_extension = CUDAExtension(
         "csrc/quantization/squeezellm/quant_cuda_kernel.cu",
         "csrc/cuda_utils_kernels.cu",
         "csrc/pybind.cpp",
-    ],
+    ] + CPU_OPS_SOURCES,
     extra_compile_args={
         "cxx": CXX_FLAGS,
         "nvcc": NVCC_FLAGS,

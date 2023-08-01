@@ -65,6 +65,7 @@ class ModelConfig:
         tokenizer_revision: Optional[str] = None,
         max_model_len: Optional[int] = None,
         quantization: Optional[str] = None,
+        device: str = "cuda",
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -76,6 +77,7 @@ class ModelConfig:
         self.revision = revision
         self.tokenizer_revision = tokenizer_revision
         self.quantization = quantization
+        self.device = torch.device(device)
 
         if os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true":
             # download model from ModelScope hub,
@@ -89,7 +91,7 @@ class ModelConfig:
             self.tokenizer = model_path
 
         self.hf_config = get_config(self.model, trust_remote_code, revision)
-        self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
+        self.dtype = _get_and_verify_dtype(self.hf_config, dtype, self.device)
         self.max_model_len = _get_and_verify_max_len(self.hf_config,
                                                      max_model_len)
         self._verify_load_format()
@@ -233,11 +235,13 @@ class CacheConfig:
         gpu_memory_utilization: float,
         swap_space: int,
         sliding_window: Optional[int] = None,
+        cpu_only: bool = False,
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.swap_space_bytes = swap_space * _GB
         self.sliding_window = sliding_window
+        self.cpu_only = cpu_only
         self._verify_args()
 
         # Will be set after profiling.
@@ -286,6 +290,7 @@ class ParallelConfig:
         tensor_parallel_size: int,
         worker_use_ray: bool,
         max_parallel_loading_workers: Optional[int] = None,
+        device: str = "cuda",
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
@@ -293,6 +298,16 @@ class ParallelConfig:
         self.max_parallel_loading_workers = max_parallel_loading_workers
 
         self.world_size = pipeline_parallel_size * tensor_parallel_size
+
+        self.device = torch.device(device)
+
+        if self.device == torch.device("cpu"):
+            logger.info(
+                "CPU-only mode doesn't support parallel execution currently.")
+            self.pipeline_parallel_size = 1
+            self.tensor_parallel_size = 1
+            self.world_size = 1
+
         if self.world_size > 1:
             self.worker_use_ray = True
         self._verify_args()
@@ -362,6 +377,7 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
 def _get_and_verify_dtype(
     config: PretrainedConfig,
     dtype: Union[str, torch.dtype],
+    device: torch.device,
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
@@ -386,6 +402,9 @@ def _get_and_verify_dtype(
         torch_dtype = dtype
     else:
         raise ValueError(f"Unknown dtype: {dtype}")
+
+    if torch_dtype == torch.float16 and device == torch.device("cpu"):
+        torch_dtype = torch.bfloat16
 
     # Verify the dtype.
     if torch_dtype != config_dtype:

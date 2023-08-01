@@ -24,6 +24,8 @@ def main(args: argparse.Namespace):
         max_num_batched_tokens=args.batch_size * args.input_len,
         trust_remote_code=args.trust_remote_code,
         dtype=args.dtype,
+        device=args.device,
+        swap_space=args.swap_space,
     )
 
     sampling_params = SamplingParams(
@@ -97,5 +99,15 @@ if __name__ == '__main__':
         'The "auto" option will use FP16 precision '
         'for FP32 and FP16 models, and BF16 precision '
         'for BF16 models.')
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help='device type for vLLM execution, supporting CUDA and CPU.')
+    parser.add_argument("--swap-space",
+                        type=int,
+                        default=4,
+                        help="memory space available for CPU (GB).")
     args = parser.parse_args()
     main(args)

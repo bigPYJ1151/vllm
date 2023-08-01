@@ -69,6 +69,8 @@ def run_vllm(
     use_beam_search: bool,
     trust_remote_code: bool,
     dtype: str,
+    device: str,
+    swap_space: int,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -79,6 +81,8 @@ def run_vllm(
         seed=seed,
         trust_remote_code=trust_remote_code,
         dtype=dtype,
+        device=device,
+        swap_space=swap_space,
     )
 
     # Add the requests to the engine.
@@ -105,21 +109,16 @@ def run_vllm(
     return end - start
 
 
-def run_hf(
-    requests: List[Tuple[str, int, int]],
-    model: str,
-    tokenizer: PreTrainedTokenizerBase,
-    n: int,
-    use_beam_search: bool,
-    max_batch_size: int,
-    trust_remote_code: bool,
-) -> float:
+def run_hf(requests: List[Tuple[str, int, int]], model: str,
+           tokenizer: PreTrainedTokenizerBase, n: int, use_beam_search: bool,
+           max_batch_size: int, trust_remote_code: bool) -> float:
     assert not use_beam_search
     llm = AutoModelForCausalLM.from_pretrained(
         model, torch_dtype=torch.float16, trust_remote_code=trust_remote_code)
     if llm.config.model_type == "llama":
         # To enable padding in the HF backend.
         tokenizer.pad_token = tokenizer.eos_token
+
     llm = llm.cuda()
 
     pbar = tqdm(total=len(requests))
@@ -201,7 +200,8 @@ def main(args: argparse.Namespace):
         elapsed_time = run_vllm(requests, args.model, args.tokenizer,
                                 args.quantization, args.tensor_parallel_size,
                                 args.seed, args.n, args.use_beam_search,
-                                args.trust_remote_code, args.dtype)
+                                args.trust_remote_code, args.dtype,
+                                args.device, args.swap_space)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -270,6 +270,16 @@ if __name__ == "__main__":
         'The "auto" option will use FP16 precision '
         'for FP32 and FP16 models, and BF16 precision '
         'for BF16 models.')
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help='device type for vLLM execution, supporting CUDA and CPU.')
+    parser.add_argument("--swap-space",
+                        type=int,
+                        default=4,
+                        help="memory space available for CPU (GB).")
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
