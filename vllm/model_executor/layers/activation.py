@@ -42,8 +42,10 @@ class NewGELU(nn.Module):
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         c = math.sqrt(2.0 / math.pi)
-        return 0.5 * x * (1.0 + torch.tanh(c *
-                                           (x + 0.044715 * torch.pow(x, 3.0))))
+        dtype = x.dtype
+        x = x.float()
+        return (0.5 * x * (1.0 + torch.tanh(c *
+                                           (x + 0.044715 * torch.pow(x, 3.0))))).to(dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
@@ -54,9 +56,11 @@ class NewGELU(nn.Module):
 class FastGELU(nn.Module):
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = x.float()
         """PyTorch-native implementation equivalent to forward()."""
-        return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 *
-                                           (1.0 + 0.044715 * x * x)))
+        return (0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 *
+                                           (1.0 + 0.044715 * x * x)))).to(dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
