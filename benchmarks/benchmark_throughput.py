@@ -1,3 +1,6 @@
+import sys
+sys.path.append("..")
+
 """Benchmark offline inference throughput."""
 import argparse
 import json
@@ -109,14 +112,16 @@ def run_hf(
     use_beam_search: bool,
     max_batch_size: int,
     trust_remote_code: bool,
+    cpu_only: bool
 ) -> float:
     assert not use_beam_search
     llm = AutoModelForCausalLM.from_pretrained(model,
-        torch_dtype=torch.float16, trust_remote_code=trust_remote_code)
+        torch_dtype=torch.float16 if not cpu_only else torch.float32, trust_remote_code=trust_remote_code)
     if llm.config.model_type == "llama":
         # To enable padding in the HF backend.
         tokenizer.pad_token = tokenizer.eos_token
-    llm = llm.cuda()
+    
+    llm = llm.cuda() if not cpu_only else llm.cpu()
 
     pbar = tqdm(total=len(requests))
     start = time.time()
@@ -140,7 +145,7 @@ def run_hf(
         # Generate the sequences.
         input_ids = tokenizer(batch, return_tensors="pt", padding=True).input_ids
         llm_outputs = llm.generate(
-            input_ids=input_ids.cuda(),
+            input_ids= input_ids.cuda() if not cpu_only else input_ids.cpu(),
             do_sample=not use_beam_search,
             num_return_sequences=n,
             temperature=1.0,
@@ -149,7 +154,7 @@ def run_hf(
             max_new_tokens=max_output_len,
         )
         # Include the decoding time.
-        tokenizer.batch_decode(llm_outputs, skip_special_tokens=True)
+        out = tokenizer.batch_decode(llm_outputs, skip_special_tokens=True)
         pbar.update(len(batch))
 
         # Clear the batch.
@@ -176,7 +181,7 @@ def main(args: argparse.Namespace):
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(
             requests, args.model, tokenizer, args.n, args.use_beam_search,
-            args.hf_max_batch_size, args.trust_remote_code)
+            args.hf_max_batch_size, args.trust_remote_code, args.cpu_only)
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
     total_num_tokens = sum(
@@ -207,6 +212,7 @@ if __name__ == "__main__":
     parser.add_argument('--trust-remote-code',
                         action='store_true',
                         help='trust remote code from huggingface')
+    parser.add_argument("--cpu-only", action="store_true")
     args = parser.parse_args()
 
     if args.backend == "vllm":
