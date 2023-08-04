@@ -56,7 +56,8 @@ class PagedAttention(nn.Module):
                  num_heads: int,
                  head_size: int,
                  scale: float,
-                 num_kv_heads: Optional[int] = None) -> None:
+                 num_kv_heads: Optional[int] = None,
+                 cpu_only: bool = False) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
@@ -66,7 +67,9 @@ class PagedAttention(nn.Module):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_mapping = torch.repeat_interleave(
-            torch.arange(self.num_kv_heads, dtype=torch.int32, device="cuda"),
+            torch.arange(self.num_kv_heads,
+                         dtype=torch.int32,
+                         device="cuda" if not cpu_only else "cpu"),
             self.num_queries_per_kv)
 
         if self.head_size not in _SUPPORTED_HEAD_SIZES:
@@ -259,8 +262,9 @@ class PagedAttentionWithRoPE(PagedAttention):
         base: int = 10000,
         num_kv_heads: Optional[int] = None,
         is_neox_style: bool = True,
+        cpu_only: bool = False,
     ) -> None:
-        super().__init__(num_heads, head_size, scale, num_kv_heads)
+        super().__init__(num_heads, head_size, scale, num_kv_heads, cpu_only)
         self.is_neox_style = is_neox_style
 
         # Create the cos and sin cache.

@@ -55,7 +55,7 @@ def get_model(model_config: ModelConfig) -> nn.Module:
     with _set_default_torch_dtype(model_config.dtype):
         # Create a model instance.
         # The weights will be initialized as empty tensors.
-        model = model_class(model_config.hf_config)
+        model = model_class(model_config.hf_config, model_config.cpu_only)
         if model_config.load_format == "dummy":
             model = model.cuda()
             # NOTE(woosuk): For accurate performance evaluation, we assign
@@ -65,5 +65,6 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             # Load the weights from the cached or downloaded files.
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format)
-            model = model.cuda()
+            if not model_config.cpu_only:
+                model = model.cuda()
     return model.eval()

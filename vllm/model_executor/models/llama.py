@@ -55,18 +55,22 @@ class LlamaMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        cpu_only: bool = False,
     ):
         super().__init__()
-        self.gate_up_proj = ColumnParallelLinear(hidden_size,
-                                                 2 * intermediate_size,
-                                                 bias=False,
-                                                 gather_output=False,
-                                                 perform_initialization=False)
+        self.gate_up_proj = ColumnParallelLinear(
+            hidden_size,
+            2 * intermediate_size,
+            bias=False,
+            gather_output=False,
+            perform_initialization=False,
+            use_cpu_initialization=cpu_only)
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
                                            input_is_parallel=True,
-                                           perform_initialization=False)
+                                           perform_initialization=False,
+                                           use_cpu_initialization=cpu_only)
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
@@ -87,6 +91,7 @@ class LlamaAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         rope_theta: float = 10000,
+        cpu_only: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -110,6 +115,7 @@ class LlamaAttention(nn.Module):
             bias=False,
             gather_output=False,
             perform_initialization=False,
+            use_cpu_initialization=cpu_only,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -117,13 +123,15 @@ class LlamaAttention(nn.Module):
             bias=False,
             input_is_parallel=True,
             perform_initialization=False,
+            use_cpu_initialization=cpu_only,
         )
         self.attn = PagedAttentionWithRoPE(self.num_heads,
                                            self.head_dim,
                                            self.scaling,
                                            base=self.rope_theta,
                                            rotary_dim=self.head_dim,
-                                           num_kv_heads=self.num_kv_heads)
+                                           num_kv_heads=self.num_kv_heads,
+                                           cpu_only=cpu_only)
 
     def forward(
         self,
@@ -144,7 +152,7 @@ class LlamaAttention(nn.Module):
 
 class LlamaDecoderLayer(nn.Module):
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, cpu_only: bool = False):
         super().__init__()
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
@@ -154,11 +162,13 @@ class LlamaDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             rope_theta=rope_theta,
+            cpu_only=cpu_only,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            cpu_only=cpu_only,
         )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -195,7 +205,7 @@ class LlamaDecoderLayer(nn.Module):
 
 class LlamaModel(nn.Module):
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, cpu_only: bool = False):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -203,9 +213,13 @@ class LlamaModel(nn.Module):
 
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.embed_tokens = VocabParallelEmbedding(
-            vocab_size, config.hidden_size, perform_initialization=False)
+            vocab_size,
+            config.hidden_size,
+            perform_initialization=False,
+            use_cpu_initialization=cpu_only)
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, cpu_only=cpu_only)
+            for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -237,16 +251,17 @@ class LlamaModel(nn.Module):
 
 class LlamaForCausalLM(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, cpu_only: bool = False):
         super().__init__()
         self.config = config
-        self.model = LlamaModel(config)
+        self.model = LlamaModel(config, cpu_only=cpu_only)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.lm_head = ColumnParallelLinear(config.hidden_size,
                                             vocab_size,
                                             bias=False,
                                             gather_output=False,
-                                            perform_initialization=False)
+                                            perform_initialization=False,
+                                            use_cpu_initialization=cpu_only)
         self.sampler = Sampler(config.vocab_size)
 
     def forward(

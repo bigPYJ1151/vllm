@@ -50,6 +50,7 @@ class ModelConfig:
         load_format: str,
         dtype: str,
         seed: int,
+        cpu_only: bool,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -58,10 +59,16 @@ class ModelConfig:
         self.download_dir = download_dir
         self.load_format = load_format
         self.seed = seed
+        self.cpu_only = cpu_only
 
         self.hf_config = get_config(model, trust_remote_code)
+<<<<<<< HEAD
         self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
         self._verify_load_format()
+=======
+        self.dtype = _get_and_verify_dtype(self.hf_config, dtype,
+                                           self.cpu_only)
+>>>>>>> Enable cpu_only mode for vLLM.
         self._verify_tokenizer_mode()
 
     def _verify_load_format(self) -> None:
@@ -173,10 +180,12 @@ class CacheConfig:
         block_size: int,
         gpu_memory_utilization: float,
         swap_space: int,
+        cpu_only: bool = False,
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.swap_space_bytes = swap_space * _GB
+        self.cpu_only = cpu_only
         self._verify_args()
 
         # Will be set after profiling.
@@ -219,17 +228,23 @@ class ParallelConfig:
             greater than 1.
     """
 
-    def __init__(
-        self,
-        pipeline_parallel_size: int,
-        tensor_parallel_size: int,
-        worker_use_ray: bool,
-    ) -> None:
+    def __init__(self, pipeline_parallel_size: int, tensor_parallel_size: int,
+                 worker_use_ray: bool, cpu_only: bool) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.worker_use_ray = worker_use_ray
 
         self.world_size = pipeline_parallel_size * tensor_parallel_size
+
+        self.cpu_only = cpu_only
+
+        if cpu_only:
+            logger.info(
+                "CPU-only mode doesn't support parallel execution currently.")
+            self.pipeline_parallel_size = 1
+            self.tensor_parallel_size = 1
+            self.world_size = 1
+
         if self.world_size > 1:
             self.worker_use_ray = True
         self._verify_args()
@@ -271,6 +286,7 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
 def _get_and_verify_dtype(
     config: PretrainedConfig,
     dtype: str,
+    cpu_only: bool,
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
@@ -279,16 +295,20 @@ def _get_and_verify_dtype(
         config_dtype = torch.float32
 
     dtype = dtype.lower()
-    if dtype == "auto":
-        if config_dtype == torch.float32:
-            # Following the common practice, we use float16 for float32 models.
-            torch_dtype = torch.float16
-        else:
-            torch_dtype = config_dtype
+    if cpu_only:
+        logger.info("Only float32 is supported on CPU currently.")
+        torch_dtype = torch.float32
     else:
-        if dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
-            raise ValueError(f"Unknown dtype: {dtype}")
-        torch_dtype = _STR_DTYPE_TO_TORCH_DTYPE[dtype]
+        if dtype == "auto":
+            if config_dtype == torch.float32:
+                # Following the common practice, we use float16 for float32 models.
+                torch_dtype = torch.float16
+            else:
+                torch_dtype = config_dtype
+        else:
+            if dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
+                raise ValueError(f"Unknown dtype: {dtype}")
+            torch_dtype = _STR_DTYPE_TO_TORCH_DTYPE[dtype]
 
     # Verify the dtype.
     if torch_dtype != config_dtype:
