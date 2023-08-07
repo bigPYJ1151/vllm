@@ -38,12 +38,13 @@ def test_rms_norm(
     hidden_size: int,
     dtype: torch.dtype,
     seed: int,
+    device: torch.device
 ) -> None:
     torch.random.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
     scale = float(hidden_size**-0.5)
-    x = torch.empty(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    x = torch.empty(num_tokens, hidden_size, dtype=dtype, device=device)
     x.uniform_(-scale, scale)
     ref = RefRMSNorm(hidden_size).to(dtype).cuda()
 
