@@ -491,7 +491,7 @@ void single_query_cached_kv_attention_launcher(
       break;                                                        \
   }
 
-void single_query_cached_kv_attention(
+void single_query_cached_kv_attention_gpu(
   torch::Tensor& out,             // [num_seqs, num_heads, head_size]
   torch::Tensor& query,           // [num_seqs, num_heads, head_size]
   torch::Tensor& key_cache,       // [num_blocks, num_heads, head_size/x, block_size, x]

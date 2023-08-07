@@ -36,7 +36,7 @@ __global__ void rms_norm_kernel(
 
 } // namespace vllm
 
-void rms_norm(
+void rms_norm_gpu(
   torch::Tensor& out,      // [num_tokens, hidden_size]
   torch::Tensor& input,    // [num_tokens, hidden_size]
   torch::Tensor& weight,   // [hidden_size]

@@ -25,6 +25,9 @@ release-debug:
 sanitizer:
 	echo 1 > /proc/sys/vm/overcommit_memory
 
+py_install:
+	MAX_JOBS=JOBS pip install --no-build-isolation  -v -e .
+
 HF_TP_bench:
 	cd benchmarks && python benchmark_throughput.py --backend=hf --dataset=../ShareGPT_V3_unfiltered_cleaned_split.json --model=daryl149/llama-2-7b-chat-hf --tokenizer=hf-internal-testing/llama-tokenizer --n=1 --num-prompts=10 --hf-max-batch-size=1 --trust-remote-code --cpu-only
 

@@ -26,7 +26,7 @@ __global__ void silu_and_mul_kernel(
 
 } // namespace vllm
 
-void silu_and_mul(
+void silu_and_mul_gpu(
   torch::Tensor& out,      // [num_tokens, d]
   torch::Tensor& input)    // [num_tokens, 2 * d]
 {

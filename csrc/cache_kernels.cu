@@ -8,7 +8,7 @@
 #include <map>
 #include <vector>
 
-void swap_blocks(
+void swap_blocks_gpu(
   torch::Tensor& src,
   torch::Tensor& dst,
   const std::map<int64_t, int64_t>& block_mapping) {
@@ -81,7 +81,7 @@ __global__ void copy_blocks_kernel(
 
 } // namespace vllm
 
-void copy_blocks(
+void copy_blocks_gpu(
   std::vector<torch::Tensor>& key_caches,
   std::vector<torch::Tensor>& value_caches,
   const std::map<int64_t, std::vector<int64_t>>& block_mapping) {
@@ -183,7 +183,7 @@ __global__ void reshape_and_cache_kernel(
 
 } // namespace vllm
 
-void reshape_and_cache(
+void reshape_and_cache_gpu(
   torch::Tensor& key,           // [num_tokens, num_heads, head_size]
   torch::Tensor& value,         // [num_tokens, num_heads, head_size]
   torch::Tensor& key_cache,     // [num_blocks, num_heads, head_size/x, block_size, x]
@@ -343,7 +343,7 @@ __global__ void gather_cached_kv_kernel_optimized(
 
 } // namespace vllm
 
-void gather_cached_kv(
+void gather_cached_kv_gpu(
   torch::Tensor& key,           // [out] [num_tokens, num_heads, head_size]
   torch::Tensor& value,         // [out] [num_tokens, num_heads, head_size]
   torch::Tensor& key_cache,     // [in]  [num_blocks, num_heads, head_size/x, block_size, x]

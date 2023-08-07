@@ -9,9 +9,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(PYTHON_LIB_PATH "/usr/local/lib/python3.8/dist-packages/")
+set(PYTHON_INCLUDE_PATH "/usr/include/python3.8")
 
 set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} ${PYTHON_LIB_PATH})
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/FindModules")
+
+include_directories(${PYTHON_INCLUDE_PATH})
 
 option(USE_STATIC_MKL "Prefer to link with MKL statically (Unix only)" OFF)
 

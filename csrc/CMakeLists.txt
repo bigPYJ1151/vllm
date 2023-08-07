@@ -13,8 +13,17 @@ message("MKL found: ${MKL_FOUND},
         omp type: ${MKL_OPENMP_TYPE},
         omp path: ${MKL_OPENMP_LIBRARY}")
 
-set(LIB_SOURCE_FILES my_linear_layer.cpp)
+macro(add_operator_target op_name source_file)
+add_library(${op_name} SHARED ${source_file})
+target_link_libraries(${op_name} ${TORCH_LIBRARIES} ${MKL_LIBRARIES})
+endmacro(add_operator_target)
 
-add_executable(hello_torch ${LIB_SOURCE_FILES})
+add_operator_target(layernorm layernorm.cpp)
+add_operator_target(pos_encoding pos_encoding.cpp)
+add_operator_target(cache_op "cache.cpp")
+add_operator_target(activation activation.cpp)
+add_operator_target(attention attention.cpp)
 
-target_link_libraries(hello_torch ${TORCH_LIBRARIES} ${MKL_LIBRARIES})
+set(EXE_SOURCE_FILES my_linear_layer.cpp)
+add_executable(linear ${EXE_SOURCE_FILES})
+target_link_libraries(linear ${TORCH_LIBRARIES} ${MKL_LIBRARIES})

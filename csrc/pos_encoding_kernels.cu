@@ -77,7 +77,7 @@ __global__ void rotary_embedding_kernel(
 
 } // namespace vllm
 
-void rotary_embedding(
+void rotary_embedding_gpu(
   torch::Tensor& positions,         // [num_tokens]
   torch::Tensor& query,             // [num_tokens, num_heads * head_size]
   torch::Tensor& key,               // [num_tokens, num_kv_heads * head_size]
