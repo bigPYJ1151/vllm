@@ -23,3 +23,5 @@ pprint(threadpool_info())
 
 # RMSNormBench(10, 4096, 4096, torch.float32, torch.device("cpu"))
 # Scalar: 282420151.5 ns
+# token parallel: 36635991.875 ns 7.7x
+# FMA: 36517116.125 ns

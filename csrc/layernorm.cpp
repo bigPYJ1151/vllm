@@ -10,16 +10,23 @@ void rms_norm_cpu_impl(scalar_t *__restrict__ out,
                        const scalar_t *__restrict__ input,
                        const scalar_t *__restrict__ weight, const float epsilon,
                        const int num_tokens, const int hidden_size) {
+#pragma omp parallel for
   for (int i = 0; i < num_tokens; ++i) {
     float variance = 0.0f;
+    auto input_p = input + i * hidden_size;
+    auto output_p = out + i * hidden_size;
+    // omp simd reduction is useless
     for (int j = 0; j < hidden_size; ++j) {
-      const float x = (float)input[i * hidden_size + j];
+      const float x = (float)input_p[j];
       variance += x * x;
     }
     float s_variance = 1.0f / sqrtf(variance / (float)hidden_size + epsilon);
+    // TBD: gcc compiler only use 128-bit of YMM for multiplications, can't
+    // fully leverage AVX2 TBD: SSE doesn't lead improvement for this loop,
+    // maybe due to the constant s_variance.
     for (int j = 0; j < hidden_size; ++j) {
-      float x = (float)input[i * hidden_size + j];
-      out[i * hidden_size + j] = ((scalar_t)(x * s_variance)) * weight[j];
+      float x = (float)input_p[j];
+      output_p[j] = ((scalar_t)(x * s_variance)) * weight[j];
     }
   }
 }

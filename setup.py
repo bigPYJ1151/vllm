@@ -12,7 +12,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 ROOT_DIR = os.path.dirname(__file__)
 
 # Compiler flags.
-CXX_FLAGS = ["-g", "-O2", "-std=c++17"]
+CXX_FLAGS = ["-g", "-O2", "-std=c++17", "-fopenmp", "-mfma"]
 # TODO(woosuk): Should we use -O3?
 NVCC_FLAGS = ["-O2", "-std=c++17"]
 
