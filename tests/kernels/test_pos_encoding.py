@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm import pos_encoding_ops
+import sys
 
 IS_NEOX_STYLE = [True, False]
 DTYPES = [torch.half, torch.bfloat16, torch.float]
@@ -113,6 +114,7 @@ def test_rotary_embedding(
     head_size: int,
     rotary_dim: Optional[int],
     dtype: torch.dtype,
+    device: torch.device,
     seed: int,
     max_position: int = 8192,
     base: int = 10000,
@@ -140,7 +142,7 @@ def test_rotary_embedding(
     cos = freqs.cos()
     sin = freqs.sin()
     cos_sin_cache = torch.cat((cos, sin), dim=-1)
-    cos_sin_cache = cos_sin_cache.to(dtype=dtype, device='cuda')
+    cos_sin_cache = cos_sin_cache.to(dtype=dtype, device=device)
 
     # Run the kernel. The kernel is in-place, so we need to clone the inputs.
     out_query = query.clone()
