@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from transformers.activations import get_activation
 
 from vllm import activation_ops
+import sys
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 2048]  # Arbitrary values for testing
