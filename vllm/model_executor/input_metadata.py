@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import torch
 from xformers.ops import AttentionBias
@@ -50,7 +50,7 @@ class InputMetadata:
         assert context_lens.shape[0] == self.num_generation_tokens
 
         # Set during the execution of the first attention op.
-        self.attn_bias: List[AttentionBias] = []
+        self.attn_bias: Union[List[AttentionBias], List[torch.Tensor]] = []
 
     def __repr__(self) -> str:
         # Print only useful metadata.

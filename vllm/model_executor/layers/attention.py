@@ -63,6 +63,7 @@ class PagedAttention(nn.Module):
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.cpu_only = cpu_only
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -87,7 +88,11 @@ class PagedAttention(nn.Module):
             return
         prompt_lens = input_metadata.prompt_lens
         attn_bias = BlockDiagonalCausalMask.from_seqlens(prompt_lens)
-        input_metadata.attn_bias.append(attn_bias)
+        if self.cpu_only:
+            attn_bias = attn_bias.materialize(
+                (1, input_metadata.num_prompt_tokens,
+                 input_metadata.num_prompt_tokens))
+        input_metadata.attn_bias = [attn_bias]  # type: ignore
 
     def multi_query_kv_attention(
         self,
@@ -122,9 +127,13 @@ class PagedAttention(nn.Module):
             attn_bias=input_metadata.attn_bias[0],
             p=0.0,
             scale=self.scale,
-        )
+        ).squeeze(
+            0
+        ) if not self.cpu_only else torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1),
+            input_metadata.attn_bias[0], 0.0).transpose(0, 1)
         # TODO(woosuk): Unnecessary copy. Optimize.
-        output.copy_(out.squeeze(0))
+        output.copy_(out)
         return output
 
     def single_query_cached_kv_attention(
