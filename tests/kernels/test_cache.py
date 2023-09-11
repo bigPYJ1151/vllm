@@ -42,7 +42,7 @@ def test_copy_blocks(
     torch.random.manual_seed(seed)
 
     if device == torch.device('cuda'):
-      torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
 
     # Generate random block mappings where each source block is mapped to two
     # destination blocks.
@@ -84,6 +84,7 @@ def test_copy_blocks(
                                                cloned_value_caches):
         assert torch.allclose(value_cache, cloned_value_cache)
 
+
 @pytest.mark.parametrize("num_mappings", NUM_MAPPINGS)
 @pytest.mark.parametrize("num_layers", NUM_LAYERS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -106,7 +107,9 @@ def test_copy_blocks_cpu(
     device: torch.device,
     seed: int,
 ) -> None:
-   test_copy_blocks(kv_cache_factory, num_mappings, num_layers, num_heads, head_size, block_size, num_blocks, dtype, device, seed) 
+    test_copy_blocks(kv_cache_factory, num_mappings, num_layers, num_heads,
+                     head_size, block_size, num_blocks, dtype, device, seed)
+
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -132,7 +135,7 @@ def test_reshape_and_cache(
     torch.random.manual_seed(seed)
 
     if device == torch.device('cuda'):
-      torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
 
     # Create a random slot mapping.
     num_slots = block_size * num_blocks
@@ -149,8 +152,8 @@ def test_reshape_and_cache(
 
     # Create the KV caches.
     key_caches, value_caches = kv_cache_factory(num_blocks, block_size, 1,
-                                                num_heads, head_size, dtype, device,
-                                                seed)
+                                                num_heads, head_size, dtype,
+                                                device, seed)
     key_cache, value_cache = key_caches[0], value_caches[0]
 
     # Clone the KV caches.
@@ -176,6 +179,7 @@ def test_reshape_and_cache(
     assert torch.allclose(key_cache, cloned_key_cache)
     assert torch.allclose(value_cache, cloned_value_cache)
 
+
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
@@ -196,4 +200,5 @@ def test_reshape_and_cache_cpu(
     device: torch.device,
     seed: int,
 ) -> None:
-  test_reshape_and_cache(kv_cache_factory, num_tokens, num_heads, head_size, block_size, num_blocks, dtype, device, seed)
+    test_reshape_and_cache(kv_cache_factory, num_tokens, num_heads, head_size,
+                           block_size, num_blocks, dtype, device, seed)
