@@ -62,13 +62,8 @@ class ModelConfig:
         self.cpu_only = cpu_only
 
         self.hf_config = get_config(model, trust_remote_code)
-<<<<<<< HEAD
-        self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
+        self.dtype = _get_and_verify_dtype(self.hf_config, dtype, self.cpu_only)
         self._verify_load_format()
-=======
-        self.dtype = _get_and_verify_dtype(self.hf_config, dtype,
-                                           self.cpu_only)
->>>>>>> Enable cpu_only mode for vLLM.
         self._verify_tokenizer_mode()
 
     def _verify_load_format(self) -> None:

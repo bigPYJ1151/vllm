@@ -21,6 +21,7 @@ void single_query_cached_kv_attention_impl(
     const float *__restrict__ alibi_slopes, // [num_heads]
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
     const int num_seqs, const int num_heads) {
+  TORCH_CHECK(HEAD_SIZE % 16 == 0);
   constexpr int x = 16 / sizeof(scalar_t);
 
   int max_context_len = max_num_blocks_per_seq * BLOCK_SIZE;
@@ -95,22 +96,28 @@ void single_query_cached_kv_attention_impl(
     }
 
     // Compute value
+    constexpr int head_partition_num = HEAD_SIZE / 16;
 #pragma omp parallel for collapse(2)
-    for (int block_idx = 0; block_idx < block_num; ++block_idx) {
-      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
-        const int kv_head_idx = head_mapping[head_idx];
-        const int physical_block_idx = seq_block_table[block_idx];
-        const scalar_t *__restrict__ prob_vec_ptr =
-            logits + head_idx * max_context_len_padded + block_idx * BLOCK_SIZE;
-        const scalar_t *__restrict__ v_block_cache_ptr =
-            v_cache + physical_block_idx * kv_block_stride +
-            kv_head_idx * kv_head_stride;
-        scalar_t *__restrict__ out_ptr =
-            out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+    for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
+      for (int head_part_idx = 0; head_part_idx < head_partition_num;
+           ++head_part_idx) {
+        for (int block_idx = 0; block_idx < block_num; ++block_idx) {
+          const int kv_head_idx = head_mapping[head_idx];
+          const int physical_block_idx = seq_block_table[block_idx];
+          const scalar_t *__restrict__ prob_vec_ptr =
+              logits + head_idx * max_context_len_padded +
+              block_idx * BLOCK_SIZE;
+          const scalar_t *__restrict__ v_block_cache_ptr =
+              v_cache + physical_block_idx * kv_block_stride +
+              kv_head_idx * kv_head_stride + BLOCK_SIZE * head_part_idx * 16;
+          scalar_t *__restrict__ out_ptr =
+              out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE +
+              head_part_idx * 16;
 
-        for (int i = 0; i < HEAD_SIZE; ++i, v_block_cache_ptr += BLOCK_SIZE) {
-          for (int j = 0; j < BLOCK_SIZE; ++j) {
-            out_ptr[i] += prob_vec_ptr[j] * v_block_cache_ptr[j];
+          for (int i = 0; i < 16; ++i, v_block_cache_ptr += BLOCK_SIZE) {
+            for (int j = 0; j < BLOCK_SIZE; ++j) {
+              out_ptr[i] += prob_vec_ptr[j] * v_block_cache_ptr[j];
+            }
           }
         }
       }

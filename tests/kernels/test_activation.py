@@ -21,21 +21,40 @@ def ref_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("d", D)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cuda')])
 @torch.inference_mode()
 def test_silu_and_mul(
     num_tokens: int,
     d: int,
     dtype: torch.dtype,
+    device: torch.device,
     seed: int,
 ) -> None:
     torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    x = torch.randn(num_tokens, 2 * d, dtype=dtype, device='cuda')
-    out = torch.empty(num_tokens, d, dtype=dtype, device='cuda')
+
+    if device == torch.device('cuda'):
+      torch.cuda.manual_seed(seed)
+
+    x = torch.randn(num_tokens, 2 * d, dtype=dtype, device=device)
+    out = torch.empty(num_tokens, d, dtype=dtype, device=device)
     activation_ops.silu_and_mul(out, x)
     ref_out = ref_silu_and_mul(x)
     assert torch.allclose(out, ref_out, atol=1e-5, rtol=1e-5)
 
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("d", D)
+@pytest.mark.parametrize("dtype", [torch.float])
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cpu')])
+@torch.inference_mode()
+def test_silu_and_mul_cpu(
+    num_tokens: int,
+    d: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+) -> None:
+  test_silu_and_mul(num_tokens, d, dtype, device, seed)
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("d", D)

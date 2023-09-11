@@ -32,6 +32,7 @@ class RefRMSNorm(nn.Module):
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cuda')])
 @torch.inference_mode()
 def test_rms_norm(
     num_tokens: int,
@@ -41,12 +42,14 @@ def test_rms_norm(
     device: torch.device
 ) -> None:
     torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+
+    if device == torch.device('cuda'):
+      torch.cuda.manual_seed(seed)
 
     scale = float(hidden_size**-0.5)
     x = torch.empty(num_tokens, hidden_size, dtype=dtype, device=device)
     x.uniform_(-scale, scale)
-    ref = RefRMSNorm(hidden_size).to(dtype).cuda()
+    ref = RefRMSNorm(hidden_size).to(device, dtype)
 
     out = torch.empty_like(x)
     layernorm_ops.rms_norm(
@@ -57,3 +60,18 @@ def test_rms_norm(
     )
     ref_out = ref(x)
     assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-5)
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", [torch.float])
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", [torch.device('cpu')])
+@torch.inference_mode()
+def test_rms_norm_cpu(
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: torch.device
+) -> None:
+  test_rms_norm(num_tokens, hidden_size, dtype, seed, device)
