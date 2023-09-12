@@ -125,7 +125,7 @@ def test_rotary_embedding(
     torch.random.manual_seed(seed)
 
     if device == torch.device('cuda'):
-      torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
 
     positions = torch.randint(0, max_position, (num_tokens, ), device=device)
     query = torch.randn(num_tokens,
@@ -178,6 +178,7 @@ def test_rotary_embedding(
     assert torch.allclose(out_query, ref_query, atol=1e-5, rtol=1e-5)
     assert torch.allclose(out_key, ref_key, atol=1e-5, rtol=1e-5)
 
+
 @pytest.mark.parametrize("is_neox_style", [True])
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -199,4 +200,5 @@ def test_rotary_embedding_cpu(
     max_position: int = 8192,
     base: int = 10000,
 ) -> None:
-    test_rotary_embedding(is_neox_style, num_tokens, num_heads, head_size, rotary_dim, dtype, device, seed, max_position, base)
+    test_rotary_embedding(is_neox_style, num_tokens, num_heads, head_size,
+                          rotary_dim, dtype, device, seed, max_position, base)

@@ -62,7 +62,8 @@ class ModelConfig:
         self.cpu_only = cpu_only
 
         self.hf_config = get_config(model, trust_remote_code)
-        self.dtype = _get_and_verify_dtype(self.hf_config, dtype, self.cpu_only)
+        self.dtype = _get_and_verify_dtype(self.hf_config, dtype,
+                                           self.cpu_only)
         self._verify_load_format()
         self._verify_tokenizer_mode()
 

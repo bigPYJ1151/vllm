@@ -146,6 +146,7 @@ activation_extension = CUDAExtension(
 )
 ext_modules.append(activation_extension)
 
+
 def get_path(*filepath) -> str:
     return os.path.join(ROOT_DIR, *filepath)
 
