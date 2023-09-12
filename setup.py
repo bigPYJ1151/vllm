@@ -20,12 +20,6 @@ ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
 CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 NVCC_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 
-MKL_LIBS = ("mkl_intel_lp64", "mkl_gnu_thread", "mkl_core")
-
-def addMKLLibs(libs: List):
-    for lib in MKL_LIBS:
-        libs.append(lib)
-
 if CUDA_HOME is None:
     raise RuntimeError(
         "Cannot find CUDA_HOME. CUDA must be available to build the package.")
@@ -106,7 +100,6 @@ cache_extension = CUDAExtension(
         "nvcc": NVCC_FLAGS,
     },
 )
-addMKLLibs(cache_extension.libraries)
 ext_modules.append(cache_extension)
 
 # Attention kernels.
@@ -118,7 +111,6 @@ attention_extension = CUDAExtension(
         "nvcc": NVCC_FLAGS,
     },
 )
-addMKLLibs(attention_extension.libraries)
 ext_modules.append(attention_extension)
 
 # Positional encoding kernels.
@@ -130,7 +122,6 @@ positional_encoding_extension = CUDAExtension(
         "nvcc": NVCC_FLAGS,
     },
 )
-addMKLLibs(positional_encoding_extension.libraries)
 ext_modules.append(positional_encoding_extension)
 
 # Layer normalization kernels.
@@ -142,7 +133,6 @@ layernorm_extension = CUDAExtension(
         "nvcc": NVCC_FLAGS,
     },
 )
-addMKLLibs(layernorm_extension.libraries)
 ext_modules.append(layernorm_extension)
 
 # Activation kernels.
@@ -154,7 +144,6 @@ activation_extension = CUDAExtension(
         "nvcc": NVCC_FLAGS,
     },
 )
-addMKLLibs(activation_extension.libraries)
 ext_modules.append(activation_extension)
 
 def get_path(*filepath) -> str:
