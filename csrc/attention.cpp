@@ -22,6 +22,7 @@ void single_query_cached_kv_attention_impl(
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
     const int num_seqs, const int num_heads) {
   TORCH_CHECK(HEAD_SIZE % 16 == 0);
+  TORCH_CHECK(alibi_slopes == nullptr, "Unsupport alibi_slopes for CPU");
   constexpr int x = 16 / sizeof(scalar_t);
 
   int max_context_len = max_num_blocks_per_seq * BLOCK_SIZE;
