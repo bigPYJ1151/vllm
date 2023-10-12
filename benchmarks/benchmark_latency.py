@@ -22,6 +22,7 @@ def main(args: argparse.Namespace):
         max_num_seqs=args.batch_size,
         max_num_batched_tokens=args.batch_size * args.input_len,
         trust_remote_code=args.trust_remote_code,
+        cpu_only=args.cpu_only,
     )
 
     sampling_params = SamplingParams(
@@ -77,5 +78,6 @@ if __name__ == '__main__':
                         help='Number of iterations to run.')
     parser.add_argument('--trust-remote-code', action='store_true',
                         help='trust remote code from huggingface')
+    parser.add_argument("--cpu-only", action="store_true")
     args = parser.parse_args()
     main(args)
