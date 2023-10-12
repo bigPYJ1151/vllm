@@ -60,7 +60,7 @@ def sample_requests(
 def run_vllm(requests: List[Tuple[str, int, int]], model: str, tokenizer: str,
              tensor_parallel_size: int, seed: int, n: int,
              use_beam_search: bool, trust_remote_code: bool,
-             cpu_only: bool) -> float:
+             cpu_only: bool, swap_space: int) -> float:
     llm = LLM(
         model=model,
         tokenizer=tokenizer,
@@ -68,6 +68,7 @@ def run_vllm(requests: List[Tuple[str, int, int]], model: str, tokenizer: str,
         seed=seed,
         trust_remote_code=trust_remote_code,
         cpu_only=cpu_only,
+        swap_space=swap_space,
     )
 
     # Add the requests to the engine.
@@ -165,7 +166,7 @@ def main(args: argparse.Namespace):
         elapsed_time = run_vllm(requests, args.model, args.tokenizer,
                                 args.tensor_parallel_size, args.seed, args.n,
                                 args.use_beam_search, args.trust_remote_code,
-                                args.cpu_only)
+                                args.cpu_only, args.swap_space)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -210,6 +211,10 @@ if __name__ == "__main__":
                         action='store_true',
                         help='trust remote code from huggingface')
     parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument("--swap-space",
+                    type=int,
+                    default=4,
+                    help="Memory space used for CPU.")
     args = parser.parse_args()
 
     if args.backend == "vllm":
