@@ -243,16 +243,16 @@ class Worker:
         input_positions = _pad_to_alignment(input_positions, multiple_of=8)
 
         # Convert to tensors.
-        tokens_tensor = torch.LongTensor(input_tokens, device=self.device)
-        positions_tensor = torch.LongTensor(input_positions,
+        tokens_tensor = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
+        positions_tensor = torch.tensor(input_positions, dtype=torch.long,
                                             device=self.device)
-        slot_mapping_tensor = torch.IntTensor(slot_mapping, device=self.device)
-        context_lens_tensor = torch.IntTensor(context_lens, device=self.device)
+        slot_mapping_tensor = torch.tensor(slot_mapping, dtype=torch.int, device=self.device)
+        context_lens_tensor = torch.tensor(context_lens, dtype=torch.int, device=self.device)
         padded_block_tables = [
             _pad_to_max(block_table, max_num_blocks_per_seq)
             for block_table in generation_block_tables
         ]
-        block_tables_tensor = torch.IntTensor(padded_block_tables,
+        block_tables_tensor = torch.tensor(padded_block_tables, dtype=torch.int,
                                               device=self.device)
 
         seq_data: Dict[int, SequenceData] = {}
