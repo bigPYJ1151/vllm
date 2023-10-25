@@ -69,8 +69,14 @@ def run_vllm(requests: List[Tuple[str, int, int]], model: str, tokenizer: str,
         trust_remote_code=trust_remote_code,
         cpu_only=cpu_only,
         swap_space=swap_space,
+        dtype="float32"
     )
 
+    requests = [(
+        'I require your assistance to rewrite our service page about Construction Contracts Lawyer in Brisbane for the persona of a homeowner in Brisbane, Australia. I will give you multiple information that you have to consider such as the contents from the top ranking pages online, and target keywords. Do you understand?',
+        68,
+        37
+    )]
     # Add the requests to the engine.
     for prompt, _, output_len in requests:
         sampling_params = SamplingParams(
@@ -90,7 +96,14 @@ def run_vllm(requests: List[Tuple[str, int, int]], model: str, tokenizer: str,
 
     start = time.time()
     # FIXME(woosuk): Do use internal method.
-    llm._run_engine(use_tqdm=True)
+    out = llm._run_engine(use_tqdm=True)
+
+    for i, item in enumerate(out):
+        print("id: {}".format(i))
+        print("Prompt: ", item.prompt)
+        print("Response: ", item.outputs[0].text)
+        print("----------------------") 
+
     end = time.time()
     return end - start
 

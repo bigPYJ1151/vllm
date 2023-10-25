@@ -12,6 +12,9 @@ from vllm import cache_ops
 from vllm import pos_encoding_ops
 from vllm.model_executor.input_metadata import InputMetadata
 
+import os
+from .tensor_dump import VLLMTensorDumper
+
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 
 
@@ -57,7 +60,8 @@ class PagedAttention(nn.Module):
                  head_size: int,
                  scale: float,
                  num_kv_heads: Optional[int] = None,
-                 cpu_only: bool = False) -> None:
+                 cpu_only: bool = False,
+                 id = -1) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
@@ -272,9 +276,11 @@ class PagedAttentionWithRoPE(PagedAttention):
         num_kv_heads: Optional[int] = None,
         is_neox_style: bool = True,
         cpu_only: bool = False,
+        id = -1
     ) -> None:
-        super().__init__(num_heads, head_size, scale, num_kv_heads, cpu_only)
+        super().__init__(num_heads, head_size, scale, num_kv_heads, cpu_only, id)
         self.is_neox_style = is_neox_style
+        self.id = id
 
         # Create the cos and sin cache.
         inv_freq = 1.0 / (base**(torch.arange(
@@ -324,6 +330,7 @@ class PagedAttentionWithRoPE(PagedAttention):
 
         # Apply rotary embedding to the query and key before passing them
         # to the attention op.
+        # dumper = VLLMTensorDumper(os.path.join('/root', 'vllm', 'tensors'), query.device, int(positions[0]))
         pos_encoding_ops.rotary_embedding(
             positions,
             query,
@@ -332,6 +339,9 @@ class PagedAttentionWithRoPE(PagedAttention):
             self.cos_sin_cache,
             self.is_neox_style,
         )
+        # if self.id == 0:
+        #   dumper.dump("pos-q", query)
+        #   dumper.dump("pos-k", key)
         return super().forward(
             query,
             key,

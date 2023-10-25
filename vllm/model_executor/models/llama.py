@@ -45,6 +45,9 @@ from vllm.model_executor.parallel_utils.tensor_parallel import (
     VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear)
 from vllm.sequence import SamplerOutput
 
+import os
+from .tensor_dump import VLLMTensorDumper 
+
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -92,6 +95,7 @@ class LlamaAttention(nn.Module):
         num_kv_heads: int,
         rope_theta: float = 10000,
         cpu_only: bool = False,
+        id = -1
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -131,7 +135,8 @@ class LlamaAttention(nn.Module):
                                            base=self.rope_theta,
                                            rotary_dim=self.head_dim,
                                            num_kv_heads=self.num_kv_heads,
-                                           cpu_only=cpu_only)
+                                           cpu_only=cpu_only,
+                                           id=id)
 
     def forward(
         self,
@@ -152,9 +157,10 @@ class LlamaAttention(nn.Module):
 
 class LlamaDecoderLayer(nn.Module):
 
-    def __init__(self, config: LlamaConfig, cpu_only: bool = False):
+    def __init__(self, config: LlamaConfig, id=-1, cpu_only: bool = False):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.id = id
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = LlamaAttention(
@@ -163,6 +169,7 @@ class LlamaDecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             rope_theta=rope_theta,
             cpu_only=cpu_only,
+            id=id
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -184,8 +191,12 @@ class LlamaDecoderLayer(nn.Module):
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         # Self Attention
+        # dumper = VLLMTensorDumper(os.path.join('/root', 'vllm', 'tensors'), hidden_states.device, int(positions[0]))
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        # if self.id == 0:
+        #     dumper.dump("i-layer", hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -193,7 +204,11 @@ class LlamaDecoderLayer(nn.Module):
             input_metadata=input_metadata,
             cache_event=cache_event,
         )
+        # if self.id == 0:
+        #     dumper.dump("att", hidden_states)
         hidden_states = residual + hidden_states
+        # if self.id == 0:
+        #     dumper.dump("residual", hidden_states)
 
         # Fully Connected
         residual = hidden_states
@@ -218,8 +233,8 @@ class LlamaModel(nn.Module):
             perform_initialization=False,
             use_cpu_initialization=cpu_only)
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, cpu_only=cpu_only)
-            for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, id=i, cpu_only=cpu_only)
+            for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -231,7 +246,10 @@ class LlamaModel(nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
+        # dumper = VLLMTensorDumper(os.path.join('/root', 'vllm', 'tensors'), input_ids.device, int(positions[0]))
+        # dumper.dump("id", input_ids)
         hidden_states = self.embed_tokens(input_ids)
+        # dumper.dump("embdding", hidden_states)
         for i in range(len(self.layers)):
             if cache_events is None:
                 cache_event = None
@@ -245,7 +263,9 @@ class LlamaModel(nn.Module):
                 input_metadata,
                 cache_event,
             )
+            # dumper.dump("decode-{}".format(i), hidden_states)
         hidden_states = self.norm(hidden_states)
+        # dumper.dump("final", hidden_states)
         return hidden_states
 
 
@@ -272,6 +292,7 @@ class LlamaForCausalLM(nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> SamplerOutput:
+        # print(input_ids)
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    input_metadata, cache_events)
         next_tokens = self.sampler(self.lm_head.weight, hidden_states,
