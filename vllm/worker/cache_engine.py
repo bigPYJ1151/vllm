@@ -58,7 +58,7 @@ class CacheEngine:
         element_size = torch.tensor([], dtype=self.dtype).element_size()
         x = (
             16 // element_size
-        ) if not self.cache_config.cpu_only else 1  # TODO: whether need to follow the tiling method on GPU
+        )
         return (
             self.num_heads,
             self.head_size // x,
