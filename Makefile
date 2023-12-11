@@ -28,6 +28,9 @@ sanitizer:
 py_install:
 	VLLM_BUILD_CPU_OPS=1 MAX_JOBS=JOBS pip install --no-build-isolation  -v -e .
 
+py_install_cpu:
+	VLLM_BUILD_CPU_ONLY=1 MAX_JOBS=JOBS pip install --no-build-isolation  -v -e .
+
 package:
 	VLLM_BUILD_CPU_OPS=1 MAX_JOBS=JOBS python setup.py bdist_wheel
 	echo "Wheel package is saved in ./dist/"

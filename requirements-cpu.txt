@@ -1,0 +1,14 @@
+ninja  # For faster builds.
+psutil
+ray >= 2.5.1
+pandas  # Required for Ray data.
+pyarrow  # Required for Ray data.
+sentencepiece  # Required for LLaMA tokenizer.
+numpy
+einops  # Required for phi-1_5
+torch @ https://download.pytorch.org/whl/cpu-cxx11-abi/torch-2.1.0%2Bcpu.cxx11.abi-cp310-cp310-linux_x86_64.whl#sha256=88f1ee550c6291af8d0417871fb7af84b86527d18bc02ac4249f07dcd84dda56 #2.1.0+cpu
+transformers >= 4.34.0  # Required for Mistral.
+fastapi
+uvicorn[standard]
+pydantic == 1.10.13  # Required for OpenAI server.
+aioprometheus[starlette]
