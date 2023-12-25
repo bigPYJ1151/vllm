@@ -2,11 +2,12 @@ import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import time
 import torch
 import torch.nn as nn
 
 from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig
-from vllm.logger import init_logger
+from vllm.logger import init_logger, init_perf_logger
 from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
 from vllm.model_executor.parallel_utils.communication_op import (
     broadcast, broadcast_object_list)
@@ -15,6 +16,7 @@ from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.utils import in_wsl
 
 logger = init_logger(__name__)
+perf_logger = init_perf_logger(__name__)
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 _PAD_SLOT_ID = -1
@@ -456,6 +458,8 @@ class ModelRunner:
     ) -> Optional[SamplerOutput]:
         input_tokens, input_positions, input_metadata, sampling_metadata = (
             self.prepare_input_tensors(seq_group_metadata_list))
+
+        perf_logger.info("start,{},{},{},{}".format(input_metadata.is_prompt, input_tokens.shape[0], input_tokens.shape[1], time.perf_counter_ns()))
         # Execute the model.
         if input_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
@@ -468,6 +472,7 @@ class ModelRunner:
             kv_caches=kv_caches,
             input_metadata=input_metadata,
         )
+        perf_logger.info("end,{},{},{},{}".format(input_metadata.is_prompt, input_tokens.shape[0], input_tokens.shape[1], time.perf_counter_ns()))
 
         # Sample the next token.
         output = self.model.sample(

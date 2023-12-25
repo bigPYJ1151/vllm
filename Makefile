@@ -42,7 +42,10 @@ HF_TP_bench:
 	cd benchmarks && python benchmark_throughput.py --backend=hf --dataset=../ShareGPT_V3_unfiltered_cleaned_split.json --model=/root/frameworks.bigdata.dev-ops/vicuna-7b-v1.5/ --n=1 --num-prompts=1 --hf-max-batch-size=1 --trust-remote-code --device=cpu
 
 VLLM_TP_bench:
-	cd benchmarks && python benchmark_throughput.py --backend=vllm --dataset=/root/HF_models/ShareGPT_V3_unfiltered_cleaned_split.json --model=/root/HF_models/vicuna-7b-v1.5/ --n=1 --num-prompts=1 --dtype=float32 --trust-remote-code --device=cpu --swap-space=4
+	cd benchmarks && python benchmark_throughput.py --backend=vllm --dataset=/root/HF_models/ShareGPT_V3_unfiltered_cleaned_split.json --model=/root/HF_models/vicuna-7b-v1.5/ --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code --device=cpu --swap-space=40
+
+VLLM_TP_bench_perf:
+	cd benchmarks && LOGGING=INFO python benchmark_throughput.py --backend=vllm --dataset=/root/HF_models/ShareGPT_V3_unfiltered_cleaned_split.json --model=/root/HF_models/vicuna-7b-v1.5/ --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code --device=cpu --swap-space=40
 
 VLLM_LT_bench:
 	cd benchmarks && python benchmark_latency.py --model=/root/HF_models/vicuna-7b-v1.5/ --n=1 --batch-size=8 --input-len=128 --output-len=512 --num-iters=4 --dtype=bfloat16 --trust-remote-code --device=cpu --swap-space=40

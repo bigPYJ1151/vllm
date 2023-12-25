@@ -3,10 +3,11 @@
 """Logging configuration for vLLM."""
 import logging
 import sys
+import time
+import os
 
 _FORMAT = "%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s"
 _DATE_FORMAT = "%m-%d %H:%M:%S"
-
 
 class NewLineFormatter(logging.Formatter):
     """Adds logging prefix to newlines to align multi-line messages."""
@@ -52,5 +53,13 @@ def init_logger(name: str):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     logger.addHandler(_default_handler)
+    logger.propagate = False
+    return logger
+
+def init_perf_logger(name: str):
+    logger = logging.getLogger("perf_{}".format(name))
+    logger.setLevel(os.getenv("LOGGING", "WARNING"))
+    csv_handler = logging.FileHandler("perf_{}_log_{}.csv".format(name, time.perf_counter_ns()))
+    logger.addHandler(csv_handler)
     logger.propagate = False
     return logger
