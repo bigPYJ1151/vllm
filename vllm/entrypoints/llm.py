@@ -1,5 +1,6 @@
 from typing import List, Optional, Union
 
+import random
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -202,7 +203,7 @@ class LLM:
         num_requests = self.llm_engine.get_num_unfinished_requests()
         logger.info("Start infinite engine with {} requests.".format(num_requests))
         # Run the engine.
-        max_output_len = self.llm_engine.get_model_config().max_model_len
+        max_output_len = self.llm_engine.scheduler_config.max_model_len
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
             finished = 0
@@ -215,12 +216,11 @@ class LLM:
                         top_p=1.0,
                         use_beam_search=False,
                         ignore_eos=True,
-                        max_tokens=max_output_len - len(output.prompt_token_ids)             
+                        max_tokens=random.randint(10, max_output_len - len(output.prompt_token_ids)),             
                     )
                     self._add_request(
                         output.prompt,
                         prompt_token_ids=None,
                         sampling_params=sampling_params,
                     )
-            if finished:
-                logger.info("{} inputs are finished and re-submitted".format(finished))
+            logger.info("{} inputs are finished and re-submitted".format(finished))
