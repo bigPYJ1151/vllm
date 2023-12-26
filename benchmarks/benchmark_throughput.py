@@ -73,6 +73,7 @@ def run_vllm(
     max_model_len: Optional[int],
     enforce_eager: bool,
     swap_space: int,
+    infinite: bool = False,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -108,7 +109,10 @@ def run_vllm(
 
     start = time.perf_counter()
     # FIXME(woosuk): Do not use internal method.
-    llm._run_engine(use_tqdm=True)
+    if not infinite:
+        llm._run_engine(use_tqdm=True)
+    else:
+        llm._run_engine_infinite()
     end = time.perf_counter()
     return end - start
 
@@ -206,7 +210,7 @@ def main(args: argparse.Namespace):
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
                                 args.device, args.max_model_len, args.enforce_eager, 
-                                args.swap_space)
+                                args.swap_space, args.infinite,)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -294,6 +298,9 @@ if __name__ == "__main__":
                         type=int,
                         default=4,
                         help="memory space available for CPU (GB).")
+    parser.add_argument("--infinite",
+                        action="store_true",
+                        help="run on infinite loop mode.")
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model

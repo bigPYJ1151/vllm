@@ -8,7 +8,9 @@ from vllm.engine.llm_engine import LLMEngine
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.utils import Counter
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 class LLM:
     """An LLM for generating texts from given prompts and sampling parameters.
@@ -195,3 +197,30 @@ class LLM:
         # its previous requests.
         outputs = sorted(outputs, key=lambda x: int(x.request_id))
         return outputs
+
+    def _run_engine_infinite(self) -> None:
+        num_requests = self.llm_engine.get_num_unfinished_requests()
+        logger.info("Start infinite engine with {} requests.".format(num_requests))
+        # Run the engine.
+        max_output_len = self.llm_engine.get_model_config().max_model_len
+        while self.llm_engine.has_unfinished_requests():
+            step_outputs = self.llm_engine.step()
+            finished = 0
+            for output in step_outputs:
+                if output.finished:
+                    finished += 1
+                    sampling_params = SamplingParams(
+                        n=1,
+                        temperature=1.0,
+                        top_p=1.0,
+                        use_beam_search=False,
+                        ignore_eos=True,
+                        max_tokens=max_output_len - len(output.prompt_token_ids)             
+                    )
+                    self._add_request(
+                        output.prompt,
+                        prompt_token_ids=None,
+                        sampling_params=sampling_params,
+                    )
+            if finished:
+                logger.info("{} inputs are finished and re-submitted".format(finished))
