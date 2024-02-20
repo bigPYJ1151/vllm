@@ -236,7 +236,7 @@ if BUILD_CPU_OPS:
         CXX_FLAGS += ["-DVLLM_BUILD_CPU_ONLY"]
     CXX_FLAGS += [
         "-DVLLM_BUILD_CPU_OPS", "-fopenmp", "-mavx512f", "-mavx512bf16",
-        "-mavx512vl"
+        "-mavx512vl", "-fselective-scheduling", "-fsel-sched-pipelining", "-fsel-sched-pipelining-outer-loops"
     ]
     CPU_OPS_SOURCES += [
         "csrc/cpu/activation_impl.cpp",

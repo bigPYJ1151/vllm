@@ -170,11 +170,9 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
         64, logits_bytes); // Cacheline alignment for each context token.
                            // [parallel_work_item_num, max_context_len_padded]
 
-        // std::printf("-------------------------\n");
-#pragma omp parallel for collapse(2) schedule(static,1)
-        for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
-    for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
-        // std::printf("Thread Num: %d, seq_idx: %d, head_idx: %d\n", omp_get_thread_num(), seq_idx, head_idx);
+#pragma omp parallel for collapse(2) schedule(static, 1)
+    for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
+      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
         int context_len = context_lens[seq_idx];
         const int *seq_block_table =
             block_tables + max_num_blocks_per_seq * seq_idx;
