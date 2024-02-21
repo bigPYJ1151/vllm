@@ -197,6 +197,7 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
           static_assert(BLOCK_SIZE % TOKEN_PER_GROUP == 0);
           constexpr int TOKEN_GROUPS = BLOCK_SIZE / TOKEN_PER_GROUP;
 
+          //   vec_op::FP32Vec8 accums[BLOCK_SIZE];
           vec_op::FP32Vec16 group_accums[TOKEN_GROUPS];
 
           for (int q_offset = 0; q_offset < HEAD_SIZE;
@@ -264,7 +265,6 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
         for (int head_part_idx = 0; head_part_idx < head_partition_num;
              ++head_part_idx) {
           vec_op::FP32Vec16 accums[head_elem_num_per_partition];
-          vec_op::FP32Vec16 elems[head_elem_num_per_partition];
           scalar_t *__restrict__ out_ptr =
               out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE +
               head_part_idx * head_elem_num_per_partition;
@@ -277,19 +277,15 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
                 kv_head_idx * kv_head_stride +
                 BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
 
-            vec_op::unroll_loop<int, head_elem_num_per_partition>(
-                [&](int head_elem_idx) {
-                  vec_op::BF16Vec16 v_vec(v_block_cache_ptr +
-                                          BLOCK_SIZE * head_elem_idx);
-                  elems[head_elem_idx] = vec_op::FP32Vec16(v_vec.reg);
-                });
-
             vec_op::FP32Vec16 prob_vec(prob_vec_ptr);
 
             vec_op::unroll_loop<int, head_elem_num_per_partition>(
                 [&](int head_elem_idx) {
+                  vec_op::BF16Vec16 v_vec(v_block_cache_ptr +
+                                          BLOCK_SIZE * head_elem_idx);
+                  vec_op::FP32Vec16 fp32_v_vec(v_vec.reg);
                   accums[head_elem_idx] =
-                      accums[head_elem_idx] + prob_vec * elems[head_elem_idx];
+                      accums[head_elem_idx] + prob_vec * fp32_v_vec;
                 });
           }
 
