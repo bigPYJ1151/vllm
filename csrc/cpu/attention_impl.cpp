@@ -214,6 +214,8 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
 
                   group_accums[token_group_idx] = vec_op::fma(
                       q_group_vec, k_group_vec, group_accums[token_group_idx]);
+                  vec_op::prefetch(k_block_cache_ptr + x * BLOCK_SIZE +
+                                   token_group_idx * x * TOKEN_PER_GROUP);
                 });
           }
 
@@ -291,12 +293,12 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
                   vec_op::BF16Vec16 v_vec(v_block_cache_ptr +
                                           BLOCK_SIZE * head_elem_idx);
                   vec_op::FP32Vec16 fp32_v_vec(v_vec.reg);
-                  if (head_elem_idx % 2 == 0) {
-                    vec_op::prefetch(next_v_block_cache_ptr +
-                                   BLOCK_SIZE * head_elem_idx);
-                  }
                   accums[head_elem_idx] =
                       accums[head_elem_idx] + prob_vec * fp32_v_vec;
+                  if (head_elem_idx % 2 == 0) {
+                    vec_op::prefetch(next_v_block_cache_ptr +
+                                     BLOCK_SIZE * head_elem_idx);
+                  }
                 });
           }
 
