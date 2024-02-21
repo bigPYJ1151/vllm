@@ -269,7 +269,7 @@ inline void storeFP32ToT<c10::BFloat16>(float v, c10::BFloat16 *ptr) {
 }
 
 inline void prefetch(const void *addr) {
-  _mm_prefetch(addr, _MM_HINT_NTA);
+  _mm_prefetch(addr, _MM_HINT_T2);
 }
 
 }; // namespace vec_op
