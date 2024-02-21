@@ -268,8 +268,8 @@ inline void storeFP32ToT<c10::BFloat16>(float v, c10::BFloat16 *ptr) {
   *reinterpret_cast<__bfloat16 *>(ptr) = _mm_cvtness_sbh(v);
 }
 
-inline void prefetch64Byte(const void *addr) {
-  _mm_prefetch(addr, _MM_HINT_T1);
+inline void prefetch(const void *addr) {
+  _mm_prefetch(addr, _MM_HINT_NTA);
 }
 
 }; // namespace vec_op

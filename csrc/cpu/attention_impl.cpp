@@ -170,7 +170,7 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
         64, logits_bytes); // Cacheline alignment for each context token.
                            // [parallel_work_item_num, max_context_len_padded]
 
-#pragma omp parallel for collapse(2) schedule(dynamic, 1)
+#pragma omp parallel for collapse(2) schedule(static, 1)
     for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
       for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
         int context_len = context_lens[seq_idx];
@@ -291,7 +291,7 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
                   vec_op::BF16Vec16 v_vec(v_block_cache_ptr +
                                           BLOCK_SIZE * head_elem_idx);
                   vec_op::FP32Vec16 fp32_v_vec(v_vec.reg);
-                  vec_op::prefetch64Byte(next_v_block_cache_ptr +
+                  vec_op::prefetch(next_v_block_cache_ptr +
                                          BLOCK_SIZE * head_elem_idx);
                   accums[head_elem_idx] =
                       accums[head_elem_idx] + prob_vec * fp32_v_vec;
