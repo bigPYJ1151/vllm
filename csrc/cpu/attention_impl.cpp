@@ -291,8 +291,8 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
                   vec_op::BF16Vec16 v_vec(v_block_cache_ptr +
                                           BLOCK_SIZE * head_elem_idx);
                   vec_op::FP32Vec16 fp32_v_vec(v_vec.reg);
-                //   vec_op::prefetch(next_v_block_cache_ptr +
-                //                    BLOCK_SIZE * head_elem_idx);
+                  vec_op::prefetch(next_v_block_cache_ptr +
+                                   BLOCK_SIZE * head_elem_idx);
                   accums[head_elem_idx] =
                       accums[head_elem_idx] + prob_vec * fp32_v_vec;
                 });
