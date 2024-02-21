@@ -170,7 +170,7 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
         64, logits_bytes); // Cacheline alignment for each context token.
                            // [parallel_work_item_num, max_context_len_padded]
 
-#pragma omp parallel for collapse(2) schedule(static, 1)
+#pragma omp parallel for collapse(2) schedule(dynamic, 1)
     for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
       for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
         int context_len = context_lens[seq_idx];
@@ -270,10 +270,17 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
               head_part_idx * head_elem_num_per_partition;
           for (int block_idx = 0; block_idx < block_num; ++block_idx) {
             const int64_t physical_block_idx = seq_block_table[block_idx];
+            const int64_t next_physical_block_idx =
+                ((block_idx == block_num - 1) ? seq_block_table[block_idx]
+                                              : seq_block_table[block_idx + 1]);
             const float *__restrict__ prob_vec_ptr =
                 thread_block_logits + block_idx * BLOCK_SIZE;
             const scalar_t *__restrict__ v_block_cache_ptr =
                 v_cache + physical_block_idx * kv_block_stride +
+                kv_head_idx * kv_head_stride +
+                BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
+            const scalar_t *__restrict__ next_v_block_cache_ptr =
+                v_cache + next_physical_block_idx * kv_block_stride +
                 kv_head_idx * kv_head_stride +
                 BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
 
@@ -284,6 +291,8 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
                   vec_op::BF16Vec16 v_vec(v_block_cache_ptr +
                                           BLOCK_SIZE * head_elem_idx);
                   vec_op::FP32Vec16 fp32_v_vec(v_vec.reg);
+                  vec_op::prefetch64Byte(next_v_block_cache_ptr +
+                                         BLOCK_SIZE * head_elem_idx);
                   accums[head_elem_idx] =
                       accums[head_elem_idx] + prob_vec * fp32_v_vec;
                 });
