@@ -197,7 +197,6 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
           static_assert(BLOCK_SIZE % TOKEN_PER_GROUP == 0);
           constexpr int TOKEN_GROUPS = BLOCK_SIZE / TOKEN_PER_GROUP;
 
-          //   vec_op::FP32Vec8 accums[BLOCK_SIZE];
           vec_op::FP32Vec16 group_accums[TOKEN_GROUPS];
 
           for (int q_offset = 0; q_offset < HEAD_SIZE;
