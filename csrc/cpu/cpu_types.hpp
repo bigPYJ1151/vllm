@@ -82,9 +82,7 @@ struct BF16Vec8 : public Vec<BF16Vec8> {
   __m128bh reg;
 
   explicit BF16Vec8(const void *ptr)
-      : reg((__m128bh)_mm_loadu_si128((__m128i*)ptr)) {
-        TORCH_CHECK((int64_t)ptr % 16 == 0);
-      }
+      : reg((__m128bh)_mm_loadu_si128((__m128i *)ptr)) {}
 
   explicit BF16Vec8(__m128bh data) : reg(data) {}
 
@@ -99,9 +97,7 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
   __m256bh reg;
 
   explicit BF16Vec16(const void *ptr)
-      : reg((__m256bh)_mm256_loadu_si256((__m256i*)ptr)) {
-        TORCH_CHECK((int64_t)ptr % 32 == 0);
-      }
+      : reg((__m256bh)_mm256_loadu_si256((__m256i *)ptr)) {}
 
   explicit BF16Vec16(__m256bh data) : reg(data) {}
 
@@ -116,9 +112,7 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
   __m512bh reg;
 
   explicit BF16Vec32(const void *ptr)
-      : reg((__m512bh)_mm512_loadu_si512(ptr)) {
-        TORCH_CHECK((int64_t)ptr % 64 == 0);
-      }
+      : reg((__m512bh)_mm512_loadu_si512(ptr)) {}
 
   explicit BF16Vec32(__m512bh data) : reg(data) {}
 
@@ -275,7 +269,7 @@ inline void storeFP32ToT<c10::BFloat16>(float v, c10::BFloat16 *ptr) {
 }
 
 inline void prefetch(const void *addr) {
-//   _mm_prefetch(addr, _MM_HINT_T0);
+  //   _mm_prefetch(addr, _MM_HINT_T0);
 }
 
 }; // namespace vec_op
