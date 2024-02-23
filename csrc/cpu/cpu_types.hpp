@@ -82,7 +82,9 @@ struct BF16Vec8 : public Vec<BF16Vec8> {
   __m128bh reg;
 
   explicit BF16Vec8(const void *ptr)
-      : reg((__m128bh)_mm_loadu_si128((__m128i*)ptr)) {}
+      : reg((__m128bh)_mm_loadu_si128((__m128i*)ptr)) {
+        TORCH_CHECK((int64_t)ptr % 16 == 0);
+      }
 
   explicit BF16Vec8(__m128bh data) : reg(data) {}
 
@@ -97,7 +99,9 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
   __m256bh reg;
 
   explicit BF16Vec16(const void *ptr)
-      : reg((__m256bh)_mm256_loadu_si256((__m256i*)ptr)) {}
+      : reg((__m256bh)_mm256_loadu_si256((__m256i*)ptr)) {
+        TORCH_CHECK((int64_t)ptr % 32 == 0);
+      }
 
   explicit BF16Vec16(__m256bh data) : reg(data) {}
 
@@ -112,7 +116,9 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
   __m512bh reg;
 
   explicit BF16Vec32(const void *ptr)
-      : reg((__m512bh)_mm512_loadu_si512(ptr)) {}
+      : reg((__m512bh)_mm512_loadu_si512(ptr)) {
+        TORCH_CHECK((int64_t)ptr % 64 == 0);
+      }
 
   explicit BF16Vec32(__m512bh data) : reg(data) {}
 
