@@ -45,6 +45,85 @@ inline void reducePartitonSoftmax(const T *max_data, T *sum_data,
     sum_data[i] /= rescaled_sum + 1e-8;
   }
 }
+
+// Note: not a efficient implementation for fp32
+template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int x>
+void reduceQKBlock(const scalar_t *__restrict__ q,
+                   const scalar_t *__restrict__ k_block,
+                   float *__restrict__ logits, float scale, bool is_tail) {
+  for (int q_offset = 0; q_offset < HEAD_SIZE; q_offset += x, q += x) {
+    for (int token_idx = 0; token_idx < BLOCK_SIZE; ++token_idx, k_block += x) {
+      for (int i = 0; i < x; ++i) {
+        logits[token_idx] += q[i] * k_block[i] * scale;
+      }
+    }
+  }
+}
+
+template <int HEAD_SIZE, int BLOCK_SIZE, int x>
+void reduceQKBlock(const c10::BFloat16 *__restrict__ q,
+                   const c10::BFloat16 *__restrict__ k_block,
+                   float *__restrict__ logits, float scale, bool is_tail) {
+  static_assert(vec_op::BF16Vec32::get_elem_num() % x == 0);
+  constexpr int TOKEN_PER_GROUP = vec_op::BF16Vec32::get_elem_num() / x;
+  static_assert(BLOCK_SIZE % TOKEN_PER_GROUP == 0);
+  constexpr int TOKEN_GROUPS = BLOCK_SIZE / TOKEN_PER_GROUP;
+
+  vec_op::FP32Vec16 group_accums[TOKEN_GROUPS];
+
+  for (int q_offset = 0; q_offset < HEAD_SIZE;
+       q_offset += x, k_block += x * BLOCK_SIZE) {
+    vec_op::BF16Vec8 q_vec(q + q_offset);
+    vec_op::BF16Vec32 q_group_vec(q_vec);
+
+    vec_op::unroll_loop<int, TOKEN_GROUPS>(
+        [k_block, &q_group_vec, &group_accums](int token_group_idx) {
+          vec_op::BF16Vec32 k_group_vec(k_block +
+                                        token_group_idx * x * TOKEN_PER_GROUP);
+
+          group_accums[token_group_idx] = vec_op::fma(
+              q_group_vec, k_group_vec, group_accums[token_group_idx]);
+          vec_op::prefetch(k_block + x * BLOCK_SIZE +
+                           token_group_idx * x * TOKEN_PER_GROUP);
+        });
+  }
+
+  vec_op::unroll_loop<int, TOKEN_GROUPS>([&group_accums, logits,
+                                          scale](int token_group_idx) {
+    vec_op::unroll_loop<int, TOKEN_PER_GROUP>(
+        [&group_accums, logits, scale, token_group_idx](int token_idx) {
+          float dot_v =
+              group_accums[token_group_idx]
+                  .template reduce_sub_sum<vec_op::FP32Vec16::get_elem_num() /
+                                           TOKEN_PER_GROUP>(token_idx);
+          logits[token_group_idx * TOKEN_PER_GROUP + token_idx] = dot_v * scale;
+        });
+  });
+}
+
+// Note: not a efficient implementation for fp32
+template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE,
+          int HEAD_PARTITION_SIZE, typename acc_t>
+void reduceValueBlock(const float *prob, const scalar_t *v_block, acc_t &&acc) {
+  for (int i = 0; i < 16; ++i, v_block += BLOCK_SIZE) {
+    for (int j = 0; j < BLOCK_SIZE; ++j) {
+      acc[i] += prob[j] * v_block[j];
+    }
+  }
+}
+
+template <int HEAD_SIZE, int BLOCK_SIZE, int HEAD_PARTITION_SIZE,
+          typename acc_t>
+void reduceValueBlock(const float *prob, const c10::BFloat16 *v_block,
+                      acc_t &&acc) {
+  vec_op::FP32Vec16 prob_vec(prob);
+
+  vec_op::unroll_loop<int, HEAD_PARTITION_SIZE>([&](int head_elem_idx) {
+    vec_op::BF16Vec16 v_vec(v_block + BLOCK_SIZE * head_elem_idx);
+    vec_op::FP32Vec16 fp32_v_vec(v_vec.reg);
+    acc[head_elem_idx] = acc[head_elem_idx] + prob_vec * fp32_v_vec;
+  });
+}
 }; // namespace
 
 // Paged attention v1
@@ -104,16 +183,8 @@ struct paged_attention_v1_impl {
               logits + head_idx * max_context_len_padded +
               block_idx * BLOCK_SIZE;
 
-          for (int q_offset = 0; q_offset < HEAD_SIZE;
-               q_offset += x, q_vec_ptr += x) {
-            for (int token_idx = 0; token_idx < BLOCK_SIZE;
-                 ++token_idx, k_block_cache_ptr += x) {
-              for (int i = 0; i < x; ++i) {
-                head_block_logits[token_idx] +=
-                    q_vec_ptr[i] * k_block_cache_ptr[i] * scale;
-              }
-            }
-          }
+          reduceQKBlock<scalar_t, HEAD_SIZE, BLOCK_SIZE, x>(
+              q_vec_ptr, k_block_cache_ptr, head_block_logits, scale, false);
         }
       }
 
@@ -121,26 +192,7 @@ struct paged_attention_v1_impl {
 #pragma omp parallel for
       for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
         float *head_logit_ptr = logits + head_idx * max_context_len_padded;
-        float max_logit = head_logit_ptr[0];
-        for (int i = 1; i < context_len; ++i) {
-          max_logit =
-              max_logit >= head_logit_ptr[i] ? max_logit : head_logit_ptr[i];
-        }
-
-        float sum = 0;
-        for (int i = 0; i < context_len; ++i) {
-          head_logit_ptr[i] = std::exp(head_logit_ptr[i] - max_logit);
-          sum += head_logit_ptr[i];
-        }
-
-        for (int i = 0; i < context_len; ++i) {
-          head_logit_ptr[i] /= sum;
-        }
-
-        int remaining_seq_upper = block_num * BLOCK_SIZE;
-        for (int i = context_len; i < remaining_seq_upper; ++i) {
-          head_logit_ptr[i] = 0;
-        }
+        reduceSoftmax(head_logit_ptr, context_len, block_num * BLOCK_SIZE);
       }
 
       // Compute value
@@ -161,12 +213,8 @@ struct paged_attention_v1_impl {
             scalar_t *__restrict__ out_ptr =
                 out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE +
                 head_part_idx * 16;
-
-            for (int i = 0; i < 16; ++i, v_block_cache_ptr += BLOCK_SIZE) {
-              for (int j = 0; j < BLOCK_SIZE; ++j) {
-                out_ptr[i] += prob_vec_ptr[j] * v_block_cache_ptr[j];
-              }
-            }
+            reduceValueBlock<scalar_t, HEAD_SIZE, BLOCK_SIZE, 16>(
+                prob_vec_ptr, v_block_cache_ptr, out_ptr);
           }
         }
       }
@@ -239,72 +287,12 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
           float *__restrict__ head_block_logits =
               thread_block_logits + block_idx * BLOCK_SIZE;
 
-          static_assert(vec_op::BF16Vec32::get_elem_num() % x == 0);
-          constexpr int TOKEN_PER_GROUP = vec_op::BF16Vec32::get_elem_num() / x;
-          static_assert(BLOCK_SIZE % TOKEN_PER_GROUP == 0);
-          constexpr int TOKEN_GROUPS = BLOCK_SIZE / TOKEN_PER_GROUP;
-
-          vec_op::FP32Vec16 group_accums[TOKEN_GROUPS];
-
-          for (int q_offset = 0; q_offset < HEAD_SIZE;
-               q_offset += x, k_block_cache_ptr += x * BLOCK_SIZE) {
-            scalar_vec_t q_vec(q_vec_ptr + q_offset);
-            vec_op::BF16Vec32 q_group_vec(q_vec);
-
-            vec_op::unroll_loop<int, TOKEN_GROUPS>(
-                [k_block_cache_ptr, &q_group_vec,
-                 &group_accums](int token_group_idx) {
-                  vec_op::BF16Vec32 k_group_vec(k_block_cache_ptr +
-                                                token_group_idx * x *
-                                                    TOKEN_PER_GROUP);
-
-                  group_accums[token_group_idx] = vec_op::fma(
-                      q_group_vec, k_group_vec, group_accums[token_group_idx]);
-                  vec_op::prefetch(k_block_cache_ptr + x * BLOCK_SIZE +
-                                   token_group_idx * x * TOKEN_PER_GROUP);
-                });
-          }
-
-          vec_op::unroll_loop<int, TOKEN_GROUPS>([&group_accums,
-                                                  head_block_logits,
-                                                  scale](int token_group_idx) {
-            vec_op::unroll_loop<int, TOKEN_PER_GROUP>([&group_accums,
-                                                       head_block_logits, scale,
-                                                       token_group_idx](
-                                                          int token_idx) {
-              float dot_v =
-                  group_accums[token_group_idx]
-                      .template reduce_sub_sum<
-                          vec_op::FP32Vec16::get_elem_num() / TOKEN_PER_GROUP>(
-                          token_idx);
-              head_block_logits[token_group_idx * TOKEN_PER_GROUP + token_idx] =
-                  dot_v * scale;
-            });
-          });
+          reduceQKBlock<HEAD_SIZE, BLOCK_SIZE, x>(
+              q_vec_ptr, k_block_cache_ptr, head_block_logits, scale, false);
         }
 
         // Compute softmax
-        float max_logit = thread_block_logits[0];
-        for (int i = 1; i < context_len; ++i) {
-          max_logit = max_logit >= thread_block_logits[i]
-                          ? max_logit
-                          : thread_block_logits[i];
-        }
-
-        float sum = 0;
-        for (int i = 0; i < context_len; ++i) {
-          thread_block_logits[i] = std::exp(thread_block_logits[i] - max_logit);
-          sum += thread_block_logits[i];
-        }
-
-        for (int i = 0; i < context_len; ++i) {
-          thread_block_logits[i] /= sum;
-        }
-
-        int remaining_seq_upper = block_num * BLOCK_SIZE;
-        for (int i = context_len; i < remaining_seq_upper; ++i) {
-          thread_block_logits[i] = 0;
-        }
+        reduceSoftmax(thread_block_logits, context_len, block_num * BLOCK_SIZE);
 
         // Compute value
         constexpr int head_elem_num_per_partition = 16;
@@ -318,34 +306,15 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
               head_part_idx * head_elem_num_per_partition;
           for (int block_idx = 0; block_idx < block_num; ++block_idx) {
             const int64_t physical_block_idx = seq_block_table[block_idx];
-            const int64_t next_physical_block_idx =
-                ((block_idx == block_num - 1) ? seq_block_table[block_idx]
-                                              : seq_block_table[block_idx + 1]);
             const float *__restrict__ prob_vec_ptr =
                 thread_block_logits + block_idx * BLOCK_SIZE;
             const scalar_t *__restrict__ v_block_cache_ptr =
                 v_cache + physical_block_idx * kv_block_stride +
                 kv_head_idx * kv_head_stride +
                 BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
-            const scalar_t *__restrict__ next_v_block_cache_ptr =
-                v_cache + next_physical_block_idx * kv_block_stride +
-                kv_head_idx * kv_head_stride +
-                BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
-
-            vec_op::FP32Vec16 prob_vec(prob_vec_ptr);
-
-            vec_op::unroll_loop<int, head_elem_num_per_partition>(
-                [&](int head_elem_idx) {
-                  vec_op::BF16Vec16 v_vec(v_block_cache_ptr +
-                                          BLOCK_SIZE * head_elem_idx);
-                  vec_op::FP32Vec16 fp32_v_vec(v_vec.reg);
-                  accums[head_elem_idx] =
-                      accums[head_elem_idx] + prob_vec * fp32_v_vec;
-                  if (head_elem_idx % 2 == 0) {
-                    vec_op::prefetch(next_v_block_cache_ptr +
-                                     BLOCK_SIZE * head_elem_idx);
-                  }
-                });
+            reduceValueBlock<HEAD_SIZE, BLOCK_SIZE,
+                             head_elem_num_per_partition>(
+                prob_vec_ptr, v_block_cache_ptr, accums);
           }
 
           vec_op::unroll_loop<int, head_elem_num_per_partition>(
@@ -474,112 +443,10 @@ struct paged_attention_v2_impl {
       const float *__restrict__ alibi_slopes, // [num_heads]
       const int q_stride, const int kv_block_stride, const int kv_head_stride,
       const int num_seqs, const int num_heads, const int max_num_partitions) {
-    TORCH_CHECK(HEAD_SIZE % 16 == 0);
-    TORCH_CHECK(alibi_slopes == nullptr, "Unsupport alibi_slopes for CPU");
-    constexpr int x = 16 / sizeof(scalar_t);
-    const int num_queries_per_kv = num_heads / num_kv_heads;
-
-    int max_context_len = max_num_blocks_per_seq * BLOCK_SIZE;
-    int max_context_len_padded = (max_context_len + 15) & 0xFFFFFFF0;
-    TORCH_CHECK((max_context_len_padded * sizeof(float)) % 64 == 0);
-
-    size_t logits_bytes = num_heads * max_context_len_padded * sizeof(float);
-    float *logits = (float *)std::aligned_alloc(
-        64, logits_bytes); // Cacheline alignment for each context token.
-                           // [head_num, max_context_len_padded]
-
-    std::memset(out, 0, num_seqs * num_heads * HEAD_SIZE * sizeof(scalar_t));
-
-    for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
-      int context_len = context_lens[seq_idx];
-      const int *seq_block_table =
-          block_tables + max_num_blocks_per_seq * seq_idx;
-      const int block_num = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-      std::memset(logits, 0, logits_bytes);
-
-      // Compute attention logits
-#pragma omp parallel for collapse(2)
-      for (int block_idx = 0; block_idx < block_num; ++block_idx) {
-        for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
-          const int64_t kv_head_idx = head_idx / num_queries_per_kv;
-          const int64_t physical_block_idx = seq_block_table[block_idx];
-          const scalar_t *__restrict__ q_vec_ptr =
-              q + seq_idx * q_stride + head_idx * HEAD_SIZE;
-          const scalar_t *__restrict__ k_block_cache_ptr =
-              k_cache + physical_block_idx * kv_block_stride +
-              kv_head_idx * kv_head_stride;
-          float *__restrict__ head_block_logits =
-              logits + head_idx * max_context_len_padded +
-              block_idx * BLOCK_SIZE;
-
-          for (int q_offset = 0; q_offset < HEAD_SIZE;
-               q_offset += x, q_vec_ptr += x) {
-            for (int token_idx = 0; token_idx < BLOCK_SIZE;
-                 ++token_idx, k_block_cache_ptr += x) {
-              for (int i = 0; i < x; ++i) {
-                head_block_logits[token_idx] +=
-                    q_vec_ptr[i] * k_block_cache_ptr[i] * scale;
-              }
-            }
-          }
-        }
-      }
-
-      // Compute softmax
-#pragma omp parallel for
-      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
-        float *head_logit_ptr = logits + head_idx * max_context_len_padded;
-        float max_logit = head_logit_ptr[0];
-        for (int i = 1; i < context_len; ++i) {
-          max_logit =
-              max_logit >= head_logit_ptr[i] ? max_logit : head_logit_ptr[i];
-        }
-
-        float sum = 0;
-        for (int i = 0; i < context_len; ++i) {
-          head_logit_ptr[i] = std::exp(head_logit_ptr[i] - max_logit);
-          sum += head_logit_ptr[i];
-        }
-
-        for (int i = 0; i < context_len; ++i) {
-          head_logit_ptr[i] /= sum;
-        }
-
-        int remaining_seq_upper = block_num * BLOCK_SIZE;
-        for (int i = context_len; i < remaining_seq_upper; ++i) {
-          head_logit_ptr[i] = 0;
-        }
-      }
-
-      // Compute value
-      constexpr int head_partition_num = HEAD_SIZE / 16;
-#pragma omp parallel for collapse(2)
-      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
-        for (int head_part_idx = 0; head_part_idx < head_partition_num;
-             ++head_part_idx) {
-          for (int block_idx = 0; block_idx < block_num; ++block_idx) {
-            const int64_t kv_head_idx = head_idx / num_queries_per_kv;
-            const int64_t physical_block_idx = seq_block_table[block_idx];
-            const float *__restrict__ prob_vec_ptr =
-                logits + head_idx * max_context_len_padded +
-                block_idx * BLOCK_SIZE;
-            const scalar_t *__restrict__ v_block_cache_ptr =
-                v_cache + physical_block_idx * kv_block_stride +
-                kv_head_idx * kv_head_stride + BLOCK_SIZE * head_part_idx * 16;
-            scalar_t *__restrict__ out_ptr =
-                out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE +
-                head_part_idx * 16;
-
-            for (int i = 0; i < 16; ++i, v_block_cache_ptr += BLOCK_SIZE) {
-              for (int j = 0; j < BLOCK_SIZE; ++j) {
-                out_ptr[i] += prob_vec_ptr[j] * v_block_cache_ptr[j];
-              }
-            }
-          }
-        }
-      }
-    }
-    std::free(logits);
+    paged_attention_v1_impl<scalar_t, HEAD_SIZE, BLOCK_SIZE>::call(
+        out, q, k_cache, v_cache, num_kv_heads, scale, block_tables,
+        context_lens, max_num_blocks_per_seq, alibi_slopes, q_stride,
+        kv_block_stride, kv_head_stride, num_seqs, num_heads);
   }
 };
 
@@ -659,47 +526,8 @@ struct paged_attention_v2_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE,
             float *__restrict__ head_block_logits =
                 logits + block_idx * BLOCK_SIZE;
 
-            static_assert(vec_op::BF16Vec32::get_elem_num() % x == 0);
-            constexpr int TOKEN_PER_GROUP =
-                vec_op::BF16Vec32::get_elem_num() / x;
-            static_assert(BLOCK_SIZE % TOKEN_PER_GROUP == 0);
-            constexpr int TOKEN_GROUPS = BLOCK_SIZE / TOKEN_PER_GROUP;
-
-            vec_op::FP32Vec16 group_accums[TOKEN_GROUPS];
-
-            for (int q_offset = 0; q_offset < HEAD_SIZE;
-                 q_offset += x, k_block_cache_ptr += x * BLOCK_SIZE) {
-              scalar_vec_t q_vec(q_vec_ptr + q_offset);
-              vec_op::BF16Vec32 q_group_vec(q_vec);
-
-              vec_op::unroll_loop<int, TOKEN_GROUPS>([k_block_cache_ptr,
-                                                      &q_group_vec,
-                                                      &group_accums](
-                                                         int token_group_idx) {
-                vec_op::BF16Vec32 k_group_vec(
-                    k_block_cache_ptr + token_group_idx * x * TOKEN_PER_GROUP);
-
-                group_accums[token_group_idx] = vec_op::fma(
-                    q_group_vec, k_group_vec, group_accums[token_group_idx]);
-                vec_op::prefetch(k_block_cache_ptr + x * BLOCK_SIZE +
-                                 token_group_idx * x * TOKEN_PER_GROUP);
-              });
-            }
-
-            vec_op::unroll_loop<int, TOKEN_GROUPS>(
-                [&group_accums, head_block_logits, scale](int token_group_idx) {
-                  vec_op::unroll_loop<int, TOKEN_PER_GROUP>(
-                      [&group_accums, head_block_logits, scale,
-                       token_group_idx](int token_idx) {
-                        float dot_v =
-                            group_accums[token_group_idx]
-                                .template reduce_sub_sum<
-                                    vec_op::FP32Vec16::get_elem_num() /
-                                    TOKEN_PER_GROUP>(token_idx);
-                        head_block_logits[token_group_idx * TOKEN_PER_GROUP +
-                                          token_idx] = dot_v * scale;
-                      });
-                });
+            reduceQKBlock<HEAD_SIZE, BLOCK_SIZE, x>(
+                q_vec_ptr, k_block_cache_ptr, head_block_logits, scale, false);
           }
 
           auto &&[max_logit, exp_sum] =
@@ -731,35 +559,15 @@ struct paged_attention_v2_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE,
                 output_buffer + head_part_idx * head_elem_num_per_partition;
             for (int block_idx = 0; block_idx < block_num; ++block_idx) {
               const int64_t physical_block_idx = seq_block_table[block_idx];
-              const int64_t next_physical_block_idx =
-                  ((block_idx == block_num - 1)
-                       ? seq_block_table[block_idx]
-                       : seq_block_table[block_idx + 1]);
               const float *__restrict__ prob_vec_ptr =
                   logits + block_idx * BLOCK_SIZE;
               const scalar_t *__restrict__ v_block_cache_ptr =
                   v_cache + physical_block_idx * kv_block_stride +
                   kv_head_idx * kv_head_stride +
                   BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
-              const scalar_t *__restrict__ next_v_block_cache_ptr =
-                  v_cache + next_physical_block_idx * kv_block_stride +
-                  kv_head_idx * kv_head_stride +
-                  BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
-
-              vec_op::FP32Vec16 prob_vec(prob_vec_ptr);
-
-              vec_op::unroll_loop<int, head_elem_num_per_partition>(
-                  [&](int head_elem_idx) {
-                    vec_op::BF16Vec16 v_vec(v_block_cache_ptr +
-                                            BLOCK_SIZE * head_elem_idx);
-                    vec_op::FP32Vec16 fp32_v_vec(v_vec.reg);
-                    accums[head_elem_idx] =
-                        accums[head_elem_idx] + prob_vec * fp32_v_vec;
-                    if (head_elem_idx % 2 == 0) {
-                      vec_op::prefetch(next_v_block_cache_ptr +
-                                       BLOCK_SIZE * head_elem_idx);
-                    }
-                  });
+              reduceValueBlock<HEAD_SIZE, BLOCK_SIZE,
+                               head_elem_num_per_partition>(
+                  prob_vec_ptr, v_block_cache_ptr, accums);
             }
 
             vec_op::unroll_loop<int, head_elem_num_per_partition>(
