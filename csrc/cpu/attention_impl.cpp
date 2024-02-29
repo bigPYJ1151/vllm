@@ -291,28 +291,33 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
     const int parallel_work_item_num = omp_get_max_threads();
 
     size_t logits_bytes =
-        parallel_work_item_num * max_context_len_padded * sizeof(float);
+        num_seqs * num_heads * max_context_len_padded * sizeof(float);
     float *logits = (float *)std::aligned_alloc(
         64, logits_bytes); // Cacheline alignment for each context token.
-                           // [parallel_work_item_num, max_context_len_padded]
+                           // [num_seqs, num_heads, max_context_len_padded]
+    int max_block_num = (max_context_len_padded + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-#pragma omp parallel for collapse(2) schedule(dynamic, 1)
+#pragma omp parallel for collapse(3) schedule(static, 1)
     for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
       for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
-        int context_len = context_lens[seq_idx];
-        const int *seq_block_table =
-            block_tables + max_num_blocks_per_seq * seq_idx;
-        const int block_num = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        const int64_t kv_head_idx = head_idx / num_queries_per_kv;
-        const scalar_t *__restrict__ q_vec_ptr =
-            q + seq_idx * q_stride + head_idx * HEAD_SIZE;
-        const int last_block_token_num =
-            context_len - (block_num - 1) * BLOCK_SIZE;
-        float *__restrict__ thread_block_logits =
-            logits + omp_get_thread_num() * max_context_len_padded;
+        for (int block_idx = 0; block_idx < max_block_num; ++block_idx) {
+          int context_len = context_lens[seq_idx];
+          const int *seq_block_table =
+              block_tables + max_num_blocks_per_seq * seq_idx;
+          const int block_num = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-        // Compute logits
-        for (int block_idx = 0; block_idx < block_num; ++block_idx) {
+          if (block_idx >= block_num)
+            continue;
+
+          const int64_t kv_head_idx = head_idx / num_queries_per_kv;
+          const scalar_t *__restrict__ q_vec_ptr =
+              q + seq_idx * q_stride + head_idx * HEAD_SIZE;
+          const int last_block_token_num =
+              context_len - (block_num - 1) * BLOCK_SIZE;
+          float *__restrict__ thread_block_logits =
+              logits + seq_idx * num_heads * max_context_len_padded +
+              head_idx * max_context_len_padded;
+
           const int64_t physical_block_idx = seq_block_table[block_idx];
           const scalar_t *__restrict__ k_block_cache_ptr =
               k_cache + physical_block_idx * kv_block_stride +
@@ -324,21 +329,44 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
               q_vec_ptr, k_block_cache_ptr, head_block_logits, scale,
               block_idx == block_num - 1 ? last_block_token_num : BLOCK_SIZE);
         }
+      }
+    }
 
-        // Compute softmax
+    // Compute softmax
+#pragma omp parallel for collapse(2) schedule(static, 1)
+    for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
+      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
+        int context_len = context_lens[seq_idx];
+        const int block_num = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        float *__restrict__ thread_block_logits =
+            logits + seq_idx * num_heads * max_context_len_padded +
+            head_idx * max_context_len_padded;
         reduceSoftmax(thread_block_logits, context_len, block_num * BLOCK_SIZE);
+      }
+    }
 
-        // Compute value
-        constexpr int head_elem_num_per_partition = 16;
-        constexpr int head_partition_num =
-            HEAD_SIZE / head_elem_num_per_partition;
+    // Compute value
+    constexpr int head_elem_num_per_partition = 16;
+    constexpr int head_partition_num = HEAD_SIZE / head_elem_num_per_partition;
+#pragma omp parallel for collapse(3) schedule(static, 1)
+    for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
+      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
         for (int head_part_idx = 0; head_part_idx < head_partition_num;
              ++head_part_idx) {
+          int context_len = context_lens[seq_idx];
+          const int block_num = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+          const int *seq_block_table =
+              block_tables + max_num_blocks_per_seq * seq_idx;
+          float *__restrict__ thread_block_logits =
+              logits + seq_idx * num_heads * max_context_len_padded +
+              head_idx * max_context_len_padded;
+          const int64_t kv_head_idx = head_idx / num_queries_per_kv;
           vec_op::FP32Vec16 accums[head_elem_num_per_partition];
           scalar_t *__restrict__ out_ptr =
               out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE +
               head_part_idx * head_elem_num_per_partition;
           for (int block_idx = 0; block_idx < block_num; ++block_idx) {
+
             const int64_t physical_block_idx = seq_block_table[block_idx];
             const float *__restrict__ prob_vec_ptr =
                 thread_block_logits + block_idx * BLOCK_SIZE;
@@ -460,8 +488,8 @@ struct paged_attention_v2_impl {
   static void call(
       scalar_t *__restrict__ out,   // [num_seqs, num_heads, head_size]
       float *__restrict__ exp_sums, // [num_seqs, num_heads, max_num_partitions]
-      float
-          *__restrict__ max_logits, // [num_seqs, num_heads, max_num_partitions]
+      float *__restrict__ max_logits,       // [num_seqs, num_heads,
+                                            // max_num_partitions]
       scalar_t *__restrict__ tmp_out,       // [num_seqs, num_heads,
                                             // max_num_partitions, head_size]
       const scalar_t *__restrict__ q,       // [num_seqs, num_heads, head_size]
@@ -492,8 +520,8 @@ struct paged_attention_v2_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE,
   static void call(
       scalar_t *__restrict__ out,   // [num_seqs, num_heads, head_size]
       float *__restrict__ exp_sums, // [num_seqs, num_heads, max_num_partitions]
-      float
-          *__restrict__ max_logits, // [num_seqs, num_heads, max_num_partitions]
+      float *__restrict__ max_logits,       // [num_seqs, num_heads,
+                                            // max_num_partitions]
       scalar_t *__restrict__ tmp_out,       // [num_seqs, num_heads,
                                             // max_num_partitions, head_size]
       const scalar_t *__restrict__ q,       // [num_seqs, num_heads, head_size]
@@ -639,8 +667,8 @@ struct paged_attention_v2_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE,
 
     // Reduce values
     constexpr int head_elem_num_per_group =
-        16; // Note: didn't align with the cacheline size, due to some HEAD_SIZE
-            // didn't align with 64 bytes
+        16; // Note: didn't align with the cacheline size, due to some
+            // HEAD_SIZE didn't align with 64 bytes
     static_assert(HEAD_SIZE % head_elem_num_per_group == 0);
     constexpr int head_group_num = HEAD_SIZE / head_elem_num_per_group;
     const float *__restrict__ rescale_factors = exp_sums;
