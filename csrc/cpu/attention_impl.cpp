@@ -46,60 +46,91 @@ inline void reducePartitonSoftmax(const T *max_data, T *sum_data,
   }
 }
 
-// Note: not a efficient implementation for fp32
+// Note: not an efficient implementation for fp32
 template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int x>
-void reduceQKBlock(const scalar_t *__restrict__ q,
+struct reduceQKBlockKernel {
+  static void call(const scalar_t *__restrict__ q,
                    const scalar_t *__restrict__ k_block,
-                   float *__restrict__ logits, float scale, bool is_tail) {
-  for (int q_offset = 0; q_offset < HEAD_SIZE; q_offset += x, q += x) {
-    for (int token_idx = 0; token_idx < BLOCK_SIZE; ++token_idx, k_block += x) {
-      for (int i = 0; i < x; ++i) {
-        logits[token_idx] += q[i] * k_block[i] * scale;
+                   float *__restrict__ logits, float scale,
+                   const int token_num) {
+    for (int q_offset = 0; q_offset < HEAD_SIZE; q_offset += x, q += x) {
+      for (int token_idx = 0; token_idx < BLOCK_SIZE;
+           ++token_idx, k_block += x) {
+        for (int i = 0; i < x; ++i) {
+          logits[token_idx] += q[i] * k_block[i] * scale;
+        }
       }
     }
   }
-}
+};
 
 template <int HEAD_SIZE, int BLOCK_SIZE, int x>
-void reduceQKBlock(const c10::BFloat16 *__restrict__ q,
+struct reduceQKBlockKernel<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE, x> {
+  constexpr static int TOKEN_PER_GROUP = vec_op::BF16Vec32::get_elem_num() / x;
+
+  static void call(const c10::BFloat16 *__restrict__ q,
                    const c10::BFloat16 *__restrict__ k_block,
-                   float *__restrict__ logits, float scale, bool is_tail) {
-  static_assert(vec_op::BF16Vec32::get_elem_num() % x == 0);
-  constexpr int TOKEN_PER_GROUP = vec_op::BF16Vec32::get_elem_num() / x;
-  static_assert(BLOCK_SIZE % TOKEN_PER_GROUP == 0);
-  constexpr int TOKEN_GROUPS = BLOCK_SIZE / TOKEN_PER_GROUP;
+                   float *__restrict__ logits, float scale,
+                   const int token_num) {
+    static_assert(vec_op::BF16Vec32::get_elem_num() % x == 0);
+    static_assert(TOKEN_PER_GROUP == 4);
+    const int group_num = (token_num + TOKEN_PER_GROUP - 1) / TOKEN_PER_GROUP;
 
-  vec_op::FP32Vec16 group_accums[TOKEN_GROUPS];
-
-  for (int q_offset = 0; q_offset < HEAD_SIZE;
-       q_offset += x, k_block += x * BLOCK_SIZE) {
-    vec_op::BF16Vec8 q_vec(q + q_offset);
-    vec_op::BF16Vec32 q_group_vec(q_vec);
-
-    vec_op::unroll_loop<int, TOKEN_GROUPS>(
-        [k_block, &q_group_vec, &group_accums](int token_group_idx) {
-          vec_op::BF16Vec32 k_group_vec(k_block +
-                                        token_group_idx * x * TOKEN_PER_GROUP);
-
-          group_accums[token_group_idx] = vec_op::fma(
-              q_group_vec, k_group_vec, group_accums[token_group_idx]);
-          vec_op::prefetch(k_block + x * BLOCK_SIZE +
-                           token_group_idx * x * TOKEN_PER_GROUP);
-        });
+    switch (group_num) {
+    case 4:
+      kernel_impl<4>(q, k_block, logits, scale);
+      return;
+    case 3:
+      kernel_impl<3>(q, k_block, logits, scale);
+      return;
+    case 2:
+      kernel_impl<2>(q, k_block, logits, scale);
+      return;
+    case 1:
+      kernel_impl<1>(q, k_block, logits, scale);
+      return;
+    default:
+      TORCH_CHECK(false, "invalid group_num in reduceQKBlockKernel.");
+    }
   }
 
-  vec_op::unroll_loop<int, TOKEN_GROUPS>([&group_accums, logits,
-                                          scale](int token_group_idx) {
-    vec_op::unroll_loop<int, TOKEN_PER_GROUP>(
-        [&group_accums, logits, scale, token_group_idx](int token_idx) {
-          float dot_v =
-              group_accums[token_group_idx]
-                  .template reduce_sub_sum<vec_op::FP32Vec16::get_elem_num() /
-                                           TOKEN_PER_GROUP>(token_idx);
-          logits[token_group_idx * TOKEN_PER_GROUP + token_idx] = dot_v * scale;
-        });
-  });
-}
+  template <int GROUP_NUM>
+  static void kernel_impl(const c10::BFloat16 *__restrict__ q,
+                          const c10::BFloat16 *__restrict__ k_block,
+                          float *__restrict__ logits, float scale) {
+    static_assert(BLOCK_SIZE % TOKEN_PER_GROUP == 0);
+
+    vec_op::FP32Vec16 group_accums[GROUP_NUM];
+    for (int q_offset = 0; q_offset < HEAD_SIZE;
+         q_offset += x, k_block += x * BLOCK_SIZE) {
+      vec_op::BF16Vec8 q_vec(q + q_offset);
+      vec_op::BF16Vec32 q_group_vec(q_vec);
+
+      vec_op::unroll_loop<int, GROUP_NUM>(
+          [k_block, &q_group_vec, &group_accums](int token_group_idx) {
+            vec_op::BF16Vec32 k_group_vec(k_block + token_group_idx * x *
+                                                        TOKEN_PER_GROUP);
+
+            group_accums[token_group_idx] = vec_op::fma(
+                q_group_vec, k_group_vec, group_accums[token_group_idx]);
+            vec_op::prefetch(k_block + x * BLOCK_SIZE +
+                             token_group_idx * x * TOKEN_PER_GROUP);
+          });
+    }
+    vec_op::unroll_loop<int, GROUP_NUM>([&group_accums, logits,
+                                         scale](int token_group_idx) {
+      vec_op::unroll_loop<int, TOKEN_PER_GROUP>(
+          [&group_accums, logits, scale, token_group_idx](int token_idx) {
+            float dot_v =
+                group_accums[token_group_idx]
+                    .template reduce_sub_sum<vec_op::FP32Vec16::get_elem_num() /
+                                             TOKEN_PER_GROUP>(token_idx);
+            logits[token_group_idx * TOKEN_PER_GROUP + token_idx] =
+                dot_v * scale;
+          });
+    });
+  }
+};
 
 // Note: not a efficient implementation for fp32
 template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE,
@@ -182,9 +213,9 @@ struct paged_attention_v1_impl {
           float *__restrict__ head_block_logits =
               logits + head_idx * max_context_len_padded +
               block_idx * BLOCK_SIZE;
-
-          reduceQKBlock<scalar_t, HEAD_SIZE, BLOCK_SIZE, x>(
-              q_vec_ptr, k_block_cache_ptr, head_block_logits, scale, false);
+          reduceQKBlockKernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, x>::call(
+              q_vec_ptr, k_block_cache_ptr, head_block_logits, scale,
+              BLOCK_SIZE);
         }
       }
 
@@ -275,6 +306,8 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
         const int64_t kv_head_idx = head_idx / num_queries_per_kv;
         const scalar_t *__restrict__ q_vec_ptr =
             q + seq_idx * q_stride + head_idx * HEAD_SIZE;
+        const int last_block_token_num =
+            context_len - (block_num - 1) * BLOCK_SIZE;
         float *__restrict__ thread_block_logits =
             logits + omp_get_thread_num() * max_context_len_padded;
 
@@ -287,8 +320,9 @@ struct paged_attention_v1_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE> {
           float *__restrict__ head_block_logits =
               thread_block_logits + block_idx * BLOCK_SIZE;
 
-          reduceQKBlock<HEAD_SIZE, BLOCK_SIZE, x>(
-              q_vec_ptr, k_block_cache_ptr, head_block_logits, scale, false);
+          reduceQKBlockKernel<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE, x>::call(
+              q_vec_ptr, k_block_cache_ptr, head_block_logits, scale,
+              block_idx == block_num - 1 ? last_block_token_num : BLOCK_SIZE);
         }
 
         // Compute softmax
@@ -508,6 +542,8 @@ struct paged_attention_v2_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE,
                start_token_idx);
           const int block_num =
               (context_token_num + BLOCK_SIZE - 1) / BLOCK_SIZE;
+          const int last_block_token_num =
+              context_token_num - (block_num - 1) * BLOCK_SIZE;
           const int *seq_block_table = block_tables +
                                        max_num_blocks_per_seq * seq_idx +
                                        start_token_idx / BLOCK_SIZE;
@@ -526,8 +562,9 @@ struct paged_attention_v2_impl<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE,
             float *__restrict__ head_block_logits =
                 logits + block_idx * BLOCK_SIZE;
 
-            reduceQKBlock<HEAD_SIZE, BLOCK_SIZE, x>(
-                q_vec_ptr, k_block_cache_ptr, head_block_logits, scale, false);
+            reduceQKBlockKernel<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE, x>::call(
+                q_vec_ptr, k_block_cache_ptr, head_block_logits, scale,
+                block_idx == block_num - 1 ? last_block_token_num : BLOCK_SIZE);
           }
 
           auto &&[max_logit, exp_sum] =
