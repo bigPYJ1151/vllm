@@ -24,6 +24,8 @@ namespace vec_op {
 #define CPU_KERNEL_GUARD_OUT(NAME) std::cout << #NAME << " exit." << std::endl;
 #endif
 
+#define FORCE_INLINE __attribute__((always_inline)) 
+
 namespace {
 template <typename T, T... indexes, typename F>
 constexpr void unroll_loop_item(std::integer_sequence<T, indexes...>, F &&f) {

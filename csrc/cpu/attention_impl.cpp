@@ -2,8 +2,8 @@
 
 namespace {
 template <typename T>
-inline std::pair<T, T> reduceSoftmax(T *data, const int size,
-                                     const int capacity) {
+inline std::pair<T, T> FORCE_INLINE reduceSoftmax(T *data, const int size,
+                                                  const int capacity) {
   T max = data[0];
   for (int i = 1; i < size; ++i) {
     max = max >= data[i] ? max : data[i];
@@ -28,8 +28,8 @@ inline std::pair<T, T> reduceSoftmax(T *data, const int size,
 }
 
 template <typename T>
-inline void reducePartitonSoftmax(const T *max_data, T *sum_data,
-                                  const int size) {
+inline void FORCE_INLINE reducePartitonSoftmax(const T *max_data, T *sum_data,
+                                               const int size) {
   T max = max_data[0];
   for (int i = 1; i < size; ++i) {
     max = max >= max_data[i] ? max : max_data[i];
@@ -49,10 +49,10 @@ inline void reducePartitonSoftmax(const T *max_data, T *sum_data,
 // Note: not an efficient implementation for fp32
 template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int x>
 struct reduceQKBlockKernel {
-  static void call(const scalar_t *__restrict__ q,
-                   const scalar_t *__restrict__ k_block,
-                   float *__restrict__ logits, float scale,
-                   const int token_num) {
+  static void FORCE_INLINE call(const scalar_t *__restrict__ q,
+                                const scalar_t *__restrict__ k_block,
+                                float *__restrict__ logits, float scale,
+                                const int token_num) {
     for (int q_offset = 0; q_offset < HEAD_SIZE; q_offset += x, q += x) {
       for (int token_idx = 0; token_idx < BLOCK_SIZE;
            ++token_idx, k_block += x) {
@@ -68,10 +68,10 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int x>
 struct reduceQKBlockKernel<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE, x> {
   constexpr static int TOKEN_PER_GROUP = vec_op::BF16Vec32::get_elem_num() / x;
 
-  static void call(const c10::BFloat16 *__restrict__ q,
-                   const c10::BFloat16 *__restrict__ k_block,
-                   float *__restrict__ logits, float scale,
-                   const int token_num) {
+  static void FORCE_INLINE call(const c10::BFloat16 *__restrict__ q,
+                                const c10::BFloat16 *__restrict__ k_block,
+                                float *__restrict__ logits, float scale,
+                                const int token_num) {
     static_assert(vec_op::BF16Vec32::get_elem_num() % x == 0);
     static_assert(TOKEN_PER_GROUP == 4);
     const int group_num = (token_num + TOKEN_PER_GROUP - 1) / TOKEN_PER_GROUP;
@@ -95,9 +95,10 @@ struct reduceQKBlockKernel<c10::BFloat16, HEAD_SIZE, BLOCK_SIZE, x> {
   }
 
   template <int GROUP_NUM>
-  static void kernel_impl(const c10::BFloat16 *__restrict__ q,
-                          const c10::BFloat16 *__restrict__ k_block,
-                          float *__restrict__ logits, float scale) {
+  static void FORCE_INLINE
+  kernel_impl(const c10::BFloat16 *__restrict__ q,
+              const c10::BFloat16 *__restrict__ k_block,
+              float *__restrict__ logits, float scale) {
     static_assert(BLOCK_SIZE % TOKEN_PER_GROUP == 0);
 
     vec_op::FP32Vec16 group_accums[GROUP_NUM];
