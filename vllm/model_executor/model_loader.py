@@ -46,20 +46,21 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
     linear_method = None
     if model_config.quantization is not None:
         quant_config = get_quant_config(model_config)
-        capability = torch.cuda.get_device_capability()
-        capability = capability[0] * 10 + capability[1]
-        if capability < quant_config.get_min_capability():
-            raise ValueError(
-                f"The quantization method {model_config.quantization} is not "
-                "supported for the current GPU. "
-                f"Minimum capability: {quant_config.get_min_capability()}. "
-                f"Current capability: {capability}.")
-        supported_dtypes = quant_config.get_supported_act_dtypes()
-        if model_config.dtype not in supported_dtypes:
-            raise ValueError(
-                f"{model_config.dtype} is not supported for quantization "
-                f"method {model_config.quantization}. Supported dtypes: "
-                f"{supported_dtypes}")
+        if not device_config.device_type == "cpu":
+            capability = torch.cuda.get_device_capability()
+            capability = capability[0] * 10 + capability[1]
+            if capability < quant_config.get_min_capability():
+                raise ValueError(
+                    f"The quantization method {model_config.quantization} is not "
+                    "supported for the current GPU. "
+                    f"Minimum capability: {quant_config.get_min_capability()}. "
+                    f"Current capability: {capability}.")
+            supported_dtypes = quant_config.get_supported_act_dtypes()
+            if model_config.dtype not in supported_dtypes:
+                raise ValueError(
+                    f"{model_config.dtype} is not supported for quantization "
+                    f"method {model_config.quantization}. Supported dtypes: "
+                    f"{supported_dtypes}")
         linear_method = quant_config.get_linear_method()
 
     with _set_default_torch_dtype(model_config.dtype):
