@@ -26,6 +26,8 @@ namespace vec_op {
 
 #define FORCE_INLINE __attribute__((always_inline)) inline
 
+#define RESTRICT __restrict__
+
 namespace {
 template <typename T, T... indexes, typename F>
 constexpr void unroll_loop_item(std::integer_sequence<T, indexes...>, F &&f) {
@@ -98,6 +100,8 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
 
   explicit BF16Vec16(const void *ptr)
       : reg((__m256i)_mm256_loadu_si256((__m256i *)ptr)) {}
+
+  explicit BF16Vec16(c10::BFloat16 v) : reg((__m256i)_mm256_set1_epi16(v.x)) {}
 
   explicit BF16Vec16(const FP32Vec16 &);
 
