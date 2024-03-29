@@ -154,11 +154,13 @@ class AWQLinearMethod(LinearMethodBase):
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         # num_tokens >= threshold
-        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
+        # FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
+        FP16_MATMUL_HEURISTIC_CONDITION = True
 
         if FP16_MATMUL_HEURISTIC_CONDITION:
-            out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
-            out = torch.matmul(reshaped_x, out)
+            # weight = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
+            out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros,
+                               pack_factor)
         else:
             out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros,
                                pack_factor)

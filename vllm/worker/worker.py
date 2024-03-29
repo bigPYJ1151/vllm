@@ -84,8 +84,8 @@ class Worker:
             torch.cuda.set_device(self.device)
 
             _check_if_gpu_supports_dtype(self.model_config.dtype)
-            device_empty_cache(self.device_config)
-            self.init_gpu_memory = mem_get_info(self.device_config)[0]
+            torch.cuda.empty_cache()
+            self.init_gpu_memory = torch.cuda.mem_get_info()[0]
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
@@ -121,7 +121,7 @@ class Worker:
         """
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
-        device_empty_cache(self.device_config)
+        torch.cuda.empty_cache()
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -129,8 +129,8 @@ class Worker:
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
-        device_synchronize(self.device_config)
-        free_gpu_memory, total_gpu_memory = mem_get_info(self.device_config)
+        torch.cuda.synchronize()
+        free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
         peak_memory = self.init_gpu_memory - free_gpu_memory
@@ -146,7 +146,7 @@ class Worker:
         if self.model_runner.lora_manager:
             self.model_runner.remove_all_loras()
         gc.collect()
-        device_empty_cache(self.device_config)
+        torch.cuda.empty_cache()
         return num_gpu_blocks, num_cpu_blocks
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
@@ -275,7 +275,7 @@ def init_distributed_environment(
             "distributed_init_method must be set if torch.distributed "
             "is not already initialized")
     else:
-        backend = get_distribute_backend(device_config)
+        backend = "nccl"
         torch.distributed.init_process_group(
             backend=backend,
             world_size=parallel_config.world_size,
