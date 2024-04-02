@@ -328,8 +328,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
-        choices=["cuda"],
+        default="auto",
         help='device type for vLLM execution, supporting CUDA only currently.')
     parser.add_argument(
         "--enable-prefix-caching",
