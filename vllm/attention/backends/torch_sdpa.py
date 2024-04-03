@@ -141,7 +141,7 @@ class TorchSDPABackendImpl(AttentionImpl):
                                                 attn_metadata.kv_cache_dtype)
 
         if attn_metadata.is_prompt:
-            if (kv_cache is None or attn_metadata.block_tables.numel() == 0):
+            if (kv_cache is None or attn_metadata.block_tables is None):
                 if self.num_kv_heads != self.num_heads:
                     key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
                     value = value.repeat_interleave(self.num_queries_per_kv,
@@ -221,8 +221,8 @@ def _make_alibi_bias(
         bias = bias[None, :] - bias[:, None]
 
         num_heads = alibi_slopes.shape[0]
-        bias = bias[None, :].expand(num_heads, prompt_len, prompt_len)
-        bias.mul_(alibi_slopes[:, None, None])
+        bias = bias[None, :].expand(num_heads, prompt_len, prompt_len)\
+                .mul(alibi_slopes[:, None, None])
         inf_mask = torch.empty(
             (1, prompt_len, prompt_len),
             dtype=bias.dtype).fill_(-torch.inf).triu_(diagonal=1)
