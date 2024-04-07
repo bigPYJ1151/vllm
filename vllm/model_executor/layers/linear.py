@@ -208,6 +208,7 @@ class ColumnParallelLinear(torch.nn.Module):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
+    @torch.compile(dynamic=True)
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
 
