@@ -38,6 +38,7 @@ find_isa(${CPUINFO} "avx512f" AVX512_FOUND)
 if (AVX512_FOUND)
     list(APPEND CXX_COMPILE_FLAGS
         "-mavx512f"
+        "-mf16c"
         "-mavx512vl"
         "-mavx512bw"
         "-mavx512dq")
