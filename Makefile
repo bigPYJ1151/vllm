@@ -17,7 +17,7 @@ VLLM_TP_bench:
 	 python benchmark_throughput.py --backend=vllm --dataset=/root/HF_models/ShareGPT_V3_unfiltered_cleaned_split.json --model=/root/HF_models/vicuna-7b-v1.5/ --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code
 
 VLLM_LT_bench:
-	cd benchmarks && python benchmark_latency.py --model=/root/HF_models/vicuna-7b-v1.5/ --n=1 --batch-size=8 --input-len=128 --output-len=512 --num-iters=4 --dtype=bfloat16 --trust-remote-code --device=cpu --swap-space=40
+	cd benchmarks && LOGGING=INFO python benchmark_latency.py --model=/root/HF_models/vicuna-7b-v1.5/ --n=1 --batch-size=8 --input-len=128 --output-len=512 --num-iters=4 --dtype=bfloat16 --trust-remote-code --device=cpu --swap-space=40
 
 VLLM_SERVE_bench:
 	cd benchmarks && python -m vllm.entrypoints.api_server \

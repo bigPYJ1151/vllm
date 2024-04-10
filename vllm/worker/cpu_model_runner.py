@@ -1,11 +1,12 @@
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import time
 
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import (DeviceConfig, LoRAConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig)
-from vllm.logger import init_logger
+from vllm.logger import init_logger, init_perf_logger
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.parallel_utils.communication_op import (
@@ -15,6 +16,7 @@ from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.utils import make_tensor_with_pad, maybe_expand_dim
 
 logger = init_logger(__name__)
+perf_logger = init_perf_logger(__name__)
 
 _PAD_SLOT_ID = -1
 
@@ -388,11 +390,14 @@ class CPUModelRunner:
             "attn_metadata": attn_metadata,
         }
 
+        perf_logger.info("start,{},{},{},{}".format(attn_metadata.is_prompt, input_tokens.shape[0], input_tokens.shape[1], time.perf_counter_ns()))
+
         hidden_states = model_executable(**execute_model_kwargs)
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
+        perf_logger.info("end,{},{},{},{}".format(attn_metadata.is_prompt, input_tokens.shape[0], input_tokens.shape[1], time.perf_counter_ns()))
         # Only perform sampling in the driver worker.
         if not sampling_metadata.perform_sampling:
             return None

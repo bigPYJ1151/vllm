@@ -4,6 +4,7 @@
 import logging
 import os
 import sys
+import time
 
 VLLM_CONFIGURE_LOGGING = int(os.getenv("VLLM_CONFIGURE_LOGGING", "1"))
 
@@ -58,4 +59,12 @@ def init_logger(name: str):
     if VLLM_CONFIGURE_LOGGING:
         logger.addHandler(_default_handler)
         logger.propagate = False
+    return logger
+
+def init_perf_logger(name: str):
+    logger = logging.getLogger("perf_{}".format(name))
+    logger.setLevel(os.getenv("LOGGING", "WARNING"))
+    csv_handler = logging.FileHandler("perf_{}_log_{}.csv".format(name, time.perf_counter_ns()))
+    logger.addHandler(csv_handler)
+    logger.propagate = False
     return logger
