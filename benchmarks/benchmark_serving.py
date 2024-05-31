@@ -17,6 +17,10 @@ On the client side, run:
         --dataset-path <path to dataset> \
         --request-rate <request_rate> \ # By default <request_rate> is inf
         --num-prompts <num_prompts> # By default <num_prompts> is 1000
+        
+    when using tgi backend, add
+        --endpoint /generate_stream
+    to the end of the command above.
 """
 import argparse
 import asyncio
@@ -58,6 +62,7 @@ def sample_sharegpt_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
+    input_len: Optional[int] = None,
     fixed_output_len: Optional[int] = None,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
@@ -94,6 +99,8 @@ def sample_sharegpt_requests(
             continue
         if prompt_len > 1024 or prompt_len + output_len > 2048:
             # Prune too long sequences.
+            continue
+        if input_len is not None and prompt_len != input_len:
             continue
         filtered_dataset.append((prompt, prompt_len, output_len))
 
@@ -359,6 +366,7 @@ def main(args: argparse.Namespace):
             dataset_path=args.dataset,
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
+            input_len = args.sharegpt_input_len,
             fixed_output_len=args.sharegpt_output_len,
         )
 
@@ -367,6 +375,7 @@ def main(args: argparse.Namespace):
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
+            input_len = args.sharegpt_input_len,
             fixed_output_len=args.sharegpt_output_len,
         )
 
@@ -524,6 +533,12 @@ if __name__ == "__main__":
         default=1000,
         help="Number of prompts to process.",
     )
+    parser.add_argument(
+        "--sharegpt-input-len",
+        type=int,
+        default=None,
+        help="Input length for each request. Overrides the output length "
+        "from the ShareGPT dataset.")
     parser.add_argument(
         "--sharegpt-output-len",
         type=int,
