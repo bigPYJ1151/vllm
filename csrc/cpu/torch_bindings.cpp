@@ -19,8 +19,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    str kv_cache_dtype, float kv_scale, int tp_rank,"
       "    int blocksparse_local_blocks,"
       "    int blocksparse_vert_stride, int blocksparse_block_size,"
-      "    int blocksparse_head_sliding_step) -> ()");
-  ops.impl("paged_attention_v1", torch::kCPU, TORCH_FN(paged_attention_v1));
+      "    int blocksparse_head_sliding_step) -> ()", TORCH_FN(paged_attention_v1));
+//   ops.impl("paged_attention_v1", torch::kCPU, TORCH_FN(paged_attention_v1));
 
   // PagedAttention V2.
   ops.def(
@@ -33,65 +33,65 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    str kv_cache_dtype, float kv_scale, int tp_rank,"
       "    int blocksparse_local_blocks,"
       "    int blocksparse_vert_stride, int blocksparse_block_size,"
-      "    int blocksparse_head_sliding_step) -> ()");
-  ops.impl("paged_attention_v2", torch::kCPU, TORCH_FN(paged_attention_v2));
+      "    int blocksparse_head_sliding_step) -> ()", TORCH_FN(paged_attention_v2));
+//   ops.impl("paged_attention_v2", torch::kCPU, TORCH_FN(paged_attention_v2));
 
   // Activation ops
 
   // Activation function used in SwiGLU.
-  ops.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
-  ops.impl("silu_and_mul", torch::kCPU, TORCH_FN(silu_and_mul));
+  ops.def("silu_and_mul(Tensor! out, Tensor input) -> ()", TORCH_FN(silu_and_mul));
+//   ops.impl("silu_and_mul", torch::kCPU, TORCH_FN(silu_and_mul));
 
   // Activation function used in GeGLU with `none` approximation.
-  ops.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
-  ops.impl("gelu_and_mul", torch::kCPU, TORCH_FN(gelu_and_mul));
+  ops.def("gelu_and_mul(Tensor! out, Tensor input) -> ()", TORCH_FN(gelu_and_mul));
+//   ops.impl("gelu_and_mul", torch::kCPU, TORCH_FN(gelu_and_mul));
 
   // Activation function used in GeGLU with `tanh` approximation.
-  ops.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
-  ops.impl("gelu_tanh_and_mul", torch::kCPU, TORCH_FN(gelu_tanh_and_mul));
+  ops.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()", TORCH_FN(gelu_tanh_and_mul));
+//   ops.impl("gelu_tanh_and_mul", torch::kCPU, TORCH_FN(gelu_tanh_and_mul));
 
   // GELU implementation used in GPT-2.
-  ops.def("gelu_new(Tensor! out, Tensor input) -> ()");
-  ops.impl("gelu_new", torch::kCPU, TORCH_FN(gelu_new));
+  ops.def("gelu_new(Tensor! out, Tensor input) -> ()", TORCH_FN(gelu_new));
+//   ops.impl("gelu_new", torch::kCPU, TORCH_FN(gelu_new));
 
   // Approximate GELU implementation.
-  ops.def("gelu_fast(Tensor! out, Tensor input) -> ()");
-  ops.impl("gelu_fast", torch::kCPU, TORCH_FN(gelu_fast));
+  ops.def("gelu_fast(Tensor! out, Tensor input) -> ()", TORCH_FN(gelu_fast));
+//   ops.impl("gelu_fast", torch::kCPU, TORCH_FN(gelu_fast));
 
   // Layernorm
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(
       "rms_norm(Tensor! out, Tensor input, Tensor weight, float epsilon) -> "
-      "()");
-  ops.impl("rms_norm", torch::kCPU, TORCH_FN(rms_norm));
+      "()", TORCH_FN(rms_norm));
+//   ops.impl("rms_norm", torch::kCPU, TORCH_FN(rms_norm));
 
   // In-place fused Add and RMS Normalization.
   ops.def(
       "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, "
-      "float epsilon) -> ()");
-  ops.impl("fused_add_rms_norm", torch::kCPU, TORCH_FN(fused_add_rms_norm));
+      "float epsilon) -> ()", TORCH_FN(fused_add_rms_norm));
+//   ops.impl("fused_add_rms_norm", torch::kCPU, TORCH_FN(fused_add_rms_norm));
 
   // Rotary embedding
   // Apply GPT-NeoX or GPT-J style rotary embedding to query and key.
   ops.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor! key, int head_size,"
-      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
-  ops.impl("rotary_embedding", torch::kCPU, TORCH_FN(rotary_embedding));
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()", TORCH_FN(rotary_embedding));
+//   ops.impl("rotary_embedding", torch::kCPU, TORCH_FN(rotary_embedding));
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   // Cache ops
   // Swap in (out) the cache blocks from src to dst.
   cache_ops.def(
-      "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");
-  cache_ops.impl("swap_blocks", torch::kCPU, TORCH_FN(swap_blocks));
+      "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()", TORCH_FN(swap_blocks));
+//   cache_ops.impl("swap_blocks", torch::kCPU, TORCH_FN(swap_blocks));
 
   // Copy the cache blocks from src to dst.
   cache_ops.def(
       "copy_blocks(Tensor[]! key_caches, Tensor[]! value_caches, Tensor "
-      "block_mapping) -> ()");
-  cache_ops.impl("copy_blocks", torch::kCPU, TORCH_FN(copy_blocks));
+      "block_mapping) -> ()", TORCH_FN(copy_blocks));
+//   cache_ops.impl("copy_blocks", torch::kCPU, TORCH_FN(copy_blocks));
 
   // Reshape the key and value tensors and cache them.
   cache_ops.def(
@@ -99,8 +99,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                  Tensor! key_cache, Tensor! value_cache,"
       "                  Tensor slot_mapping,"
       "                  str kv_cache_dtype,"
-      "                  float kv_scale) -> ()");
-  cache_ops.impl("reshape_and_cache", torch::kCPU, TORCH_FN(reshape_and_cache));
+      "                  float kv_scale) -> ()", TORCH_FN(reshape_and_cache));
+//   cache_ops.impl("reshape_and_cache", torch::kCPU, TORCH_FN(reshape_and_cache));
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
