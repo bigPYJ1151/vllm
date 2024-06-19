@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.distributed import ProcessGroup
-from vllm._C import ops
 
 from .parallel_state import (get_cpu_world_group, get_pp_pynccl_communicator,
                              get_tensor_model_parallel_group,
@@ -14,6 +13,7 @@ from .parallel_state import (get_cpu_world_group, get_pp_pynccl_communicator,
                              get_tp_ca_communicator,
                              get_tp_pynccl_communicator)
 
+from intel_extension_for_pytorch._C import tpp_shm_allreduce
 
 @dataclass
 class GraphCaptureContext:
@@ -86,7 +86,9 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     # Bypass the function if we are using only 1 GPU.
     if get_tensor_model_parallel_world_size() == 1:
         return input_
-    ops.shm_allreduce(input_, get_tensor_model_parallel_rank())
+
+    tpp_shm_allreduce(input_, get_tensor_model_parallel_group())
+    
     return input_
 
 

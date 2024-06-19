@@ -1,6 +1,6 @@
 import os
 import copy
-from typing import Dict, List, Optional, Tuple, Set
+from typing import List, Tuple, Set
 
 import torch
 import torch.distributed
@@ -134,24 +134,6 @@ class CPUExecutor(ExecutorBase):
             self.children_workers.append(child_worker)
             ray.get(child_worker.init_runner.remote(model_config))
         
-        task_handlers = []
-        for child in self.children_workers:
-            task_handlers.append(child.init_device.remote())
-            task_handlers.append(child.load_model.remote())
-        
-        self._init_worker()
-
-        # Initialize SHM CCL
-        for child in self.children_workers:
-            task_handlers.append(child.init_shm_manager.remote())
-        ray.get(task_handlers)
-        self.driver_worker.init_shm_manager()
-
-        for child in self.children_workers:
-            task_handlers.append(child.join_shm_manager.remote())
-        ray.get(task_handlers)
-        self.driver_worker.join_shm_manager()
-
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
         underlying worker.

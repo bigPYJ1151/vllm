@@ -2,15 +2,15 @@
 
 install_deps:
 	pip install wheel packaging ninja setuptools>=49.4.0 numpy
-	pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+	pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/nightly
 
 install:
 	VLLM_TARGET_DEVICE=cpu pip install --no-build-isolation  -v -e .
 
 VLLM_TP_2S_bench:
 	ray stop
-	OMP_DISPLAY_ENV=VERBOSE VLLM_CPU_KVCACHE_SPACE=40 OMP_PROC_BIND=close numactl --physcpubind=32-63 --membind=1 ray start --head --num-cpus=32 --num-gpus=0
-	cd benchmarks && OMP_DISPLAY_ENV=VERBOSE VLLM_CPU_KVCACHE_SPACE=40 OMP_PROC_BIND=close numactl --physcpubind=0-31 --membind=0 python3 benchmark_throughput.py --backend=vllm --dataset=./ShareGPT_V3_unfiltered_cleaned_split.json --model=lmsys/vicuna-7b-v1.5 --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code --device=cpu -tp=2
+	OMP_DISPLAY_ENV=VERBOSE VLLM_CPU_KVCACHE_SPACE=40 OMP_PROC_BIND=close LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 numactl --physcpubind=24-47 --membind=0 ray start --head --num-cpus=24 --num-gpus=0
+	cd benchmarks && OMP_DISPLAY_ENV=VERBOSE VLLM_CPU_KVCACHE_SPACE=40 OMP_PROC_BIND=close LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 numactl --physcpubind=0-23 --membind=0 python3 benchmark_throughput.py --backend=vllm --dataset=./ShareGPT_V3_unfiltered_cleaned_split.json --model=lmsys/vicuna-7b-v1.5 --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code --device=cpu -tp=2
 
 VLLM_2S_offline:
 	ray stop
@@ -37,8 +37,10 @@ HF_TP_bench:
 VLLM_TP_bench:
 	cd benchmarks && \
 	 OMP_DISPLAY_ENV=verbose \
-	 VLLM_CPU_KVCACHE_SPACE=40 \
+	 VLLM_CPU_KVCACHE_SPACE=100 \
 	 OMP_PROC_BIND=close \
+	 TORCH_LOGS="recompiles" \
+	 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 \
 	 python3 benchmark_throughput.py --backend=vllm --dataset=./ShareGPT_V3_unfiltered_cleaned_split.json --model=lmsys/vicuna-7b-v1.5 --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code --device=cpu
 
 VLLM_LT_bench:
