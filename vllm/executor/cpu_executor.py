@@ -74,14 +74,6 @@ class CPUExecutor(ExecutorBase):
         threads_num_per_node = torch.get_num_threads()
         nodes = ray.nodes()
 
-        for node in nodes:
-            node_thread_num = node["Resources"]["CPU"]
-            if threads_num_per_node != node_thread_num:
-                raise RuntimeError(
-                    f"Number of OMP threads {node_thread_num} in child node "
-                    f"doesn't match with the number {threads_num_per_node} in "
-                    "driver worker.") 
-
         if self.parallel_config.placement_group is None:
             placement_group_specs = (
                 [{"CPU": threads_num_per_node}] * \
