@@ -133,7 +133,14 @@ class CPUExecutor(ExecutorBase):
             ) # type: ignore
             self.children_workers.append(child_worker)
             ray.get(child_worker.init_runner.remote(model_config))
+
+        task_handlers = []
+        for child in self.children_workers:
+            task_handlers.append(child.init_device.remote())
+            task_handlers.append(child.load_model.remote())
         
+        self._init_worker()
+
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
         underlying worker.
