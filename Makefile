@@ -39,10 +39,16 @@ VLLM_TP_bench:
 	 OMP_DISPLAY_ENV=verbose \
 	 VLLM_CPU_KVCACHE_SPACE=40 \
 	 OMP_PROC_BIND=close \
+	 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 \
 	 python3 benchmark_throughput.py --backend=vllm --dataset=./ShareGPT_V3_unfiltered_cleaned_split.json --model=lmsys/vicuna-7b-v1.5 --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code --device=cpu
 
 VLLM_LT_bench:
-	cd benchmarks && python benchmark_latency.py --model=/root/HF_models/vicuna-7b-v1.5/ --n=1 --batch-size=8 --input-len=128 --output-len=512 --num-iters=4 --dtype=bfloat16 --trust-remote-code --device=cpu --swap-space=40
+	cd benchmarks && \
+	OMP_DISPLAY_ENV=verbose \
+	VLLM_CPU_KVCACHE_SPACE=40 \
+	OMP_PROC_BIND=close \
+	LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 \
+	python3 benchmark_latency.py --model=nvidia/Llama3-ChatQA-1.5-8B --n=1 --batch-size=128 --input-len=32 --output-len=1024 --num-iters-warmup=0 --num-iters=1 --dtype=bfloat16 --trust-remote-code --device=cpu
 
 VLLM_SERVE_bench:
 	cd benchmarks && python -m vllm.entrypoints.api_server \

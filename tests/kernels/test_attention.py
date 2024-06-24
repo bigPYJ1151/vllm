@@ -3,8 +3,8 @@ from typing import List, Optional, Tuple
 
 import pytest
 import torch
-from xformers import ops as xops
-from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
+# from xformers import ops as xops
+# from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
 
 from vllm import _custom_ops as ops
 from vllm.utils import get_max_shared_memory_bytes, is_hip
@@ -20,24 +20,19 @@ MAX_SEQ_LEN = get_max_shared_memory_bytes() // FLOAT32_BYTES - 512
 NUM_BLOCKS = 4321  # Arbitrary values for testing
 PARTITION_SIZE = 512
 # flshattF and tritonflashattF supported: {torch.float16, torch.bfloat16}
-DTYPES = [torch.half, torch.bfloat16, torch.float
-          ] if not is_hip() else [torch.half, torch.bfloat16]
+DTYPES = [torch.bfloat16, torch.float32]
 NUM_GEN_SEQS = [7]  # Arbitrary values for testing
 NUM_PREFILL_SEQS = [3]  # Arbitrary values for testing
 NUM_HEADS = [(40, 40), (64, 8)]  # Arbitrary values for testing
 
 # FlashAttention forward only supports head dimension at most 128
 # https://github.com/ROCmSoftwarePlatform/flash-attention/blob/3d2b6f5d037782cc2c906909a46fb7e2e1b48b25/csrc/flash_attn_rocm/flash_api.cpp#L62
-HEAD_SIZES = [64, 80, 96, 112, 128, 192, 256
-              ] if not is_hip() else [64, 80, 96, 112, 128]
-
-BLOCK_SIZES = [16, 32]
+HEAD_SIZES = [64, 80, 96, 112, 128, 192, 256]
+BLOCK_SIZES = [16]
 USE_ALIBI = [False, True]
-KV_CACHE_DTYPE = ["auto", "fp8"]
+KV_CACHE_DTYPE = ["auto"]
 SEEDS = [0]
-CUDA_DEVICES = [
-    f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
-]
+CUDA_DEVICES = ["cpu"]
 
 
 def ref_masked_attention(

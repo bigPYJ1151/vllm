@@ -452,23 +452,26 @@ class AsyncLLMEngine:
             device_config = kwargs["device_config"]
             if device_config.device_type == "cpu":
                 import os
+
                 from ray.util.scheduling_strategies import (
-                    PlacementGroupSchedulingStrategy
-                )
-                omp_thread_num = int(os.getenv("OMP_NUM_THREADS"))
-                placement_group_specs = (
-                    [{"CPU": omp_thread_num}] * parallel_config.world_size)
+                    PlacementGroupSchedulingStrategy)
+                omp_thread_num = int(os.getenv("OMP_NUM_THREADS", "0"))
+                placement_group_specs = ([{
+                    "CPU": omp_thread_num
+                }] * parallel_config.world_size)
                 placement_group = ray.util.placement_group(
                     placement_group_specs, strategy="STRICT_SPREAD")
                 ray.get(placement_group.ready(), timeout=1800)
                 parallel_config.placement_group = placement_group
                 scheduling_strategy = PlacementGroupSchedulingStrategy(
-                        placement_group=placement_group,
-                        placement_group_capture_child_tasks=True,
-                        placement_group_bundle_index=0,
-                    )
-                engine_class = ray.remote(num_cpus=omp_thread_num,                 scheduling_strategy=scheduling_strategy)(
-                    self._engine_class).remote 
+                    placement_group=placement_group,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=0,
+                )
+                engine_class = ray.remote(
+                    num_cpus=omp_thread_num,
+                    scheduling_strategy=scheduling_strategy)(
+                        self._engine_class).remote
             else:
                 if parallel_config.tensor_parallel_size == 1:
                     num_gpus = cache_config.gpu_memory_utilization

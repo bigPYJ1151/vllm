@@ -9,9 +9,8 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
                          VisionLanguageConfig)
 from vllm.distributed import (broadcast_tensor_dict,
-                              parallel_state,
                               ensure_model_parallel_initialized,
-                              init_distributed_environment)
+                              init_distributed_environment, parallel_state)
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.sequence import ExecuteModelRequest, SamplerOutput
@@ -122,7 +121,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
 
     def __init__(
         self,
-        model_config: Optional[ModelConfig],
+        model_config: ModelConfig,
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
@@ -180,8 +179,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
             kv_cache_dtype=self.kv_cache_dtype,
-            is_driver_worker=self.is_driver_worker
-        )
+            is_driver_worker=self.is_driver_worker)
 
     def init_device(self) -> None:
         self.init_distributed_environment()
@@ -190,7 +188,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
 
     def load_model(self):
         self.model_runner.load_model()
-    
+
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of blocks available for the KV cache.
 
@@ -344,12 +342,13 @@ class CPUWorker(LoraNotSupportedWorkerBase):
     def init_shm_manager(self):
         from vllm._C.ops import init_shm_manager
 
-        elem_size = torch.tensor([], 
-                                    dtype=self.model_config.dtype).element_size()
+        elem_size = torch.tensor([],
+                                 dtype=self.model_config.dtype).element_size()
         world_size = parallel_state.get_tensor_model_parallel_world_size()
-        hidden_size = self.model_config.get_hidden_size() 
+        hidden_size = self.model_config.get_hidden_size()
         rank_buffer_size = \
-            self.model_config.max_model_len * hidden_size * 5 // world_size * elem_size 
+            self.model_config.max_model_len * hidden_size * 5 // world_size \
+                  * elem_size
         init_shm_manager(
             self.ip_port,
             parallel_state.get_tensor_model_parallel_world_size(),
@@ -360,12 +359,13 @@ class CPUWorker(LoraNotSupportedWorkerBase):
     def join_shm_manager(self):
         from vllm._C.ops import join_shm_manager
 
-        elem_size = torch.tensor([], 
-                                    dtype=self.model_config.dtype).element_size()
+        elem_size = torch.tensor([],
+                                 dtype=self.model_config.dtype).element_size()
         world_size = parallel_state.get_tensor_model_parallel_world_size()
-        hidden_size = self.model_config.get_hidden_size() 
+        hidden_size = self.model_config.get_hidden_size()
         rank_buffer_size = \
-            self.model_config.max_model_len * hidden_size * 5 // world_size * elem_size 
+            self.model_config.max_model_len * hidden_size * 5 // world_size \
+                  * elem_size
         ret = join_shm_manager(
             self.ip_port,
             parallel_state.get_tensor_model_parallel_world_size(),

@@ -131,7 +131,6 @@ struct reduceQKBlockKernel {
 
   constexpr static int TOKEN_PER_GROUP = k_load_vec_type::get_elem_num() / x;
   constexpr static int MAX_GROUP_NUM = 16 / TOKEN_PER_GROUP;
-  constexpr static int UNROLL_GROUP_NUM = MAX_GROUP_NUM / 4;
 
   static_assert(MAX_GROUP_NUM == 8 || MAX_GROUP_NUM == 4);
   static_assert(k_load_vec_type::get_elem_num() % x == 0);
@@ -139,48 +138,23 @@ struct reduceQKBlockKernel {
 
   FORCE_INLINE static void call(const scalar_t* __restrict__ q,
                                 const scalar_t* __restrict__ k_block,
+                                const scalar_t* __restrict__ next_k_block,
                                 float* __restrict__ logits, float scale,
                                 const int token_num) {
     const int group_num = (token_num + TOKEN_PER_GROUP - 1) / TOKEN_PER_GROUP;
 
     qk_acc_vec_type group_accums[MAX_GROUP_NUM];
-    if (token_num == BLOCK_SIZE) {
-      for (int q_offset = 0; q_offset < HEAD_SIZE;
-           q_offset += x, k_block += x * BLOCK_SIZE) {
-        q_load_vec_type q_load_group_vec(q + q_offset);
-        q_vec_type q_group_vec(q_load_group_vec);
-
-        vec_op::unroll_loop<int, MAX_GROUP_NUM>(
-            [k_block, &q_group_vec, &group_accums](int token_group_idx) {
-              k_load_vec_type k_load_group_vec(k_block + token_group_idx * x *
-                                                             TOKEN_PER_GROUP);
-              k_vec_type k_group_vec(k_load_group_vec);
-              vec_op::fma(group_accums[token_group_idx], q_group_vec,
-                          k_group_vec);
-              vec_op::prefetch(k_block + x * BLOCK_SIZE +
-                               token_group_idx * x * TOKEN_PER_GROUP);
-            });
-      }
-    } else {
-      for (int q_offset = 0; q_offset < HEAD_SIZE;
-           q_offset += x, k_block += x * BLOCK_SIZE) {
-        q_load_vec_type q_load_group_vec(q + q_offset);
-        q_vec_type q_group_vec(q_load_group_vec);
-        for (int token_group_start = 0; token_group_start < group_num;
-             token_group_start += UNROLL_GROUP_NUM) {
-          vec_op::unroll_loop<int, UNROLL_GROUP_NUM>(
-              [token_group_start, k_block, &q_group_vec,
-               &group_accums](int token_group_idx) {
-                token_group_idx += token_group_start;
-                k_load_vec_type k_load_group_vec(k_block + token_group_idx * x *
-                                                               TOKEN_PER_GROUP);
-                k_vec_type k_group_vec(k_load_group_vec);
-                vec_op::fma(group_accums[token_group_idx], q_group_vec,
-                            k_group_vec);
-                vec_op::prefetch(k_block + x * BLOCK_SIZE +
-                                 token_group_idx * x * TOKEN_PER_GROUP);
-              });
-        }
+    for (int q_offset = 0; q_offset < HEAD_SIZE; q_offset += x,
+             k_block += x * BLOCK_SIZE, next_k_block += x * BLOCK_SIZE) {
+      q_load_vec_type q_load_group_vec(q + q_offset);
+      q_vec_type q_group_vec(q_load_group_vec);
+      for (int token_group_idx = 0; token_group_idx < group_num;
+           ++token_group_idx) {
+        k_load_vec_type k_load_group_vec(k_block +
+                                         token_group_idx * x * TOKEN_PER_GROUP);
+        k_vec_type k_group_vec(k_load_group_vec);
+        vec_op::fma(group_accums[token_group_idx], q_group_vec, k_group_vec);
+        vec_op::prefetch(next_k_block + token_group_idx * x * TOKEN_PER_GROUP);
       }
     }
 
@@ -274,9 +248,19 @@ struct paged_attention_v1_impl {
               kv_head_idx * kv_head_stride;
           float* __restrict__ head_block_logits =
               thread_block_logits + block_idx * BLOCK_SIZE;
+          const scalar_t* __restrict__ next_k_block_cache_ptr =
+              k_block_cache_ptr;
+          if (block_idx != block_num - 1) {
+            const int64_t next_physical_block_idx =
+                seq_block_table[block_idx + 1];
+            next_k_block_cache_ptr = k_cache +
+                                     next_physical_block_idx * kv_block_stride +
+                                     kv_head_idx * kv_head_stride;
+          }
 
           reduceQKBlockKernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, x>::call(
-              q_vec_ptr, k_block_cache_ptr, head_block_logits, scale,
+              q_vec_ptr, k_block_cache_ptr, next_k_block_cache_ptr,
+              head_block_logits, scale,
               block_idx == block_num - 1 ? last_block_token_num : BLOCK_SIZE);
         }
 
@@ -506,8 +490,19 @@ struct paged_attention_v2_impl {
             float* __restrict__ head_block_logits =
                 logits + block_idx * BLOCK_SIZE;
 
+            const scalar_t* __restrict__ next_k_block_cache_ptr =
+                k_block_cache_ptr;
+            if (block_idx != block_num - 1) {
+              const int64_t next_physical_block_idx =
+                  seq_block_table[block_idx + 1];
+              next_k_block_cache_ptr =
+                  k_cache + next_physical_block_idx * kv_block_stride +
+                  kv_head_idx * kv_head_stride;
+            }
+
             reduceQKBlockKernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, x>::call(
-                q_vec_ptr, k_block_cache_ptr, head_block_logits, scale,
+                q_vec_ptr, k_block_cache_ptr, next_k_block_cache_ptr,
+                head_block_logits, scale,
                 block_idx == block_num - 1 ? last_block_token_num : BLOCK_SIZE);
           }
 

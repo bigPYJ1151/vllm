@@ -1,6 +1,5 @@
-import os
 import copy
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Any, List, Set, Tuple
 
 import torch
 import torch.distributed
@@ -28,8 +27,8 @@ class CPUExecutor(ExecutorBase):
         self.scheduler_config = _verify_and_get_scheduler_config(
             self.scheduler_config)
 
-        self.children_workers : List[CPUWorker] = []
-        self.children_loops = []
+        self.children_workers: List[CPUWorker] = []
+        self.children_loops: List[Any] = []
 
         # Instantiate the worker and load the model to CPU.
         ip = get_ip()
@@ -40,7 +39,7 @@ class CPUExecutor(ExecutorBase):
             self._init_ray_workers()
         else:
             self._init_worker()
-    
+
     def _init_worker(self):
         self.driver_worker = CPUWorker(
             model_config=self.model_config,
@@ -63,11 +62,10 @@ class CPUExecutor(ExecutorBase):
 
     def _init_ray_workers(self):
         assert self.parallel_config.tensor_parallel_size > 1
-        
+
         import ray
         from ray.util.scheduling_strategies import (
-            PlacementGroupSchedulingStrategy
-        )
+            PlacementGroupSchedulingStrategy)
 
         #FIXME: Specify cluster addr explicitly.
         ray.init(address="auto", ignore_reinit_error=True)
@@ -80,7 +78,7 @@ class CPUExecutor(ExecutorBase):
                 raise RuntimeError(
                     f"Number of OMP threads {node_thread_num} in child node "
                     f"doesn't match with the number {threads_num_per_node} in "
-                    "driver worker.") 
+                    "driver worker.")
 
         if self.parallel_config.placement_group is None:
             placement_group_specs = (
@@ -95,7 +93,6 @@ class CPUExecutor(ExecutorBase):
             placement_group = self.parallel_config.placement_group
             bundle_offset = 1
 
-        
         model_config = copy.deepcopy(self.model_config)
         parallel_config = copy.deepcopy(self.parallel_config)
         scheduler_config = copy.deepcopy(self.scheduler_config)
@@ -114,31 +111,30 @@ class CPUExecutor(ExecutorBase):
 
             child_worker = ray.remote(
                 num_cpus=threads_num_per_node,
-                scheduling_strategy=scheduling_strategy
-            )(CPUWorker).remote(
-                model_config=None,
-                parallel_config=parallel_config,
-                scheduler_config=scheduler_config,
-                device_config=device_config,
-                cache_config=cache_config,
-                load_config=load_config,
-                local_rank=bundle_id + 1,
-                rank=bundle_id + 1,
-                distributed_init_method=distributed_init_method,
-                ip_port = ip_port,
-                lora_config=lora_config,
-                kv_cache_dtype=cache_config.cache_dtype,
-                is_driver_worker=False, 
-                trust_remote_code=model_config.trust_remote_code, 
-            ) # type: ignore
+                scheduling_strategy=scheduling_strategy)(CPUWorker).remote(
+                    model_config=None,
+                    parallel_config=parallel_config,
+                    scheduler_config=scheduler_config,
+                    device_config=device_config,
+                    cache_config=cache_config,
+                    load_config=load_config,
+                    local_rank=bundle_id + 1,
+                    rank=bundle_id + 1,
+                    distributed_init_method=distributed_init_method,
+                    ip_port=ip_port,
+                    lora_config=lora_config,
+                    kv_cache_dtype=cache_config.cache_dtype,
+                    is_driver_worker=False,
+                    trust_remote_code=model_config.trust_remote_code,
+                )  # type: ignore
             self.children_workers.append(child_worker)
             ray.get(child_worker.init_runner.remote(model_config))
-        
+
         task_handlers = []
         for child in self.children_workers:
             task_handlers.append(child.init_device.remote())
             task_handlers.append(child.load_model.remote())
-        
+
         self._init_worker()
 
         # Initialize SHM CCL
@@ -174,8 +170,8 @@ class CPUExecutor(ExecutorBase):
             task_handlers = []
             for child in self.children_workers:
                 task_handlers.append(
-                    child.initialize_cache.remote(num_gpu_blocks, num_cpu_blocks)
-                )
+                    child.initialize_cache.remote(num_gpu_blocks,
+                                                  num_cpu_blocks))
 
         self.driver_worker.initialize_cache(num_gpu_blocks, num_cpu_blocks)
 
@@ -183,7 +179,7 @@ class CPUExecutor(ExecutorBase):
             import ray
             ray.get(task_handlers)
 
-            # FIXME: For now, we suppose workers are ready after the 
+            # FIXME: For now, we suppose workers are ready after the
             # cache initialization.
             self.children_loops = []
             for worker in self.children_workers:
