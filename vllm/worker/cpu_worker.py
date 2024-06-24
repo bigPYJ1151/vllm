@@ -17,6 +17,7 @@ from vllm.sequence import ExecuteModelRequest, SamplerOutput
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.worker.cpu_model_runner import CPUModelRunner
 from vllm.worker.worker_base import LoraNotSupportedWorkerBase
+from vllm.distributed import (parallel_state)
 
 logger = init_logger(__name__)
 
@@ -130,6 +131,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         local_rank: int,
         rank: int,
         distributed_init_method: str,
+        ip_port: str,
         lora_config: Optional[LoRAConfig] = None,
         vision_language_config: Optional[VisionLanguageConfig] = None,
         kv_cache_dtype: Optional[str] = "auto",
@@ -144,6 +146,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
+        self.ip_port = ip_port
         self.lora_config = lora_config
         self.vision_language_config = vision_language_config
         self.is_driver_worker = is_driver_worker
@@ -335,3 +338,33 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         return CPUCacheEngine.get_cache_block_size(
             self.cache_config.block_size, self.cache_config.cache_dtype,
             self.model_config, self.parallel_config)
+
+    def init_shm_manager(self):
+        elem_size = torch.tensor([], 
+                                    dtype=self.model_config.dtype).element_size()
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        hidden_size = self.model_config.get_hidden_size() 
+        rank_buffer_size = \
+            self.model_config.max_model_len * hidden_size * 5 // world_size * elem_size 
+        torch.ops._C.init_shm_manager(
+            self.ip_port,
+            parallel_state.get_tensor_model_parallel_world_size(),
+            parallel_state.get_tensor_model_parallel_rank(),
+            rank_buffer_size,
+        )
+
+    def join_shm_manager(self):
+        elem_size = torch.tensor([], 
+                                    dtype=self.model_config.dtype).element_size()
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        hidden_size = self.model_config.get_hidden_size() 
+        rank_buffer_size = \
+            self.model_config.max_model_len * hidden_size * 5 // world_size * elem_size 
+        ret = torch.ops._C.join_shm_manager(
+            self.ip_port,
+            parallel_state.get_tensor_model_parallel_world_size(),
+            parallel_state.get_tensor_model_parallel_rank(),
+            rank_buffer_size,
+        )
+        print("rank: ", parallel_state.get_tensor_model_parallel_rank())
+        print(ret)

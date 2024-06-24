@@ -32,6 +32,7 @@ class CPUExecutor(ExecutorBase):
         # Instantiate the worker and load the model to CPU.
         ip = get_ip()
         port = get_open_port()
+        self.ip_port = ip + "_" + str(port)
         self.distributed_init_method = get_distributed_init_method(ip, port)
         if self.parallel_config.tensor_parallel_size > 1:
             self._init_ray_workers()
@@ -49,6 +50,7 @@ class CPUExecutor(ExecutorBase):
             local_rank=0,
             rank=0,
             distributed_init_method=self.distributed_init_method,
+            ip_port=self.ip_port,
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
@@ -104,6 +106,7 @@ class CPUExecutor(ExecutorBase):
                 local_rank=bundle_id + 1,
                 rank=bundle_id + 1,
                 distributed_init_method=distributed_init_method,
+                ip_port=self.ip_port,
                 lora_config=lora_config,
                 kv_cache_dtype=self.cache_config.cache_dtype,
                 is_driver_worker=False, 
@@ -116,6 +119,18 @@ class CPUExecutor(ExecutorBase):
             task_handlers.append(child.load_model.remote())
 
         self._init_worker()
+
+
+        # Initialize SHM CCL
+        for child in self.children_workers:
+            task_handlers.append(child.init_shm_manager.remote())
+        ray.get(task_handlers)
+        self.driver_worker.init_shm_manager()
+
+        for child in self.children_workers:
+            task_handlers.append(child.join_shm_manager.remote())
+        ray.get(task_handlers)
+        self.driver_worker.join_shm_manager()
 
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
