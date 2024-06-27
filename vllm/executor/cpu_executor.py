@@ -1,17 +1,20 @@
-from typing import List, Set, Tuple
+import os
+from functools import partial
+from typing import Any, Awaitable, List, Optional, Set, Tuple, Union
 
 import torch
-import copy
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig
 from vllm.executor.executor_base import ExecutorAsyncBase, ExecutorBase
+from vllm.executor.multiproc_worker_utils import (ProcessWorkerWrapper,
+                                                  ResultHandler, WorkerMonitor)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import ExecuteModelRequest, SamplerOutput
-from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
-                        make_async)
-from vllm.worker.cpu_worker import CPUWorker
+from vllm.utils import (get_distributed_init_method, get_open_port,
+                        get_vllm_instance_id, make_async)
+from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
@@ -21,107 +24,158 @@ class CPUExecutor(ExecutorBase):
     def _init_executor(self) -> None:
         assert self.device_config.device_type == "cpu"
         assert self.lora_config is None, "cpu backend doesn't support LoRA"
+
+        #
+        # Environment variables for CPU executor
+        #
+
+        # Ensure that VLLM_INSTANCE_ID is set, to be inherited by workers
+        os.environ["VLLM_INSTANCE_ID"] = get_vllm_instance_id()
+
+        # Disable torch async compiling which won't work with daemonic processes
+        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+
         self.model_config = _verify_and_get_model_config(self.model_config)
         self.cache_config = _verify_and_get_cache_config(self.cache_config)
         self.scheduler_config = _verify_and_get_scheduler_config(
             self.scheduler_config)
 
-        self.children_workers : List[CPUWorker] = []
-        self.children_loops = []
-
-        # Instantiate the worker and load the model to CPU.
-        ip = get_ip()
+        # Multiprocessing-based executor does not support multi-node setting.
+        # Since it only works for single node, we can use the loopback address
+        # 127.0.0.1 for communication.
+        ip = "127.0.0.1"
         port = get_open_port()
+        self.ip_port = ip + "_" + str(port)
         self.distributed_init_method = get_distributed_init_method(ip, port)
-        if self.parallel_config.tensor_parallel_size > 1:
-            self._init_ray_workers()
-        else:
-            self._init_worker()
 
-    def _init_worker(self):
-        self.driver_worker = CPUWorker(
+        is_async = isinstance(self, CPUExecutorAsync)
+
+        world_size = self.parallel_config.tensor_parallel_size
+        result_handler = ResultHandler()
+        self.parallel_worker_tasks: Optional[Union[Any, Awaitable[Any]]] = None
+        self.workers = []
+        
+        if is_async:
+            self.workers = [
+                ProcessWorkerWrapper(
+                    result_handler,
+                    partial(
+                        self._create_worker,
+                        rank=rank,
+                        local_rank=rank,
+                    )) for rank in range(0, world_size)
+            ]
+            self.driver_worker = self.workers[0]
+            self.workers = self.workers[1:]
+            self.driver_method_invoker = _async_driver_method_invoker
+        else:
+            self.driver_worker = self._create_worker()
+            self.driver_method_invoker = _driver_method_invoker
+        
+            if world_size != 1:
+                self.workers = [
+                    ProcessWorkerWrapper(
+                        result_handler,
+                        partial(
+                            self._create_worker,
+                            rank=rank,
+                            local_rank=rank,
+                        )) for rank in range(1, world_size)
+                ]
+
+        if world_size != 1 or is_async:
+            if is_async:
+                async_worker_list = self.workers + [self.driver_worker]
+            else:
+                async_worker_list = self.workers
+            self.worker_monitor = WorkerMonitor(async_worker_list, result_handler)
+            result_handler.start()
+            self.worker_monitor.start()
+
+        self._run_workers("init_device")
+        self._run_workers("load_model",
+                          max_concurrent_workers=self.parallel_config.
+                          max_parallel_loading_workers)
+        if world_size > 1:
+            self._run_workers("init_shm_manager")
+            self._run_workers("join_shm_manager")
+
+    def _create_worker(
+        self,
+        local_rank: int = 0,
+        rank: int = 0,
+    ):
+        worker_module_name = "vllm.worker.cpu_worker"
+        worker_class_name = "CPUWorker"
+
+        wrapper = WorkerWrapperBase(
+            worker_module_name=worker_module_name,
+            worker_class_name=worker_class_name,
+        )
+
+        assert self.distributed_init_method is not None
+
+        kwargs = dict(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
             device_config=self.device_config,
             cache_config=self.cache_config,
             load_config=self.load_config,
-            local_rank=0,
-            rank=0,
+            local_rank=local_rank,
+            ip_port=self.ip_port,
+            rank=rank,
             distributed_init_method=self.distributed_init_method,
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
-            kv_cache_dtype=self.cache_config.cache_dtype,
-            is_driver_worker=True,
+            is_driver_worker=rank == 0,
         )
-        self.driver_worker.init_device()
-        self.driver_worker.load_model()
+        wrapper.init_worker(**kwargs)
 
-    def _init_ray_workers(self):
-        assert self.parallel_config.tensor_parallel_size > 1
+        return wrapper.worker
 
-        import ray
-        from ray.util.scheduling_strategies import (
-            PlacementGroupSchedulingStrategy
-        )
+    def _run_workers(
+        self,
+        method: str,
+        *args,
+        async_run_remote_workers_only: bool = False,
+        max_concurrent_workers: Optional[int] = None,
+        **kwargs,
+    ) -> Any:
+        """Runs the given method on all workers.
 
-        #FIXME: Specify cluster addr explicitly.
-        ray.init(address="auto")
-        threads_num_per_node = torch.get_num_threads()
+        Args:
+            async_run_remote_workers_only: If True the method will be run only
+                in the remote workers, not the driver worker. It will also be
+                run asynchronously and return a list of futures rather than
+                blocking on the results.
+        """
 
-        placement_group_specs = (
-            [{"CPU": threads_num_per_node}] * \
-            (self.parallel_config.world_size - 1))
-        placement_group = ray.util.placement_group(
-            placement_group_specs)
-        ray.get(placement_group.ready(), timeout=1800)
-        self.parallel_config.placement_group = placement_group
+        if max_concurrent_workers:
+            raise NotImplementedError(
+                "max_concurrent_workers is not supported yet.")
 
-        model_config = copy.deepcopy(self.model_config)
-        parallel_config = copy.deepcopy(self.parallel_config)
-        scheduler_config = copy.deepcopy(self.scheduler_config)
-        device_config = copy.deepcopy(self.device_config)
-        lora_config = copy.deepcopy(self.lora_config)
-        cache_config = copy.deepcopy(self.cache_config)
-        load_config = copy.deepcopy(self.load_config)
-        distributed_init_method = copy.deepcopy(self.distributed_init_method)
-        for bundle_id, bundle in enumerate(placement_group.bundle_specs):
-            scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=placement_group,
-                placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=bundle_id,
-            )
-            child_worker = ray.remote(
-                num_cpus=threads_num_per_node,
-                scheduling_strategy=scheduling_strategy
-            )(CPUWorker).remote(
-                model_config=model_config,
-                parallel_config=parallel_config,
-                scheduler_config=scheduler_config,
-                device_config=device_config,
-                cache_config=cache_config,
-                load_config=load_config,
-                local_rank=bundle_id + 1,
-                rank=bundle_id + 1,
-                distributed_init_method=distributed_init_method,
-                lora_config=lora_config,
-                kv_cache_dtype=self.cache_config.cache_dtype,
-                is_driver_worker=False, 
-            ) # type: ignore
-            self.children_workers.append(child_worker)
+        # Start the workers first.
+        worker_outputs = [
+            worker.execute_method(method, *args, **kwargs)
+            for worker in self.workers
+        ]
 
-        task_handlers = []
-        for child in self.children_workers:
-            task_handlers.append(child.init_device.remote())
-            task_handlers.append(child.load_model.remote())
+        if async_run_remote_workers_only:
+            # Just return futures
+            return worker_outputs
 
-        self._init_worker()
+        driver_worker_output = self.driver_method_invoker(self.driver_worker, method, *args, **kwargs)
+
+        # Get the results of the workers.
+        return [driver_worker_output
+                ] + [output.get() for output in worker_outputs]
 
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
         underlying worker.
         """
-        return self.driver_worker.determine_num_available_blocks()
+        return self.driver_method_invoker(self.driver_worker, "determine_num_available_blocks")
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -135,59 +189,73 @@ class CPUExecutor(ExecutorBase):
         # management procedure.
         logger.info("# CPU blocks: %d", num_gpu_blocks)
 
-        if self.parallel_config.tensor_parallel_size > 1:
-            task_handlers = []
-            for child in self.children_workers:
-                task_handlers.append(
-                    child.initialize_cache.remote(num_gpu_blocks, num_cpu_blocks)
-                )
-
-        self.driver_worker.initialize_cache(num_gpu_blocks, num_cpu_blocks)
-
-        if self.parallel_config.tensor_parallel_size > 1:
-            import ray
-            ray.get(task_handlers)
-
-            # FIXME: For now, we suppose workers are ready after the 
-            # cache initialization.
-            self.children_loops = []
-            for worker in self.children_workers:
-                self.children_loops.append(worker.child_loop.remote())
+        self._run_workers("initialize_cache",
+                          num_gpu_blocks=num_gpu_blocks,
+                          num_cpu_blocks=num_cpu_blocks)
 
     def execute_model(
             self,
             execute_model_req: ExecuteModelRequest) -> List[SamplerOutput]:
-        output = self.driver_worker.execute_model(execute_model_req)
+        if (self.parallel_config.tensor_parallel_size > 1 and 
+            self.parallel_worker_tasks is None):
+            self.parallel_worker_tasks = self._run_workers(
+                "start_worker_execution_loop",
+                async_run_remote_workers_only=True,
+            )
+        output = self.driver_method_invoker(self.driver_worker, "execute_model", execute_model_req)
         return output
 
+    def stop_remote_worker_execution_loop(self) -> None:
+        if self.parallel_worker_tasks is None:
+            return
+        """
+        Passing None will cause the driver to stop the model execution
+        loop running in each of the remote workers.
+        """
+        self.driver_method_invoker(self.driver_worker, "execute_model", None)
+        parallel_worker_tasks = self.parallel_worker_tasks
+        self.parallel_worker_tasks = None
+        # Ensure that workers exit model loop cleanly
+        # (this will raise otherwise)
+        self._wait_for_tasks_completion(parallel_worker_tasks)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
-        return self.driver_worker.add_lora(lora_request)
+        return all(self._run_workers("add_lora", lora_request))
 
     def remove_lora(self, lora_id: int) -> bool:
-        return self.driver_worker.remove_lora(lora_id)
+        return all(self._run_workers("remove_lora", lora_id))
 
     def list_loras(self) -> Set[int]:
-        return self.driver_worker.list_loras()
+        return self.driver_method_invoker(self.driver_worker, "list_loras")
 
     def check_health(self) -> None:
-        # CPUExecutor will always be healthy as long as
-        # it's running.
-        return
+        """Raises an error if engine is unhealthy."""
+        if self.worker_monitor is not None and not self.worker_monitor.is_alive(
+        ):
+            raise RuntimeError("Worker processes are not running")
 
+    def shutdown(self):
+        if (worker_monitor := getattr(self, "worker_monitor",
+                                      None)) is not None:
+            worker_monitor.close()
+
+    def _wait_for_tasks_completion(self, parallel_worker_tasks: Any) -> None:
+        """Wait for futures returned from _run_workers() with
+        async_run_remote_workers_only to complete."""
+        for result in parallel_worker_tasks:
+            result.get()
 
 class CPUExecutorAsync(CPUExecutor, ExecutorAsyncBase):
 
     async def execute_model_async(
             self,
             execute_model_req: ExecuteModelRequest) -> List[SamplerOutput]:
-        output = await make_async(self.driver_worker.execute_model
+        output = await make_async(self.execute_model
                                   )(execute_model_req=execute_model_req, )
         return output
 
     async def check_health_async(self) -> None:
-        # CPUExecutor will always be healthy as long as
-        # it's running.
-        return
+        self.check_health()
 
 
 def _verify_and_get_model_config(config: ModelConfig) -> ModelConfig:
@@ -232,3 +300,9 @@ def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
             f" {kv_cache_space}, expect a positive integer value.")
 
     return config
+
+def _driver_method_invoker(driver, method: str, *args, **kwargs):
+    return getattr(driver, method)(*args, **kwargs)
+
+def _async_driver_method_invoker(driver, method: str, *args, **kwargs):
+    return driver.execute_method(method, *args, **kwargs).get()

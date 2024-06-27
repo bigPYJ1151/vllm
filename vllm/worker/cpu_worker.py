@@ -4,13 +4,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.distributed
 
+import vllm.envs as envs
 from vllm.attention import get_attn_backend
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
                          VisionLanguageConfig)
 from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
-                              init_distributed_environment)
+                              init_distributed_environment, parallel_state)
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.sequence import ExecuteModelRequest, SamplerOutput
@@ -128,11 +129,11 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         cache_config: CacheConfig,
         load_config: LoadConfig,
         local_rank: int,
+        ip_port: str,
         rank: int,
         distributed_init_method: str,
         lora_config: Optional[LoRAConfig] = None,
         vision_language_config: Optional[VisionLanguageConfig] = None,
-        kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
     ) -> None:
         self.model_config = model_config
@@ -143,6 +144,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         self.load_config = load_config
         self.local_rank = local_rank
         self.rank = rank
+        self.ip_port = ip_port
         self.distributed_init_method = distributed_init_method
         self.lora_config = lora_config
         self.vision_language_config = vision_language_config
@@ -163,14 +165,22 @@ class CPUWorker(LoraNotSupportedWorkerBase):
             load_config=self.load_config,
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
-            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_dtype=cache_config.cache_dtype,
             is_driver_worker=is_driver_worker)
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: CPUCacheEngine
         self.cpu_cache: List[torch.Tensor]
 
+        omp_cpuids = envs.VLLM_CPU_OMP_THREADS_BIND
+        if omp_cpuids == "all":
+            self.local_omp_cpuid = "all"
+        else:
+            self.local_omp_cpuid = omp_cpuids.split("|")[rank]
+
     def init_device(self) -> None:
+        torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
+
         self.init_distributed_environment()
         # Set random seed.
         set_random_seed(self.model_config.seed)
@@ -262,40 +272,68 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         if blocks_to_copy.numel() > 0:
             self.cache_engine.copy(blocks_to_copy)
 
-    def child_loop(self):
-        while True:
-            self.execute_model()
+    @torch.no_grad()
+    def start_worker_execution_loop(self) -> None:
+        """Execute model loop in parallel worker.
+
+        You can stop the loop by executing a driver worker with an empty output.
+        See `stop_remote_worker_execution_loop` for more details.
+        """
+        while self._execute_model_non_driver():
+            pass
+
+    def _execute_model_non_driver(self) -> bool:
+        """Execute model in parallel worker.
+
+        Returns True iff there are remaining sequences to process.
+        """
+        assert not self.is_driver_worker
+
+        data = broadcast_tensor_dict(src=0)
+        num_seq_groups = data.get("num_seq_groups", 0)
+        blocks_to_copy = data.get("blocks_to_copy")
+        self.cache_copy(blocks_to_copy)
+
+        # If there is no input, we don't need to execute the model.
+        if num_seq_groups == 0:
+            return False
+
+        self.model_runner.execute_model(None, self.cpu_cache)
+        return True
 
     @torch.no_grad()
     def execute_model(
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
     ) -> List[SamplerOutput]:
+        if not self.is_driver_worker:
+            self._execute_model_non_driver()
+            return []
 
         if execute_model_req is None:
-            seq_group_metadata_list = None
-        else:
-            seq_group_metadata_list = execute_model_req.seq_group_metadata_list
+            # This signals that there's no more requests to process for now.
+            # All workers are running infinite loop with broadcast_tensor_dict,
+            # and it stops the loop when the driver broadcasts an empty input.
+            # Send an empty input to notify all other workers to stop their
+            # execution loop.
+            broadcast_tensor_dict({}, src=0)
+            return []
 
-        if self.is_driver_worker:
-            assert seq_group_metadata_list is not None
-            num_seq_groups: int = len(seq_group_metadata_list)
-            assert execute_model_req is not None
-            blocks_to_copy = execute_model_req.blocks_to_copy
-            blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
-                                          device="cpu",
-                                          dtype=torch.int64).view(-1, 2)
-            assert len(execute_model_req.blocks_to_swap_in) == 0
-            assert len(execute_model_req.blocks_to_swap_out) == 0
-            data: Dict[str, Any] = {
-                "num_seq_groups": num_seq_groups,
-                "blocks_to_copy": blocks_to_copy,
-            }
-            broadcast_tensor_dict(data, src=0)
-        else:
-            data = broadcast_tensor_dict(src=0)
-            num_seq_groups = data["num_seq_groups"]
-            blocks_to_copy = data["blocks_to_copy"]
+        seq_group_metadata_list = execute_model_req.seq_group_metadata_list
+
+        assert seq_group_metadata_list is not None
+        num_seq_groups: int = len(seq_group_metadata_list)
+        blocks_to_copy = execute_model_req.blocks_to_copy
+        blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
+                                      device="cpu",
+                                      dtype=torch.int64).view(-1, 2)
+        assert len(execute_model_req.blocks_to_swap_in) == 0
+        assert len(execute_model_req.blocks_to_swap_out) == 0
+        data: Dict[str, Any] = {
+            "num_seq_groups": num_seq_groups,
+            "blocks_to_copy": blocks_to_copy,
+        }
+        broadcast_tensor_dict(data, src=0)
 
         self.cache_copy(blocks_to_copy)
 
@@ -335,3 +373,33 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         return CPUCacheEngine.get_cache_block_size(
             self.cache_config.block_size, self.cache_config.cache_dtype,
             self.model_config, self.parallel_config)
+
+    def init_shm_manager(self):
+        elem_size = torch.tensor([],
+                                 dtype=self.model_config.dtype).element_size()
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        hidden_size = self.model_config.get_hidden_size()
+        rank_buffer_size = (self.model_config.max_model_len * hidden_size *
+                            5 // world_size * elem_size)
+        torch.ops._C.init_shm_manager(
+            self.ip_port,
+            parallel_state.get_tensor_model_parallel_world_size(),
+            parallel_state.get_tensor_model_parallel_rank(),
+            rank_buffer_size,
+        )
+
+    def join_shm_manager(self):
+        elem_size = torch.tensor([],
+                                 dtype=self.model_config.dtype).element_size()
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        hidden_size = self.model_config.get_hidden_size()
+        rank_buffer_size = (self.model_config.max_model_len * hidden_size *
+                            5 // world_size * elem_size)
+        ret = torch.ops._C.join_shm_manager(
+            self.ip_port,
+            parallel_state.get_tensor_model_parallel_world_size(),
+            parallel_state.get_tensor_model_parallel_rank(),
+            rank_buffer_size,
+        )
+        print("rank: ", parallel_state.get_tensor_model_parallel_rank())
+        print(ret)

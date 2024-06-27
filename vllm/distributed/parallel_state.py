@@ -33,7 +33,6 @@ from torch.distributed import Backend, ProcessGroup
 import vllm.envs as envs
 from vllm.logger import init_logger
 
-from intel_extension_for_pytorch._C import tpp_shm_allreduce
 
 @dataclass
 class GraphCaptureContext:
@@ -247,10 +246,11 @@ class GroupCoordinator:
             pynccl_comm.all_reduce(input_)
         else:
             # torch.distributed.all_reduce(input_, group=self.device_group)
-            tpp_shm_allreduce(input_, self.device_group)
+            torch.ops._C.shm_allreduce(input_, self.rank)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        print("all_gather...............")
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -301,10 +301,13 @@ class GroupCoordinator:
         else:
             gather_list = None
         # Gather.
-        torch.distributed.gather(input_,
-                                 gather_list,
-                                 dst=self.ranks[dst],
-                                 group=self.device_group)
+        # torch.distributed.gather(input_,
+        #                          gather_list,
+        #                          dst=self.ranks[dst],
+        #                          group=self.device_group)
+        torch.ops._C.shm_gather(input_, gather_list, self.ranks[dst],
+                                self.rank)
+
         if self.rank_in_group == dst:
             output_tensor = torch.cat(gather_list, dim=dim)
         else:
