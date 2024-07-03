@@ -178,9 +178,13 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         else:
             self.local_omp_cpuid = omp_cpuids.split("|")[rank]
 
-    def init_device(self) -> None:
+    def init_threads_env(self) -> None:
+        """ This function must be executed by multi workers one-by-one to avoid
+        crash.
+        """
         torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
 
+    def init_device(self) -> None:
         self.init_distributed_environment()
         # Set random seed.
         set_random_seed(self.model_config.seed)

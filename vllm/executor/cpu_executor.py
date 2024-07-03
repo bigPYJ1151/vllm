@@ -92,6 +92,10 @@ class CPUExecutor(ExecutorBase):
             result_handler.start()
             self.worker_monitor.start()
 
+        self.driver_method_invoker(self.driver_worker, "init_threads_env")
+        for worker in self.workers:
+            worker.execute_method("init_threads_env").get()
+
         self._run_workers("init_device")
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
