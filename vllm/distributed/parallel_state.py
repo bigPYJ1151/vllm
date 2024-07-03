@@ -250,7 +250,6 @@ class GroupCoordinator:
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        print("all_gather...............")
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
