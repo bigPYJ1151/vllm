@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed
 
+import vllm.envs as envs
 from vllm.attention import get_attn_backend
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, MultiModalConfig, ParallelConfig,
@@ -132,7 +133,6 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         distributed_init_method: str,
         lora_config: Optional[LoRAConfig] = None,
         multimodal_config: Optional[MultiModalConfig] = None,
-        kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
     ) -> None:
         self.model_config = model_config
@@ -166,14 +166,21 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             load_config=self.load_config,
             lora_config=self.lora_config,
             multimodal_config=self.multimodal_config,
-            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_dtype=cache_config.cache_dtype,
             is_driver_worker=is_driver_worker)
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: List[CPUCacheEngine]
         self.cpu_cache: List[List[torch.Tensor]]
 
+        omp_cpuids = envs.VLLM_CPU_OMP_THREADS_BIND
+        if omp_cpuids == "all":
+            self.local_omp_cpuid = "all"
+        else:
+            self.local_omp_cpuid = omp_cpuids.split("|")[rank]
+
     def init_device(self) -> None:
+        torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
         self.init_distributed_environment()
         # Set random seed.
         set_random_seed(self.model_config.seed)
