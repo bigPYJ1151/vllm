@@ -96,9 +96,6 @@ class CPUExecutor(ExecutorBase):
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
-        if world_size > 1:
-            self._run_workers("init_shm_manager")
-            self._run_workers("join_shm_manager")
 
     def _create_worker(
         self,

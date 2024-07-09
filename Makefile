@@ -8,7 +8,7 @@ install_dnnl:
 
 install_deps:
 	pip install wheel packaging ninja setuptools>=49.4.0 numpy
-	pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+	pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/test/cpu
 
 install:
 	VLLM_TARGET_DEVICE=cpu pip install --no-build-isolation  -v -e .
