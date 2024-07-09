@@ -246,7 +246,9 @@ class GroupCoordinator:
         if (pynccl_comm is not None and not pynccl_comm.disabled):
             pynccl_comm.all_reduce(input_)
         else:
+            # torch.ops._C.shm_allreduce(input_, self.rank)
             ipex.distributed.all_reduce(input_, group=self.device_group)
+            # ipex._C.tpp_shm_allreduce(input_, self.device_group)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -300,10 +302,11 @@ class GroupCoordinator:
         else:
             gather_list = None
         # Gather.
-        torch.distributed.gather(input_,
-                                 gather_list,
-                                 dst=self.ranks[dst],
-                                 group=self.device_group)
+        torch.ops._C.shm_gather(input_, gather_list, self.ranks[dst], self.rank)
+        # torch.distributed.gather(input_,
+        #                          gather_list,
+        #                          dst=self.ranks[dst],
+        #                          group=self.device_group)
         if self.rank_in_group == dst:
             output_tensor = torch.cat(gather_list, dim=dim)
         else:

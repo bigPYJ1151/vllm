@@ -22,7 +22,7 @@ VLLM_2S_offline:
 	cd examples && OMP_DISPLAY_ENV=VERBOSE VLLM_CPU_KVCACHE_SPACE=40 OMP_PROC_BIND=close numactl --physcpubind=0-31 --membind=0 python3 offline_inference.py
 
 VLLM_TP_4S_bench:
-	cd benchmarks &&  VLLM_CPU_OMP_THREADS_BIND="0-31|32-63|64-95|96-127" VLLM_CPU_KVCACHE_SPACE=40 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 python3 benchmark_throughput.py --backend=vllm --dataset=./ShareGPT_V3_unfiltered_cleaned_split.json --model=lmsys/vicuna-7b-v1.5 --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code --device=cpu -tp=4
+	cd benchmarks &&  VLLM_CPU_OMP_THREADS_BIND="0-31|32-63|64-95|96-127" VLLM_CPU_KVCACHE_SPACE=40 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 python3 -m cProfile -o ipex_tpp benchmark_throughput.py --backend=vllm --dataset=./ShareGPT_V3_unfiltered_cleaned_split.json --model=lmsys/vicuna-7b-v1.5 --n=1 --num-prompts=1000 --dtype=bfloat16 --trust-remote-code --device=cpu -tp=4
 
 VLLM_4S_offline:
 	ray stop
