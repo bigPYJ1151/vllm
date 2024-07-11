@@ -13,6 +13,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 from vllm.utils import FlexibleArgumentParser
+from pyinstrument import Profiler
 
 
 def sample_requests(
@@ -86,6 +87,7 @@ def run_vllm(
     load_format: str = EngineArgs.load_format,
 ) -> float:
     from vllm import LLM, SamplingParams
+    profiler = Profiler(interval=0.0003, async_mode="strict")
     llm = LLM(
         model=model,
         tokenizer=tokenizer,
@@ -124,8 +126,12 @@ def run_vllm(
             ))
 
     start = time.perf_counter()
+    profiler.start()
     llm.generate(prompts, sampling_params, use_tqdm=True)
+    profiler.stop()
     end = time.perf_counter()
+    # profiler.print()
+    profiler.write_html("new_opt-125m-b32i128o128", show_all=True)
     return end - start
 
 
@@ -144,13 +150,16 @@ def run_hf(
     if llm.config.model_type == "llama":
         # To enable padding in the HF backend.
         tokenizer.pad_token = tokenizer.eos_token
-    llm = llm.cuda()
+    llm = llm.cpu()
+    profiler = Profiler(interval=0.001, async_mode="strict")
 
     pbar = tqdm(total=len(requests))
     start = time.perf_counter()
     batch: List[str] = []
     max_prompt_len = 0
     max_output_len = 0
+
+    profiler.start()
     for i in range(len(requests)):
         prompt, prompt_len, output_len = requests[i]
         # Add the prompt to the batch.
@@ -158,18 +167,13 @@ def run_hf(
         max_prompt_len = max(max_prompt_len, prompt_len)
         max_output_len = max(max_output_len, output_len)
         if len(batch) < max_batch_size and i != len(requests) - 1:
-            # Check if we can add more requests to the batch.
-            _, next_prompt_len, next_output_len = requests[i + 1]
-            if (max(max_prompt_len, next_prompt_len) +
-                    max(max_output_len, next_output_len)) <= 2048:
-                # We can add more requests to the batch.
                 continue
 
         # Generate the sequences.
         input_ids = tokenizer(batch, return_tensors="pt",
                               padding=True).input_ids
         llm_outputs = llm.generate(
-            input_ids=input_ids.cuda(),
+            input_ids=input_ids.cpu(),
             do_sample=not use_beam_search,
             num_return_sequences=n,
             temperature=1.0,
@@ -185,7 +189,9 @@ def run_hf(
         batch = []
         max_prompt_len = 0
         max_output_len = 0
+    profiler.stop()
     end = time.perf_counter()
+    profiler.write_html("new_hf_opt-125m-b32i128o128", show_all=True)
     return end - start
 
 
