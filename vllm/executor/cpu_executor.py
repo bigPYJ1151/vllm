@@ -48,6 +48,10 @@ class CPUExecutor(ExecutorBase):
             os.environ['KMP_PLAIN_BARRIER_PATTERN'] = "dist,dist"
             os.environ['KMP_REDUCTION_BARRIER_PATTERN'] = "dist,dist"
 
+        # To hint IPEX uses shared memory based AllReduce
+        os.environ["LOCAL_WORLD_SIZE"] = str(
+                self.parallel_config.tensor_parallel_size)
+
         self.model_config = _verify_and_get_model_config(self.model_config)
         self.cache_config = _verify_and_get_cache_config(self.cache_config)
         self.scheduler_config = _verify_and_get_scheduler_config(
