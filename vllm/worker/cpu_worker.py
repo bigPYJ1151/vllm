@@ -164,7 +164,6 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             self.local_omp_cpuid = "all"
         else:
             self.local_omp_cpuid = omp_cpuids.split("|")[rank]
-
         self.model_runner: CPUModelRunner = CPUModelRunner(
             model_config,
             parallel_config,
@@ -185,7 +184,6 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     def init_device(self) -> None:
         if self.local_omp_cpuid != "all":
             torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
-
         self.init_distributed_environment()
         # Set random seed.
         set_random_seed(self.model_config.seed)

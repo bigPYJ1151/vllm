@@ -393,8 +393,14 @@ class LLMEngine:
             from vllm.executor.tpu_executor import TPUExecutor
             executor_class = TPUExecutor
         elif engine_config.device_config.device_type == "cpu":
-            from vllm.executor.cpu_executor import CPUExecutor
-            executor_class = CPUExecutor
+            if distributed_executor_backend == "ray":
+                from vllm.executor.cpu_executor import RayCPUExecutor
+                import ray
+                ray.init(address=None, ignore_reinit_error=True)
+                executor_class = RayCPUExecutor
+            else:
+                from vllm.executor.cpu_executor import CPUExecutor
+                executor_class = CPUExecutor
         elif engine_config.device_config.device_type == "openvino":
             from vllm.executor.openvino_executor import OpenVINOExecutor
             executor_class = OpenVINOExecutor

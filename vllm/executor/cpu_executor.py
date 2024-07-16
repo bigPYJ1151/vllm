@@ -36,6 +36,9 @@ class CPUExecutor(ExecutorBase):
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
+        # Disable Ray usage stats collection.
+        os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
+
         # Intel OpenMP setting
         ld_prealod_str = os.getenv("LD_PRELOAD", "")
         if "libiomp5.so" in ld_prealod_str:
@@ -58,6 +61,15 @@ class CPUExecutor(ExecutorBase):
         self.scheduler_config = _verify_and_get_scheduler_config(
             self.scheduler_config)
 
+        if self.parallel_config.distributed_executor_backend == 'ray':
+            omp_cpuids = envs.VLLM_CPU_OMP_THREADS_BIND
+            if omp_cpuids == "all":
+                local_omp_cpuid = "all"
+            else:
+                local_omp_cpuid = omp_cpuids.split("|")[0]
+            self.omp_thread_num = torch.ops._C_utils.parse_cpu_num(local_omp_cpuid)
+            os.environ["VLLM_CPU_OMP_THREADS_BIND"] = "all"
+
         # Multiprocessing-based executor does not support multi-node setting.
         # Since it only works for single node, we can use the loopback address
         # 127.0.0.1 for communication.
@@ -65,12 +77,18 @@ class CPUExecutor(ExecutorBase):
         port = get_open_port()
         self.distributed_init_method = get_distributed_init_method(ip, port)
 
-        is_async = isinstance(self, CPUExecutorAsync)
-
-        world_size = self.parallel_config.tensor_parallel_size
-        result_handler = ResultHandler()
         self.parallel_worker_tasks: Optional[Union[Any, Awaitable[Any]]] = None
         self.workers = []
+
+        self._init_workers()
+
+        self._run_workers("init_device")
+        self._run_workers("load_model")
+
+    def _init_workers(self):
+        is_async = isinstance(self, CPUExecutorAsync)
+        world_size = self.parallel_config.tensor_parallel_size
+        result_handler = ResultHandler()
 
         if is_async:
             self.workers = [
@@ -109,9 +127,6 @@ class CPUExecutor(ExecutorBase):
                                                 result_handler)
             result_handler.start()
             self.worker_monitor.start()
-
-        self._run_workers("init_device")
-        self._run_workers("load_model")
 
     def _create_worker(
         self,
@@ -295,6 +310,112 @@ class CPUExecutor(ExecutorBase):
             result.get()
 
 
+class RayCPUExecutor(CPUExecutor):
+
+    def _init_workers(self):
+        assert self.parallel_config.distributed_executor_backend == "ray"
+
+        world_size = self.parallel_config.tensor_parallel_size
+
+        self.workers = [
+            self._create_worker(
+                local_rank=rank,
+                rank=rank,
+            ) for rank in range(0, world_size)
+        ]
+        self.driver_worker = self.workers[0]
+        self.workers = self.workers[1:]
+        self.driver_method_invoker = _ray_async_driver_method_invoker
+
+    def _create_worker(self, 
+                       local_rank: int = 0, 
+                       rank: int = 0,
+    ):
+        import ray
+
+        worker_module_name = "vllm.worker.cpu_worker"
+        worker_class_name = "CPUWorker"
+
+        worker = ray.remote(
+            num_cpus=self.omp_thread_num,
+        )(WorkerWrapperBase).remote(
+            worker_module_name=worker_module_name,
+            worker_class_name=worker_class_name,
+            trust_remote_code=self.model_config.trust_remote_code,
+        )
+        worker.execute_method.remote(
+            "update_environment_variables",
+            os.environ,
+        )    
+
+        kwargs = dict(
+            model_config=self.model_config,
+            parallel_config=self.parallel_config,
+            scheduler_config=self.scheduler_config,
+            device_config=self.device_config,
+            cache_config=self.cache_config,
+            load_config=self.load_config,
+            local_rank=local_rank,
+            rank=rank,
+            distributed_init_method=self.distributed_init_method,
+            lora_config=self.lora_config,
+            multimodal_config=self.multimodal_config,
+            kv_cache_dtype=self.cache_config.cache_dtype,
+            prompt_adapter_config=self.prompt_adapter_config,
+            is_driver_worker=rank == 0,
+        )
+        worker.execute_method.remote(
+            "init_worker",
+            **kwargs,
+        )
+
+        return worker
+
+    def _run_workers(
+        self,
+        method: str,
+        *args,
+        async_run_remote_workers_only: bool = False,
+        max_concurrent_workers: Optional[int] = None,
+        **kwargs,
+    ) -> Any:
+        """Runs the given method on all workers.
+
+        Args:
+            async_run_remote_workers_only: If True the method will be run only
+                in the remote workers, not the driver worker. It will also be
+                run asynchronously and return a list of futures rather than
+                blocking on the results.
+        """
+        import ray
+        if max_concurrent_workers:
+            raise NotImplementedError(
+                "max_concurrent_workers is not supported yet.")
+
+        # Start the workers first.
+        worker_outputs = [
+            worker.execute_method.remote(method, *args, **kwargs)
+            for worker in self.workers
+        ]
+
+        if async_run_remote_workers_only:
+            # Just return futures
+            return worker_outputs
+
+        driver_worker_output = self.driver_method_invoker(
+            self.driver_worker, method, *args, **kwargs)
+
+        # Get the results of the workers.
+        return [driver_worker_output
+                ] + [ray.get(output) for output in worker_outputs]
+
+    def _wait_for_tasks_completion(self, parallel_worker_tasks: Any) -> None:
+        """Wait for futures returned from _run_workers() with
+        async_run_remote_workers_only to complete."""
+        import ray
+        for result in parallel_worker_tasks:
+            ray.get(result)
+
 class CPUExecutorAsync(CPUExecutor, ExecutorAsyncBase):
 
     async def execute_model_async(
@@ -358,3 +479,7 @@ def _driver_method_invoker(driver, method: str, *args, **kwargs):
 
 def _async_driver_method_invoker(driver, method: str, *args, **kwargs):
     return driver.execute_method(method, *args, **kwargs).get()
+
+def _ray_async_driver_method_invoker(driver, method: str, *args, **kwargs):
+    import ray
+    return ray.get(driver.execute_method.remote(method, *args, **kwargs))

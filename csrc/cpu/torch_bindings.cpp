@@ -4,6 +4,8 @@
 
 #include <torch/library.h>
 
+int64_t parse_cpu_num(const std::string& cpu_ids);
+
 void init_cpu_threads_env(const std::string& cpu_ids);
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
@@ -111,6 +113,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _utils), utils) {
   // CPU utils
+  utils.def("parse_cpu_num(str cpu_ids) -> int", &parse_cpu_num);
   utils.def("init_cpu_threads_env(str cpu_ids) -> ()", &init_cpu_threads_env);
 }
 

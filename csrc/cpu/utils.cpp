@@ -5,6 +5,29 @@
 
 #include "cpu_types.hpp"
 
+int64_t parse_cpu_num(const std::string& cpu_ids) {
+  bitmask* omp_cpu_mask = numa_parse_cpustring(cpu_ids.c_str());
+  TORCH_CHECK(omp_cpu_mask->size > 0);
+  std::vector<int> omp_cpu_ids;
+  constexpr int group_size = 8 * sizeof(*omp_cpu_mask->maskp);
+
+  int64_t num = 0;
+
+  for (int offset = 0; offset < omp_cpu_mask->size; offset += group_size) {
+    unsigned long group_mask = omp_cpu_mask->maskp[offset / group_size];
+    int i = 0;
+    while (group_mask) {
+      if (group_mask & 1) {
+        ++num;
+      }
+      ++i;
+      group_mask >>= 1;
+    }
+  }
+
+  return num;
+}
+
 void init_cpu_threads_env(const std::string& cpu_ids) {
   bitmask* omp_cpu_mask = numa_parse_cpustring(cpu_ids.c_str());
   TORCH_CHECK(omp_cpu_mask->size > 0);
