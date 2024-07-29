@@ -97,6 +97,9 @@ class AWQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def is_awq_marlin_compatible(cls, quant_config: Dict[str, Any]):
+        # workaround here to support awq only for cpu, do not need to check here, just return False
+        return False
+
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
         num_bits = quant_config.get("bits", None)

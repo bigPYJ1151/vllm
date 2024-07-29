@@ -107,6 +107,10 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def is_gptq_marlin_compatible(cls, quant_config: Dict[str, Any]):
+
+        # workaround here to support gptq only for cpu, do not need to check here, just return False
+        return False
+
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
         num_bits = quant_config.get("bits", None)
@@ -121,7 +125,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         if (num_bits is None or group_size is None or sym is None
                 or desc_act is None):
             return False
-
+        
         return check_gptq_marlin_supported(
             num_bits=num_bits,
             group_size=group_size,
