@@ -4,7 +4,12 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-
+from torch.nn.utils import skip_init
+import intel_extension_for_pytorch as ipex
+from intel_extension_for_pytorch.cpu._auto_kernel_selection import (
+    _enable_tpp,
+    _disable_tpp,
+)
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               split_tensor_along_last_dim,
@@ -118,6 +123,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+        if not hasattr(layer, "ipex_linear"):
+            linear = skip_init(torch.nn.Linear, layer.weight.shape[1], layer.weight.shape[0], bias=True if bias is not None else False)
+            linear.weight = layer.weight
+            if bias is not None:
+                linear.bias = bias
+            _disable_tpp()
+            if layer.weight.dtype is torch.bfloat16:
+                _enable_tpp()
+            layer.ipex_linear = ipex.llm.optimize(linear.eval(), dtype=layer.weight.dtype, inplace=True)
+
+        if hasattr(layer, "ipex_linear"):
+            res = layer.ipex_linear(x)
+            return res
 
         return F.linear(x, layer.weight, bias)
 
