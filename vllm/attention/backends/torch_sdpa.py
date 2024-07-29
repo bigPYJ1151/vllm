@@ -216,7 +216,7 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                         query[None, :, start:end, :],
                         key[None, :, start:end, :],
                         value[None, :, start:end, :],
-                        attn_mask=mask,
+                        attn_mask=mask.unsqueeze(0) if (mask is not None and mask.dim() == 3) else mask,
                         dropout_p=0.0,
                         is_causal=not self.need_mask,
                         scale=self.scale).squeeze(0).movedim(
