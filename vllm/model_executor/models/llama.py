@@ -54,7 +54,12 @@ from vllm.utils import is_hip
 from .interfaces import SupportsLoRA
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
 
-
+from torch.nn.utils import skip_init
+import intel_extension_for_pytorch as ipex
+from intel_extension_for_pytorch.cpu._auto_kernel_selection import (
+    _enable_tpp,
+    _disable_tpp,
+)
 class LlamaMLP(nn.Module):
 
     def __init__(
@@ -73,6 +78,10 @@ class LlamaMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj")
+        self.enable_ipex_linear_silu_mul = False
+        self.intermediate_size = intermediate_size
+        if quant_config is None:
+            self.enable_ipex_linear_silu_mul = True
         self.down_proj = RowParallelLinear(input_size=intermediate_size,
                                            output_size=hidden_size,
                                            bias=bias,
@@ -84,8 +93,25 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.enable_ipex_linear_silu_mul and not hasattr(self, "ipex_fusion"):
+            linear_s = skip_init(torch.nn.Linear, x.shape[1], self.intermediate_size, bias=False)
+            linear_m = skip_init(torch.nn.Linear, x.shape[1], self.intermediate_size, bias=False)
+            linear_s.weight = torch.nn.Parameter(self.gate_up_proj.weight[0:self.intermediate_size,:],requires_grad=False)
+            linear_m.weight = torch.nn.Parameter(self.gate_up_proj.weight[self.intermediate_size:self.intermediate_size*2:], requires_grad=False)
+            if self.gate_up_proj.bias is not None:
+                assert False, "self.gate_up_proj shall not have bias"
+            _disable_tpp()
+            if x.dtype is torch.bfloat16:
+                _enable_tpp()
+            linear_s = ipex.llm.optimize(linear_s.eval(), dtype=x.dtype, inplace=True)
+            linear_m = ipex.llm.optimize(linear_m.eval(), dtype=x.dtype, inplace=True)
+            self.ipex_fusion = ipex.llm.modules.Linear2SiluMul(linear_s, linear_m)
+
+        if self.enable_ipex_linear_silu_mul and hasattr(self, "ipex_fusion"):
+            x = self.ipex_fusion(x)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
