@@ -12,7 +12,8 @@ from vllm.executor.multiproc_worker_utils import (ProcessWorkerWrapper,
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
-from vllm.sequence import ExecuteModelRequest, SamplerOutput
+from vllm.sampling_params import SamplingParams
+from vllm.sequence import ExecuteModelRequest, SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.utils import (get_distributed_init_method, get_open_port,
                         get_vllm_instance_id, make_async)
 from vllm.worker.worker_base import WorkerWrapperBase
@@ -205,8 +206,44 @@ class CPUExecutor(ExecutorBase):
         # NOTE: `cpu block` for CPU backend is located on CPU memory but is
         # referred as `gpu block`. Because we want to reuse the existing block
         # management procedure.
-        logger.info("# CPU blocks: %d", num_gpu_blocks)
 
+        logger.info("Warming up...")
+        if (self.parallel_config.tensor_parallel_size > 1
+                and self.parallel_worker_tasks is None):
+            self.parallel_worker_tasks = self._run_workers(
+                "start_worker_execution_loop",
+                async_run_remote_workers_only=True,
+            )
+
+        # Enable top-k sampling to reflect the accurate memory usage.
+        sampling_params = SamplingParams(top_p=0.99, top_k=self.model_config.get_vocab_size() - 1)
+        max_num_batched_tokens = min(
+            self.scheduler_config.max_num_batched_tokens,
+            self.model_config.max_model_len,
+        )
+        max_num_seqs = self.scheduler_config.max_num_seqs
+
+        assert self.lora_config is None
+
+        # Run the model with the dummy inputs.
+        for seq_len in [max_num_seqs, max_num_batched_tokens]:
+            seq_data = SequenceData([0] * seq_len)
+            dummy_multi_modal_data = None
+            seq = SequenceGroupMetadata(
+                request_id=str(0),
+                is_prompt=True,
+                seq_data={0: seq_data},
+                sampling_params=sampling_params,
+                block_tables=None,
+                lora_request=None,
+                multi_modal_data=dummy_multi_modal_data,
+            )
+            input = ExecuteModelRequest([seq])
+            self.driver_method_invoker(self.driver_worker,
+                                    "execute_model", input)
+        self.stop_remote_worker_execution_loop()
+
+        logger.info("# CPU blocks: %d", num_gpu_blocks)
         self._run_workers("initialize_cache",
                           num_gpu_blocks=num_gpu_blocks,
                           num_cpu_blocks=num_cpu_blocks)

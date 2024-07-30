@@ -180,7 +180,7 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: List[CPUCacheEngine]
-        self.cpu_cache: List[List[torch.Tensor]]
+        self.cpu_cache: List[List[torch.Tensor]] = [[None] * self.model_config.get_num_layers(self.parallel_config)]
 
     def init_device(self) -> None:
         if self.local_omp_cpuid != "all":
@@ -338,3 +338,8 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         return CPUCacheEngine.get_cache_block_size(
             self.cache_config.block_size, self.cache_config.cache_dtype,
             self.model_config, self.parallel_config)
+
+    def warming_up_model(self):
+        logger.info("Warming up...")
+        self.model_runner.profile_run()
+        logger.info("Warming up done.")
