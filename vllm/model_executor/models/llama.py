@@ -80,8 +80,18 @@ class LlamaMLP(nn.Module):
             prefix=f"{prefix}.gate_up_proj")
         self.enable_ipex_linear_silu_mul = False
         self.intermediate_size = intermediate_size
+        self.is_quantization = False
         if quant_config is None:
             self.enable_ipex_linear_silu_mul = True
+        else:
+            self.is_quantization = True
+            import os
+            disable_ipex_woq_fusion = os.getenv('DISABLE_IPEX_WOQ_FUSION', default=False)
+            if disable_ipex_woq_fusion is None or bool(disable_ipex_woq_fusion) is False:
+                self.disable_ipex_woq_fusion = False
+            else:
+                self.disable_ipex_woq_fusion = True
+
         self.down_proj = RowParallelLinear(input_size=intermediate_size,
                                            output_size=hidden_size,
                                            bias=bias,
@@ -91,7 +101,54 @@ class LlamaMLP(nn.Module):
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
+    def enable_ipex_woq_fusion(self, x, qlinear):
+        if not hasattr(self, "ipex_fusion"):
+            from intel_extension_for_pytorch.quantization import WoqWeightDtype
+            from intel_extension_for_pytorch.utils.weight_only_quantization import (
+                _woq_enable_weight_cache_for_large_batch,
+            )
 
+            weight_dtype = WoqWeightDtype.INT4
+            lowp_mode = ipex.quantization.WoqLowpMode.INT8
+            # lowp_mode = ipex.quantization.WoqLowpMode.NONE
+            # lowp_mode = ipex.quantization.WoqLowpMode.FP16
+            # lowp_mode = ipex.quantization.WoqLowpMode.BF16
+            act_quant_mode_dict = {
+                "PER_TENSOR": ipex.quantization.WoqActQuantMode.PER_TENSOR,
+                "PER_IC_BLOCK": ipex.quantization.WoqActQuantMode.PER_IC_BLOCK,
+                "PER_BATCH": ipex.quantization.WoqActQuantMode.PER_BATCH,
+                "PER_BATCH_IC_BLOCK": ipex.quantization.WoqActQuantMode.PER_BATCH_IC_BLOCK,
+                "PER_TENSOR_SYM": ipex.quantization.WoqActQuantMode.PER_TENSOR_SYM,
+                "PER_IC_BLOCK_SYM": ipex.quantization.WoqActQuantMode.PER_IC_BLOCK_SYM,
+                "PER_BATCH_SYM": ipex.quantization.WoqActQuantMode.PER_BATCH_SYM,
+                "PER_BATCH_IC_BLOCK_SYM": ipex.quantization.WoqActQuantMode.PER_BATCH_IC_BLOCK_SYM,
+            }
+            qconfig = ipex.quantization.get_weight_only_quant_qconfig_mapping(
+                weight_dtype=weight_dtype,
+                lowp_mode=lowp_mode,
+                act_quant_mode=act_quant_mode_dict["PER_BATCH_IC_BLOCK"],
+                group_size=qlinear.quant_method.quant_config.group_size,
+            )
+            import os
+            disable_woq_cache = os.getenv('DISABLE_IPEX_WEIGHT_CACHE', default=False)
+            if disable_woq_cache is None or bool(disable_woq_cache) is False:
+                disable_woq_cache = False
+            else:
+                disable_woq_cache = True
+            if not disable_woq_cache:
+                qconfig = _woq_enable_weight_cache_for_large_batch(
+                    qconfig
+                )
+
+            # OC needs to be divided by 2
+            qeights = qlinear.qweight.shape[1] // 2
+            qscales = qlinear.scales.shape[1] // 2
+            qzeros = qlinear.qzeros.shape[1] // 2
+            ipex_qlinear1 = ipex.nn.modules.weight_only_quantization.WeightOnlyQuantizedLinear.from_int4_weight(qlinear.qweight[:, 0:qeights], qlinear.scales[:,0:qscales], qlinear.qzeros[:, 0:qzeros], x.shape[-1], x.shape[0], qconfig=qconfig, bias=None, group_size=qlinear.quant_method.quant_config.group_size, is_gptq=True if hasattr(qlinear.quant_method.quant_config, "is_intel_autoround") else False, is_intel_autoround=qlinear.quant_method.quant_config.is_intel_autoround if hasattr(qlinear.quant_method.quant_config, "is_intel_autoround") else False)
+            ipex_qlinear2 = ipex.nn.modules.weight_only_quantization.WeightOnlyQuantizedLinear.from_int4_weight(qlinear.qweight[:, qeights:qeights*2], qlinear.scales[:, qscales:qscales*2], qlinear.qzeros[:,qzeros:qzeros*2], x.shape[-1], x.shape[0], qconfig=qconfig, bias=None, group_size=qlinear.quant_method.quant_config.group_size, is_gptq=True if hasattr(qlinear.quant_method.quant_config, "is_intel_autoround") else False, is_intel_autoround=qlinear.quant_method.quant_config.is_intel_autoround if hasattr(qlinear.quant_method.quant_config, "is_intel_autoround") else False)
+            self.ipex_fusion = ipex.llm.modules.Linear2SiluMul(ipex_qlinear1, ipex_qlinear2)
+        out = self.ipex_fusion(x)
+        return out
     def forward(self, x):
         if self.enable_ipex_linear_silu_mul and not hasattr(self, "ipex_fusion"):
             linear_s = skip_init(torch.nn.Linear, x.shape[1], self.intermediate_size, bias=False)
@@ -109,6 +166,8 @@ class LlamaMLP(nn.Module):
 
         if self.enable_ipex_linear_silu_mul and hasattr(self, "ipex_fusion"):
             x = self.ipex_fusion(x)
+        elif self.is_quantization and not self.disable_ipex_woq_fusion:
+            x = self.enable_ipex_woq_fusion(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)

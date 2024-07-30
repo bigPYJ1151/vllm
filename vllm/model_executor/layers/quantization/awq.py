@@ -207,9 +207,16 @@ class AWQLinearMethod(LinearMethodBase):
                 act_quant_mode=act_quant_mode_dict["PER_IC_BLOCK"],
                 group_size=self.quant_config.group_size,
             )
-            qconfig = _woq_enable_weight_cache_for_large_batch(
-                qconfig
-            )
+            import os
+            disable_woq_cache = os.getenv('DISABLE_IPEX_WEIGHT_CACHE', default=False)
+            if disable_woq_cache is None or bool(disable_woq_cache) is False:
+                disable_woq_cache = False
+            else:
+                disable_woq_cache = True
+            if not disable_woq_cache:
+                qconfig = _woq_enable_weight_cache_for_large_batch(
+                    qconfig
+                )
             layer.ipex_qlinear = ipex.nn.modules.weight_only_quantization.WeightOnlyQuantizedLinear.from_int4_weight(qweight, scales, qzeros, x.shape[-1], out_shape[-1], qconfig=qconfig, bias=bias, group_size=self.quant_config.group_size)
         out = layer.ipex_qlinear(reshaped_x)
 
