@@ -79,7 +79,8 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj")
         self.enable_ipex_linear_silu_mul = False
-        self.intermediate_size = intermediate_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.intermediate_size = intermediate_size // tp_size
         self.is_quantization = False
         if quant_config is None:
             self.enable_ipex_linear_silu_mul = True
