@@ -14,7 +14,8 @@ from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.model_loader import get_model
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensors,
                              MultiModalInputs)
-from vllm.sequence import (IntermediateTensors, SamplerOutput,
+from vllm.sampling_params import SamplingParams
+from vllm.sequence import (IntermediateTensors, SamplerOutput, SequenceData,
                            SequenceGroupMetadata)
 from vllm.utils import make_tensor_with_pad
 from vllm.worker.model_runner_base import (
@@ -168,27 +169,30 @@ class CPUModelRunner(ModelRunnerBase[CPUModelInput]):
                 mm_kwargs = self.multi_modal_input_mapper(mm_data)
                 multi_modal_inputs_list.append(mm_kwargs)
 
-            # Compute the slot mapping.
-            block_table = seq_group_metadata.block_tables[seq_id]
-            # Mask the [0, start_idx) tokens of the prompt with _PAD_SLOT_ID,
-            # where start_idx is max(0, seq_len - sliding_window).
-            # For example, if the prompt len is 10, sliding window is 8, and
-            # block size is 4, the first two tokens are masked and the slot
-            # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
-            start_idx = 0
-            if self.sliding_window is not None:
-                start_idx = max(0, seq_len - self.sliding_window)
+            if seq_group_metadata.block_tables is None:
+                block_table = []
+            else:
+                # Compute the slot mapping.
+                block_table = seq_group_metadata.block_tables[seq_id]
+                # Mask the [0, start_idx) tokens of the prompt with _PAD_SLOT_ID,
+                # where start_idx is max(0, seq_len - sliding_window).
+                # For example, if the prompt len is 10, sliding window is 8, and
+                # block size is 4, the first two tokens are masked and the slot
+                # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
+                start_idx = 0
+                if self.sliding_window is not None:
+                    start_idx = max(0, seq_len - self.sliding_window)
 
-            for i in range(computed_len, seq_len):
-                if i < start_idx:
-                    slot_mapping.append(_PAD_SLOT_ID)
-                    continue
+                for i in range(computed_len, seq_len):
+                    if i < start_idx:
+                        slot_mapping.append(_PAD_SLOT_ID)
+                        continue
 
-                block_number = block_table[i //
-                                           self.block_size]  # type: ignore
-                block_offset = i % self.block_size  # type: ignore
-                slot = block_number * self.block_size + block_offset
-                slot_mapping.append(slot)
+                    block_number = block_table[i //
+                                            self.block_size]  # type: ignore
+                    block_offset = i % self.block_size  # type: ignore
+                    slot = block_number * self.block_size + block_offset
+                    slot_mapping.append(slot)
 
         num_prompt_tokens = len(input_tokens)
 
