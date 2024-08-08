@@ -476,6 +476,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
             self.unpadded_vocab_size = config.vocab_size
             if lora_config:
                 self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+            pad_factor = 64 * get_tensor_model_parallel_world_size()
+            self.unpadded_vocab_size = ((self.unpadded_vocab_size + pad_factor - 1) // pad_factor) * pad_factor
             self.lm_head = ParallelLMHead(
                 self.unpadded_vocab_size,
                 config.hidden_size,

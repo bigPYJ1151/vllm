@@ -1540,7 +1540,7 @@ def _get_and_verify_max_len(
                 f"{model_max_length} in model's config.json). This may lead "
                 "to incorrect model outputs or CUDA errors. Make sure the "
                 "value is correct and within the model context size.")
-    return int(max_model_len)
+    return min(8192, int(max_model_len))
 
 
 def get_served_model_name(model: str,

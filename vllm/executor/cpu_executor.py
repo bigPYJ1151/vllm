@@ -232,7 +232,7 @@ class CPUExecutor(ExecutorBase):
         assert self.lora_config is None
 
         # Run the model with the dummy inputs.
-        for seq_len in [max_num_seqs, min(4096, max_num_batched_tokens)]:
+        for seq_len in [max_num_seqs, max_num_batched_tokens]:
             seq_data = SequenceData([0] * seq_len)
             dummy_multi_modal_data = None
             seq = SequenceGroupMetadata(
