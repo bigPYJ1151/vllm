@@ -365,6 +365,8 @@ class LlamaModel(nn.Module):
                 self.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                quant_config=quant_config,
+                padding_size=32 * get_tensor_model_parallel_world_size() # Padding for un-even world size
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -552,53 +554,61 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if ("rotary_emb.cos_cached" in name
-                    or "rotary_emb.sin_cached" in name):
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if scale_name := get_compressed_tensors_cache_scale(name):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                continue
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                if weight_name not in name:
+            try:
+                if "rotary_emb.inv_freq" in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if ("rotary_emb.cos_cached" in name
+                        or "rotary_emb.sin_cached" in name):
+                    # Models trained using ColossalAI may include these tensors in
+                    # the checkpoint. Skip them.
                     continue
+                # With tie_word_embeddings, we can skip lm_head.weight
+                # The weight might appear unnecessarily in the files if the model is
+                # processed with quantization, LoRA, fine-tuning, etc.
+                if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                    continue
+                if scale_name := get_compressed_tensors_cache_scale(name):
+                    # Loading kv cache scales for compressed-tensors quantization
+                    param = params_dict[scale_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    loaded_weight = loaded_weight[0]
+                    weight_loader(param, loaded_weight)
+                    continue
+                for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
 
-                if is_pp_missing_parameter(name, self):
-                    continue
+                    if is_pp_missing_parameter(name, self):
+                        continue
 
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
 
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale.
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Remapping the name of FP8 kv-scale.
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
 
-                if is_pp_missing_parameter(name, self):
-                    continue
+                    if is_pp_missing_parameter(name, self):
+                        continue
 
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+            except Exception as e:
+                print("{} failed, param_shape: {}, loaded_shape: {}, msg={}".format(name, param.size(), loaded_weight.size(), e))
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
