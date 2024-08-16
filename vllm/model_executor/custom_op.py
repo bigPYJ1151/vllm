@@ -7,6 +7,7 @@ class CustomOp(nn.Module):
 
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.initialized = False
         self._forward_method = self.dispatch_forward()
 
     def forward(self, *args, **kwargs):

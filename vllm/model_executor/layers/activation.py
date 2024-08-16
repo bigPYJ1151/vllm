@@ -104,6 +104,13 @@ class NewGELU(CustomOp):
         return 0.5 * x * (1.0 + torch.tanh(c *
                                            (x + 0.044715 * torch.pow(x, 3.0))))
 
+    @staticmethod
+    def _forward_native(x: torch.Tensor) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+        c = math.sqrt(2.0 / math.pi)
+        return 0.5 * x * (1.0 + torch.tanh(c *
+                                           (x + 0.044715 * torch.pow(x, 3.0))))                
+
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         from vllm import _custom_ops as ops
 
@@ -117,6 +124,12 @@ class NewGELU(CustomOp):
         out = torch.empty_like(x)
         ops.gelu_new(out, x)
         return out
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.initialized:
+            self.initialized = True
+            NewGELU._forward_native = torch.compile(NewGELU._forward_native, dynamic=True, options={"cpp_wrapper": True}) 
+        return NewGELU._forward_native(x)
 
 
 class FastGELU(CustomOp):
