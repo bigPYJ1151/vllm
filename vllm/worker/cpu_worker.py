@@ -320,9 +320,8 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     @torch.inference_mode()
     def prepare_worker_input(
             self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
-        assert execute_model_req is not None
         virtual_engine = execute_model_req.virtual_engine
-        num_seq_groups: int = len(execute_model_req.seq_group_metadata_list)
+        num_seq_groups = len(execute_model_req.seq_group_metadata_list)
         blocks_to_copy = execute_model_req.blocks_to_copy
         blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
                                       device="cpu",
