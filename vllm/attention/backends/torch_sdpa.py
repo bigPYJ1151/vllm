@@ -71,9 +71,17 @@ class TorchSDPAMetadata(AttentionMetadata, PagedAttentionMetadata):
     """
     # Currently, input sequences can only contain all prompts
     # or all decoding. True if all sequences are prompts.
-    is_prompt: bool
+    chunked_prefill: bool
+    seq_lens: List[int]  # For non-chunked prefill
+
+    # For chunked prefill only
+    max_query_len: Optional[int] = None
+    max_kv_len: Optional[int] = None
+    query_start_loc: Optional[torch.Tensor] = None
+    kv_start_loc: Optional[torch.Tensor] = None
+    prefill_block_tables: Optional[torch.Tensor] = None
+
     slot_mapping: torch.Tensor
-    seq_lens: Optional[List[int]]
 
     # Begin encoder attn & enc/dec cross-attn fields...
     # Encoder sequence lengths representation
@@ -123,20 +131,14 @@ class TorchSDPAMetadata(AttentionMetadata, PagedAttentionMetadata):
 
     @property
     def prefill_metadata(self) -> Optional["TorchSDPAMetadata"]:
-        # Currently chunked prefill is not supported
-        if self.num_decode_tokens == 0:
-            assert self.num_prefills > 0
-            return self
-
-        return None
+        if self.num_prefill_tokens == 0:
+            return None
+        return self
 
     @property
     def decode_metadata(self) -> Optional["TorchSDPAMetadata"]:
-        # Currently chunked prefill is not supported
-        if self.num_prefills > 0:
-            assert self.num_decode_tokens == 0
+        if self.num_decode_tokens == 0:
             return None
-
         return self
 
     def get_seq_lens(
@@ -407,8 +409,7 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
 
         if prefill_meta := attn_metadata.prefill_metadata:
             assert attn_metadata.seq_lens is not None
-            if (kv_cache.numel() == 0
-                    or prefill_meta.block_tables.numel() == 0):
+            if not prefill_meta.chunked_prefill:
                 output = self._run_sdpa_forward(query,
                                                 key,
                                                 value,
@@ -416,31 +417,65 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                                                 attn_type=attn_type)
             else:
                 # prefix-enabled attention
-                raise RuntimeError(
-                    "Torch SDPA backend doesn't support prefix decoding.")
+                import intel_extension_for_pytorch.llm.modules as ipex_modules
+                output = torch.empty_like(query)
+
+                if prefill_meta.num_prefill_tokens > 0:
+                    ipex_modules.PagedAttention.flash_attn_varlen_func(
+                        output[:prefill_meta.num_prefill_tokens, :, :],
+                        query[:prefill_meta.num_prefill_tokens, :, :],
+                        key_cache,
+                        value_cache,
+                        prefill_meta.query_start_loc,
+                        prefill_meta.kv_start_loc,
+                        prefill_meta.max_query_len,
+                        prefill_meta.max_kv_len,
+                        self.scale,
+                        True,
+                        prefill_meta.prefill_block_tables,
+                        self.alibi_slopes,
+                    )
+
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
-            (
+            (   
                 seq_lens_arg,
                 max_seq_len_arg,
                 block_tables_arg,
             ) = decode_meta.get_seq_len_block_table_args(attn_type)
 
-            output = PagedAttention.forward_decode(
-                query,
-                key_cache,
-                value_cache,
-                block_tables_arg,
-                seq_lens_arg,
-                max_seq_len_arg,
-                self.kv_cache_dtype,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-                k_scale,
-                v_scale,
-            )
+            if decode_meta.num_prefill_tokens > 0:
+                PagedAttention.forward_decode_(
+                    output[attn_metadata.num_prefill_tokens:, :, :],
+                    query[attn_metadata.num_prefill_tokens:, :, :],
+                    key_cache,
+                    value_cache,
+                    block_tables_arg,
+                    seq_lens_arg,
+                    max_seq_len_arg,
+                    self.kv_cache_dtype,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                    k_scale,
+                    v_scale,
+                )
+            else:
+                output = PagedAttention.forward_decode(
+                    query,
+                    key_cache,
+                    value_cache,
+                    block_tables_arg,
+                    seq_lens_arg,
+                    max_seq_len_arg,
+                    self.kv_cache_dtype,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                    k_scale,
+                    v_scale,
+                )
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)

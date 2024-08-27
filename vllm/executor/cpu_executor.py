@@ -340,10 +340,6 @@ def _verify_and_get_scheduler_config(
         config: SchedulerConfig) -> SchedulerConfig:
     # Reminder: Please update docs/source/serving/compatibility_matrix.rst
     # If the feature combo become valid
-    if config.chunked_prefill_enabled:
-        logger.warning("Chunked prefill is not supported on CPU, disable it.")
-        config.chunked_prefill_enabled = False
-
     return config
 
 
