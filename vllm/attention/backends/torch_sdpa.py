@@ -66,9 +66,17 @@ class TorchSDPAMetadata(AttentionMetadata, PagedAttentionMetadata):
     """
     # Currently, input sequences can only contain all prompts
     # or all decoding. True if all sequences are prompts.
-    is_prompt: bool
+    chunked_prefill: bool
+    seq_lens: List[int]  # For non-chunked prefill
+
+    # For chunked prefill only
+    max_query_len: Optional[int]
+    max_kv_len: Optional[int]
+    query_start_loc: Optional[torch.Tensor]
+    kv_start_loc: Optional[torch.Tensor]
+    prefill_block_tables: Optional[torch.Tensor]
+
     slot_mapping: torch.Tensor
-    seq_lens: Optional[List[int]]
 
     def __post_init__(self):
         # Set during the execution of the first attention op.
@@ -184,9 +192,10 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                                                 self.kv_cache_dtype, k_scale,
                                                 v_scale)
 
-        if attn_metadata.is_prompt:
-            assert attn_metadata.seq_lens is not None
-            if (kv_cache is None or attn_metadata.block_tables.numel() == 0):
+        if not attn_metadata.chunked_prefill:
+            if attn_metadata.num_prefill_tokens > 0:
+                assert attn_metadata.seq_lens is not None
+                assert attn_metadata.num_decode_tokens == 0
                 if self.num_kv_heads != self.num_heads:
                     key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
                     value = value.repeat_interleave(self.num_queries_per_kv,
@@ -228,26 +237,57 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                     output[start:end, :, :] = sub_out
                     start = end
             else:
-                # prefix-enabled attention
-                raise RuntimeError(
-                    "Torch SDPA backend doesn't support prefix decoding.")
-
+                assert attn_metadata.num_prefill_tokens == 0
+                output = PagedAttention.forward_decode(
+                    query,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_tables,
+                    attn_metadata.seq_lens_tensor,
+                    attn_metadata.max_decode_seq_len,
+                    self.kv_cache_dtype,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                    k_scale,
+                    v_scale,
+                )
         else:
-            # Decoding run.
-            output = PagedAttention.forward_decode(
-                query,
-                key_cache,
-                value_cache,
-                attn_metadata.block_tables,
-                attn_metadata.seq_lens_tensor,
-                attn_metadata.max_decode_seq_len,
-                self.kv_cache_dtype,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-                k_scale,
-                v_scale,
-            )
+            import intel_extension_for_pytorch.llm.modules as ipex_modules
+            output = torch.empty_like(query)
+
+            if attn_metadata.num_prefill_tokens > 0:
+                ipex_modules.PagedAttention.flash_attn_varlen_func(
+                    output[:attn_metadata.num_prefill_tokens, :, :],
+                    query[:attn_metadata.num_prefill_tokens, :, :],
+                    key_cache,
+                    value_cache,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.kv_start_loc,
+                    attn_metadata.max_query_len,
+                    attn_metadata.max_kv_len,
+                    self.scale,
+                    True,
+                    attn_metadata.prefill_block_tables,
+                    self.alibi_slopes,
+                )
+
+            if attn_metadata.num_decode_tokens > 0:
+                PagedAttention.forward_decode_(
+                    output[attn_metadata.num_prefill_tokens:, :, :],
+                    query[attn_metadata.num_prefill_tokens:, :, :],
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_tables,
+                    attn_metadata.seq_lens_tensor,
+                    attn_metadata.max_decode_seq_len,
+                    self.kv_cache_dtype,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                    k_scale,
+                    v_scale,
+                )
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
