@@ -70,6 +70,43 @@ class PagedAttention:
         *args,
     ) -> torch.Tensor:
         output = torch.empty_like(query)
+
+        PagedAttention.forward_decode_(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lens,
+            max_context_len,
+            kv_cache_dtype,
+            num_kv_heads,
+            scale,
+            alibi_slopes,
+            k_scale,
+            v_scale,
+            *args,
+        )
+
+        return output
+
+    @staticmethod
+    def forward_decode_(
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+        max_context_len: int,
+        kv_cache_dtype: str,
+        num_kv_heads: int,
+        scale: float,
+        alibi_slopes: Optional[torch.Tensor],
+        k_scale: float,
+        v_scale: float,
+        *args,
+    ) -> None:
         block_size = value_cache.shape[2]
         head_mapping = torch.arange(
             0,
@@ -82,26 +119,6 @@ class PagedAttention:
             output, query.contiguous(), key_cache, value_cache, head_mapping,
             scale, block_tables, context_lens, block_size, max_context_len,
             alibi_slopes)
-
-        return output
-
-    @staticmethod
-    def forward_prefix(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache_dtype: str,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_tables: torch.Tensor,
-        subquery_start_loc: torch.Tensor,
-        prompt_lens_tensor: torch.Tensor,
-        context_lens: torch.Tensor,
-        max_subquery_len: int,
-        alibi_slopes: Optional[torch.Tensor],
-        *args,
-    ) -> torch.Tensor:
-        raise NotImplementedError
 
     @staticmethod
     def swap_blocks(
