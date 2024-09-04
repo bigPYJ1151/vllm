@@ -328,10 +328,6 @@ def _verify_and_get_scheduler_config(
 
 
 def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
-    if config.enable_prefix_caching:
-        logger.warning("Prefix caching is not supported on CPU, disable it.")
-        config.enable_prefix_caching = False
-
     kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
 
     if kv_cache_space >= 0:
