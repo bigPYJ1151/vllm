@@ -112,6 +112,27 @@ class CPUModelInputBuilder(ModelRunnerInputBuilderBase[CPUModelInput]):
         if is_prompt:
             context_len = seq_data.get_num_computed_tokens()
             seq_len = context_len + token_chunk_size
+            
+            # For prefix caching
+            prefix_cache_block_num = len(seq_group_metadata.computed_block_nums)
+            if prefix_cache_block_num > 0:
+                prefix_cache_len = prefix_cache_block_num * self.runner.block_size
+                self.chunked_prefill = True
+                if prefix_cache_len <= context_len:
+                    # We already passed the cache hit region,
+                    # so do normal computation.
+                    pass
+                elif context_len < prefix_cache_len < seq_len:
+                    # Partial hit. Compute the missing part.
+                    context_len = prefix_cache_len
+                    token_chunk_size = seq_len - context_len
+                elif seq_len <= prefix_cache_len:
+                    # Full hit. Only compute the last token to avoid
+                    # erroneous behavior. FIXME: Ideally we should directly
+                    # mark all tokens as computed in the scheduler and do not
+                    # schedule this sequence, so this case should not happen.
+                    context_len = seq_len - 1
+                    token_chunk_size = 1
 
             tokens = seq_data.get_token_ids()
             if context_len != 0 or seq_len < len(tokens):
