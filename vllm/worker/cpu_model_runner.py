@@ -7,15 +7,15 @@ from torch import nn
 
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
-                         ModelConfig, MultiModalConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig)
+                         ModelConfig, ParallelConfig, PromptAdapterConfig,
+                         SchedulerConfig)
 from vllm.logger import init_logger
 from vllm.model_executor import SamplingMetadata
+from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader import get_model
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
                              MultiModalInputs)
-from vllm.sequence import (IntermediateTensors, SamplerOutput,
-                           SequenceGroupMetadata)
+from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
 from vllm.utils import make_tensor_with_pad
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase, ModelRunnerInputBuilderBase,
@@ -112,6 +112,27 @@ class CPUModelInputBuilder(ModelRunnerInputBuilderBase[CPUModelInput]):
         if is_prompt:
             context_len = seq_data.get_num_computed_tokens()
             seq_len = context_len + token_chunk_size
+            
+            # For prefix caching
+            prefix_cache_block_num = len(seq_group_metadata.computed_block_nums)
+            if prefix_cache_block_num > 0:
+                prefix_cache_len = prefix_cache_block_num * self.runner.block_size
+                self.chunked_prefill = True
+                if prefix_cache_len <= context_len:
+                    # We already passed the cache hit region,
+                    # so do normal computation.
+                    pass
+                elif context_len < prefix_cache_len < seq_len:
+                    # Partial hit. Compute the missing part.
+                    context_len = prefix_cache_len
+                    token_chunk_size = seq_len - context_len
+                elif seq_len <= prefix_cache_len:
+                    # Full hit. Only compute the last token to avoid
+                    # erroneous behavior. FIXME: Ideally we should directly
+                    # mark all tokens as computed in the scheduler and do not
+                    # schedule this sequence, so this case should not happen.
+                    context_len = seq_len - 1
+                    token_chunk_size = 1
 
             tokens = seq_data.get_token_ids()
             if context_len != 0 or seq_len < len(tokens):
@@ -287,7 +308,6 @@ class CPUModelRunner(ModelRunnerBase[CPUModelInput]):
         cache_config: CacheConfig,
         load_config: LoadConfig,
         lora_config: Optional[LoRAConfig],
-        multimodal_config: Optional[MultiModalConfig],
         kv_cache_dtype: Optional[str] = "auto",
         prompt_adapter_config: Optional[PromptAdapterConfig] = None,
         is_driver_worker: bool = False,
@@ -300,7 +320,6 @@ class CPUModelRunner(ModelRunnerBase[CPUModelInput]):
         self.device_config = device_config
         self.cache_config = cache_config
         self.lora_config = lora_config
-        self.multimodal_config = multimodal_config
         self.prompt_adapter_config = prompt_adapter_config
         self.load_config = load_config
         self.is_driver_worker = is_driver_worker
@@ -321,8 +340,10 @@ class CPUModelRunner(ModelRunnerBase[CPUModelInput]):
         )
 
         # Multi-modal data support
-        self.multi_modal_input_mapper = MULTIMODAL_REGISTRY \
+        self.mm_registry = MULTIMODAL_REGISTRY
+        self.multi_modal_input_mapper = self.mm_registry \
             .create_input_mapper(self.model_config)
+        self.mm_registry.init_mm_limits_per_prompt(self.model_config)
 
         # Lazy initialization.
         self.model: nn.Module  # Set after init_Model
@@ -331,7 +352,6 @@ class CPUModelRunner(ModelRunnerBase[CPUModelInput]):
         self.model = get_model(model_config=self.model_config,
                                load_config=self.load_config,
                                device_config=self.device_config,
-                               multimodal_config=self.multimodal_config,
                                lora_config=self.lora_config,
                                parallel_config=self.parallel_config,
                                scheduler_config=self.scheduler_config,
