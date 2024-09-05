@@ -265,8 +265,8 @@ class CPUModelInputBuilder(ModelRunnerInputBuilderBase[CPUModelInput]):
                 device="cpu",
             )
         else:
-            block_tables = None
-            seq_lens_tensor = None
+            block_tables = torch.tensor([])
+            seq_lens_tensor = torch.tensor([])
 
         attn_metadata = self.runner.attn_backend.make_metadata(
             chunked_prefill=self.chunked_prefill,

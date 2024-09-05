@@ -75,11 +75,11 @@ class TorchSDPAMetadata(AttentionMetadata, PagedAttentionMetadata):
     seq_lens: List[int]  # For non-chunked prefill
 
     # For chunked prefill only
-    max_query_len: Optional[int]
-    max_kv_len: Optional[int]
-    query_start_loc: Optional[torch.Tensor]
-    kv_start_loc: Optional[torch.Tensor]
-    prefill_block_tables: Optional[torch.Tensor]
+    max_query_len: Optional[int] = None
+    max_kv_len: Optional[int] = None
+    query_start_loc: Optional[torch.Tensor] = None
+    kv_start_loc: Optional[torch.Tensor] = None
+    prefill_block_tables: Optional[torch.Tensor] = None
 
     slot_mapping: torch.Tensor
 
