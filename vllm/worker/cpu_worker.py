@@ -370,10 +370,6 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         hidden_size = self.model_config.get_hidden_size()
 
         ctx_len = self.model_config.max_model_len
-        if self.model_config.max_model_len > 8192:
-            assert self.scheduler_config.chunked_prefill_enabled, "chunked prefill should be enabled for long context model."
-            ctx_len = self.scheduler_config.max_num_batched_tokens
-
         rank_buffer_size = (ctx_len * hidden_size *
                             5 // world_size * elem_size)
         torch.ops._C.init_shm_manager(
@@ -390,10 +386,6 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         hidden_size = self.model_config.get_hidden_size()
 
         ctx_len = self.model_config.max_model_len
-        if self.model_config.max_model_len > 8192:
-            assert self.scheduler_config.chunked_prefill_enabled, "chunked prefill should be enabled for long context model."
-            ctx_len = self.scheduler_config.max_num_batched_tokens
-
         rank_buffer_size = (ctx_len * hidden_size *
                             5 // world_size * elem_size)
         ret = torch.ops._C.join_shm_manager(

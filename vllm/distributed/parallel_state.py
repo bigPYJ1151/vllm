@@ -287,9 +287,9 @@ class GroupCoordinator:
         if (pynccl_comm is not None and not pynccl_comm.disabled):
             pynccl_comm.all_reduce(input_)
         elif input_.is_cpu:
-            import intel_extension_for_pytorch as ipex
-            ipex.distributed.all_reduce(input_, group=self.device_group)
-            # torch.ops._C.shm_allreduce(input_, self.rank)
+            # import intel_extension_for_pytorch as ipex
+            # ipex.distributed.all_reduce(input_, group=self.device_group)
+            torch.ops._C.shm_allreduce(input_, self.rank)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
         return input_
