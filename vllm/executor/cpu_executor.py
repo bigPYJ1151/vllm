@@ -359,6 +359,10 @@ def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
             "Invalid environment variable VLLM_CPU_KVCACHE_SPACE"
             f" {kv_cache_space}, expect a positive integer value.")
 
+    if config.cache_dtype in ["fp8", "fp8_e4m3"]:
+        config.cache_dtype = "fp8_e5m2"
+        logger.warning("Using fp8_e5m2 KVcache dtype.")
+
     return config
 
 

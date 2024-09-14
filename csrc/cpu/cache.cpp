@@ -95,7 +95,7 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
   }
 
   const int element_num_per_block = key_caches[0][0].numel();
-  VLLM_DISPATCH_FLOATING_TYPES(
+  VLLM_DISPATCH_FLOATING_TYPES_AND_E5M2(
       key_caches[0].scalar_type(), "copy_blocks_cpu_impl", [&] {
         CPU_KERNEL_GUARD_IN(copy_blocks_cpu_impl)
         copy_blocks_cpu_impl<scalar_t>(key_caches, value_caches, block_mapping,

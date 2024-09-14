@@ -50,8 +50,10 @@ class CPUCacheEngine:
 
         if cache_config.cache_dtype == "auto":
             self.dtype = model_config.dtype
+        elif cache_config.cache_dtype == "fp8_e5m2":
+            self.dtype = torch.float8_e5m2
         else:
-            self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            raise RuntimeError(f"invalid cache dtype {cache_config.cache_dtype}")
 
         # Get attention backend.
         self.attn_backend = get_attn_backend(
