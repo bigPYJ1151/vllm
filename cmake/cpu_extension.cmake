@@ -100,6 +100,7 @@ set(VLLM_EXT_SRC
     "csrc/cpu/cache.cpp"
     "csrc/cpu/utils.cpp"
     "csrc/cpu/layernorm.cpp"
+    "csrc/cpu/shm_ccl.cpp"
     "csrc/cpu/pos_encoding.cpp"
     "csrc/cpu/torch_bindings.cpp")
 

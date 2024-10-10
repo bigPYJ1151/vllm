@@ -369,8 +369,9 @@ class GroupCoordinator:
         if (pynccl_comm is not None and not pynccl_comm.disabled):
             pynccl_comm.all_reduce(input_)
         elif input_.is_cpu:
-            import intel_extension_for_pytorch as ipex
-            ipex.distributed.all_reduce(input_, group=self.device_group)
+            # import intel_extension_for_pytorch as ipex
+            # ipex.distributed.all_reduce(input_, group=self.device_group)
+            torch.ops._C.shm_allreduce(input_, self.rank)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -431,10 +432,11 @@ class GroupCoordinator:
         else:
             gather_list = None
         # Gather.
-        torch.distributed.gather(input_,
-                                 gather_list,
-                                 dst=self.ranks[dst],
-                                 group=self.device_group)
+        torch.ops._C.shm_gather(input_, gather_list, self.ranks[dst], self.rank)
+        # torch.distributed.gather(input_,
+        #                          gather_list,
+        #                          dst=self.ranks[dst],
+        #                          group=self.device_group)
         if self.rank_in_group == dst:
             output_tensor = torch.cat(gather_list, dim=dim)
         else:
