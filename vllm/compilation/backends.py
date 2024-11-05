@@ -183,6 +183,7 @@ def wrap_inductor(graph,
 
     if additional_inductor_config is not None:
         current_config.update(additional_inductor_config)
+    print(current_config)
 
     # inductor can inplace modify the graph, so we need to copy it
     # see https://github.com/pytorch/pytorch/issues/138980
@@ -199,6 +200,9 @@ class SplitItem:
 
 def split_graph(graph: fx.GraphModule,
                 ops: List[str]) -> Tuple[fx.GraphModule, List[SplitItem]]:
+    if len(ops) == 0:
+        return graph, []
+            
     # split graph by ops
     subgraph_id = 0
     node_to_subgraph_id = {}
@@ -264,7 +268,7 @@ class VllmBackend:
 
     def __init__(self, ):
         # every instance of VllmBackend has its own graph pool
-        self.graph_pool = torch.cuda.graph_pool_handle()
+        self.graph_pool = torch.cuda.graph_pool_handle() if torch.cuda.is_available() else None
 
         # `torch.compile` is JIT compiled, so we don't need to
         # do anything here
@@ -350,7 +354,7 @@ class ConcreteSizeEntry:
     output: Optional[Any] = None
 
 
-class PiecewiseBackend:
+class PiecewiseBackend(torch.nn.Module):
 
     def __init__(self,
                  graph: fx.GraphModule,
@@ -370,6 +374,7 @@ class PiecewiseBackend:
         If a shape needs both compilation and cudagraph, we will
         compile it first, and then capture cudagraph.
         """
+        super().__init__()
         self.graph = graph
         self.compilation_configs = compilation_configs
         self.graph_pool = graph_pool
@@ -417,8 +422,11 @@ class PiecewiseBackend:
                 runtime_shape=None,
                 do_logging=self.is_first_graph,
                 use_inductor=self.compilation_configs.use_inductor)
-
-            return self.graph(*args)
+            from torch._subclasses.fake_tensor import FakeTensorMode
+            fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+            with fake_mode:
+                out = self.graph(*args)
+            return out
 
         if not self.first_run_finished:
             self.first_run_finished = True

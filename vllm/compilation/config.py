@@ -93,15 +93,15 @@ class CompilationConfig(BaseModel):
 
         from vllm.compilation.backends import fix_functionalization
         from vllm.utils import combine_fx_passes
-        if "post_grad_custom_post_pass" in self.inductor_compile_config:
-            self.inductor_compile_config[
-                "post_grad_custom_post_pass"] = combine_fx_passes(
-                    fix_functionalization,
-                    self.inductor_compile_config["post_grad_custom_post_pass"],
-                )
-        else:
-            self.inductor_compile_config[
-                "post_grad_custom_post_pass"] = fix_functionalization
+        # if "post_grad_custom_post_pass" in self.inductor_compile_config:
+        #     self.inductor_compile_config[
+        #         "post_grad_custom_post_pass"] = combine_fx_passes(
+        #             fix_functionalization,
+        #             self.inductor_compile_config["post_grad_custom_post_pass"],
+        #         )
+        # else:
+        #     self.inductor_compile_config[
+        #         "post_grad_custom_post_pass"] = fix_functionalization
 
     def init_during_runtime(self):
         """To complete the initialization of config,

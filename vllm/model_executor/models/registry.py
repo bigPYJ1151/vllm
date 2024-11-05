@@ -290,6 +290,7 @@ def _try_inspect_model_cls(
     model: _BaseRegisteredModel,
 ) -> Optional[_ModelInfo]:
     try:
+        return _ModelInfo(True, False, False, False, False, False)
         return model.inspect_model_cls()
     except Exception:
         logger.exception("Error in inspecting model architecture '%s'",
