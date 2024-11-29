@@ -266,6 +266,9 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # Initialize the cache.
         self._init_cache_engine()
 
+        assert self.kv_cache is not None
+        self.model_runner.warming_up_model(self.kv_cache[0])
+
     def _validate_num_cpu_blocks(self, num_cpu_blocks: int) -> None:
         """Raise errors if the num_cpu_blocks is invalid.
         """
