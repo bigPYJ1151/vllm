@@ -277,7 +277,7 @@ class TorchSDPAMetadata(AttentionMetadata, PagedAttentionMetadata):
 class TorchSDPAMetadataBuilder(AttentionMetadataBuilder[TorchSDPAMetadata]):
 
     def __init__(self, input_builder: ModelInputForCPUBuilder) -> None:
-        self.chunked_prefill = input_builder.chunked_prefill
+        self.chunked_prefill = input_builder.input_data.chunked_prefill
         self.input_data = input_builder.input_data
 
     def build(self, seq_lens: List[int], query_lens: List[int],
