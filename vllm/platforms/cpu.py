@@ -109,5 +109,6 @@ class CpuPlatform(Platform):
                 "size_asserts": False,
                 "nan_asserts": False,
                 "memory_planning": True,
-                "freezing": True,
+                "max_autotune": True,
+                "epilogue_fusion": True,
             }

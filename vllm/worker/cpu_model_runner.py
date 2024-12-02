@@ -1,6 +1,7 @@
 import dataclasses
 import weakref
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Dict, List, Optional, Type, TypeVar,
                     Union)
@@ -477,11 +478,11 @@ class CPUModelRunnerBase(ModelRunnerBase[TModelInputForCPU]):
         ]:
             return
 
-        # Only generate graph for the generic shape
-        input_data = self._prepare_dummy_model_input_tensors(512)
         logger.info("Warming up model for the compilation...")
-        import depyf
-        with depyf.prepare_debug("compile_debug_dir"):
+        # Only generate graph for the generic shape
+        input_data = self._prepare_dummy_model_input_tensors(
+            self.scheduler_config.max_num_batched_tokens)
+        with _set_global_compilation_settings():
             self.execute_model(
                 input_data,
                 kv_cache,
@@ -520,6 +521,17 @@ class CPUModelRunnerBase(ModelRunnerBase[TModelInputForCPU]):
     @property
     def vocab_size(self) -> int:
         return self.model_config.get_vocab_size()
+
+
+@contextmanager
+def _set_global_compilation_settings():
+    import torch._inductor.config
+
+    # Note: The CPPGEMM backend requires freezing parameters.
+    freezing_value = torch._inductor.config.freezing
+    torch._inductor.config.freezing = True
+    yield
+    torch._inductor.config.freezing = freezing_value
 
 
 class CPUModelRunner(CPUModelRunnerBase[ModelInputForCPUWithSamplingMetadata]):
