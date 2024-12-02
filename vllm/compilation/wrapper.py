@@ -36,8 +36,11 @@ class TorchCompileWrapperWithCustomDispatcher:
 
             backend = vllm_config.compilation_config.init_backend(vllm_config)
 
-            options = get_current_vllm_config(
-            ).compilation_config.inductor_compile_config
+            options = None
+            if isinstance(backend, str) and backend == "inductor":
+                options = get_current_vllm_config(
+                ).compilation_config.inductor_compile_config
+
             compiled_callable = torch.compile(
                 self.forward,
                 fullgraph=envs.VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE,
