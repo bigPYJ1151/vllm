@@ -17,7 +17,8 @@ Table of contents:
 3. [Build from source](#build-cpu-backend-from-source)
 4. [Related runtime environment variables](#env-intro)
 5. [Intel Extension for PyTorch](#ipex-guidance)
-6. [Performance tips](#cpu-backend-performance-tips)
+6. [Usage of torch.compile](#torch_compile)
+7. [Performance tips](#cpu-backend-performance-tips)
 
 (cpu-backend-requirements)=
 
@@ -108,6 +109,8 @@ $ VLLM_TARGET_DEVICE=cpu python setup.py install
 ```
 
 - Setting environment variable `ENV TORCHINDUCTOR_COMPILE_THREADS=1` to avoid too many background compilation threads.
+
+- Setting environment variable `ENV TORCHINDUCTOR_CPP_WRAPPER=1` may improve performance further.
 
 (cpu-backend-performance-tips)=
 
