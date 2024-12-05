@@ -472,7 +472,7 @@ class CPUModelRunnerBase(ModelRunnerBase[TModelInputForCPU]):
 
     def warming_up_model(self, kv_cache: List[torch.Tensor]) -> None:
         compilation_config = self.vllm_config.compilation_config
-        if compilation_config in [
+        if compilation_config.level in [
                 CompilationLevel.NO_COMPILATION,
                 CompilationLevel.DYNAMO_AS_IS,
         ]:
