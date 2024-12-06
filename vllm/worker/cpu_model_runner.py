@@ -12,6 +12,7 @@ from torch import nn
 from vllm import envs
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import CompilationLevel, VllmConfig
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor import SamplingMetadata
@@ -478,11 +479,13 @@ class CPUModelRunnerBase(ModelRunnerBase[TModelInputForCPU]):
         ]:
             return
 
+        import depyf
+        rank = get_tp_group().local_rank
         logger.info("Warming up model for the compilation...")
         # Only generate graph for the generic shape
         input_data = self._prepare_dummy_model_input_tensors(
             self.scheduler_config.max_num_batched_tokens)
-        with _set_global_compilation_settings():
+        with _set_global_compilation_settings(), depyf.prepare_debug("torch_compile_dir_{}".format(rank)):
             self.execute_model(
                 input_data,
                 kv_cache,
