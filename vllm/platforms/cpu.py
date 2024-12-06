@@ -94,12 +94,10 @@ class CpuPlatform(Platform):
             model_config.dtype = torch.bfloat16
 
         parallel_config = vllm_config.parallel_config
-        if (parallel_config.distributed_executor_backend is not None
-                and parallel_config.distributed_executor_backend != "mp"):
-            logger.warning(("%s is not supported on CPU, fallback to mp "
-                            "distributed executor backend."),
-                           parallel_config.distributed_executor_backend)
+        if (parallel_config.distributed_executor_backend is None 
+                or parallel_config.distributed_executor_backend != "mp"):
             parallel_config.distributed_executor_backend = "mp"
+
         if parallel_config.worker_cls == "auto":
             if vllm_config.speculative_config:
                 parallel_config.worker_cls = \
@@ -120,6 +118,9 @@ class CpuPlatform(Platform):
 
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+
+        # Bypass the default thread num setting
+        os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
 
         # Intel OpenMP setting
         ld_prealod_str = os.getenv("LD_PRELOAD", "")
