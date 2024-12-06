@@ -312,6 +312,7 @@ class SHMManager {
   explicit SHMManager(const std::string& ip_port, const int group_size,
                       const int rank, const size_t rank_buffer_size)
       : _rank(rank),
+        _rank_buffer_size(rank_buffer_size),
         _shm_names({""}),
         _shared_mem_ptrs({nullptr}),
         _shm_ctx(nullptr) {
@@ -348,16 +349,41 @@ class SHMManager {
     return "/vllm_" + ip_port + "_" + std::to_string(rank);
   }
 
+  static void create_singleton_instance(
+   const std::string& ip_port, const int group_size,
+   const int rank, const size_t rank_buffer_size 
+  ) {
+    std::call_once(SingletonCreationFlag, [&](){
+        TORCH_CHECK(SingletonInstance == nullptr, "Duplicate initialization of SHMManager singleton is not allowed.");
+        SingletonInstance = std::make_unique<SHMManager>(
+            ip_port, group_size, rank, rank_buffer_size
+        );
+    });
+  }
+ 
+  static SHMManager* get_singleton_instance(){
+    return SingletonInstance.get();
+  }
+
+ protected:
+  static std::unique_ptr<SHMManager> SingletonInstance;
+  static std::once_flag SingletonCreationFlag; 
+
  private:
   static size_t round_size(const size_t size) {
     return ((size + 63) >> 6) << 6;
   }
 
+  static size_t compute_shm_size(const size_t rank_buffer_size) {
+    const size_t rounded_rank_buffer_size = round_size(rank_buffer_size);
+    const size_t shm_size = sizeof(SHMContext) + rounded_rank_buffer_size;
+    return shm_size;
+  }
+
   void* init_shm(int target_rank, const size_t rank_buffer_size) {
     const std::string& shm_name = _shm_names[target_rank];
     const int local_rank = _rank;
-    const size_t rounded_rank_buffer_size = round_size(rank_buffer_size);
-    const size_t shm_size = sizeof(SHMContext) + rounded_rank_buffer_size;
+    const size_t shm_size = compute_shm_size(rank_buffer_size);
 
     int fd = -1;
     if (local_rank == target_rank) {
@@ -387,6 +413,11 @@ class SHMManager {
                   "mmap in SHMManager failed. errno: " + std::to_string(errno));
     }
 
+    if (close(fd) != 0) {
+      TORCH_CHECK(false,
+                  "close in SHMManager failed. errno: " + std::to_string(errno)); 
+    }
+
     TORCH_CHECK((size_t)shm_ptr % 64 == 0)
 
     return shm_ptr;
@@ -394,19 +425,25 @@ class SHMManager {
 
   void destroy_shm() {
     for (int i = 0; i < MAX_SHM_RANK_NUM; ++i) {
-      if (!_shm_names[i].empty() && _shared_mem_ptrs[i] != nullptr) {
+      if (_shared_mem_ptrs[i] != nullptr) {
+        munmap(_shared_mem_ptrs[i], compute_shm_size(_rank_buffer_size));
+      }
+
+      if (!_shm_names[i].empty()) {
         shm_unlink(_shm_names[i].c_str());
       }
     }
   }
 
   int _rank;
+  size_t _rank_buffer_size;
   std::array<std::string, MAX_SHM_RANK_NUM> _shm_names;
   std::array<void*, MAX_SHM_RANK_NUM> _shared_mem_ptrs;
   SHMContext* _shm_ctx;
 };
 
-static std::unique_ptr<SHMManager> shm_manager_singleton = nullptr;
+std::unique_ptr<SHMManager> SHMManager::SingletonInstance = nullptr;
+std::once_flag SHMManager::SingletonCreationFlag = std::once_flag(); 
 
 template <typename scalar_t>
 void shm_allreduce_sum(SHMContext* ctx, const int rank, scalar_t* data,
@@ -478,11 +515,11 @@ void shm_gather(torch::Tensor& data,
       for (int i = 0; i < outputs->size(); ++i) {
         output_ptrs[i] = outputs->at(i).data_ptr<scalar_t>();
       }
-      shm_gather_impl(shm_manager_singleton->get_shm_ctx(), rank,
+      shm_gather_impl(SHMManager::get_singleton_instance()->get_shm_ctx(), rank,
                       data.data_ptr<scalar_t>(), data.numel(), output_ptrs,
                       dst);
     } else {
-      shm_gather_impl(shm_manager_singleton->get_shm_ctx(), rank,
+      shm_gather_impl(SHMManager::get_singleton_instance()->get_shm_ctx(), rank,
                       data.data_ptr<scalar_t>(), data.numel(), (scalar_t**)(0),
                       dst);
     }
@@ -495,7 +532,7 @@ void shm_allreduce(torch::Tensor& data, int64_t rank) {
   TORCH_CHECK(data.is_contiguous())
   VLLM_DISPATCH_FLOATING_TYPES(data.scalar_type(), "shm_allreduce_sum", [&] {
     CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
-    shm_allreduce_sum(shm_manager_singleton->get_shm_ctx(), rank,
+    shm_allreduce_sum(SHMManager::get_singleton_instance()->get_shm_ctx(), rank,
                       data.data_ptr<scalar_t>(), data.numel());
     CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
   });
@@ -503,20 +540,13 @@ void shm_allreduce(torch::Tensor& data, int64_t rank) {
 
 void init_shm_manager(const std::string& ip_port, const int64_t group_size,
                       const int64_t rank, const int64_t rank_buffer_size) {
-  if (shm_manager_singleton == nullptr) {
-    shm_manager_singleton = std::make_unique<SHMManager>(
-        ip_port, group_size, rank, rank_buffer_size);
-  } else {
-    TORCH_CHECK(
-        false,
-        "Duplicate initialization of shm_manager_singleton is not allowed.")
-  }
+    SHMManager::create_singleton_instance(ip_port, group_size, rank, rank_buffer_size);
 }
 
 std::string join_shm_manager(const std::string& ip_port,
                              const int64_t group_size, const int64_t rank,
                              const int64_t rank_buffer_size) {
-  TORCH_CHECK(shm_manager_singleton);
-  shm_manager_singleton->join(ip_port, group_size, rank, rank_buffer_size);
-  return shm_manager_singleton->get_shm_ctx()->to_string();
+  TORCH_CHECK(SHMManager::get_singleton_instance());
+  SHMManager::get_singleton_instance()->join(ip_port, group_size, rank, rank_buffer_size);
+  return SHMManager::get_singleton_instance()->get_shm_ctx()->to_string();
 }
