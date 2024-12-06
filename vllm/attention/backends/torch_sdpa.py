@@ -446,6 +446,10 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        # For warming-up
+        if attn_metadata is None:
+            return query
+
         assert k_scale == 1.0 and v_scale == 1.0
         if (attn_type == AttentionType.ENCODER
                 and (not attn_metadata.is_all_encoder_attn_metadata_set)):

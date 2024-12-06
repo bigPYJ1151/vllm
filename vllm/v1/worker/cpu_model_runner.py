@@ -1,7 +1,10 @@
+from contextlib import contextmanager
 import torch
 import numpy as np
 from typing import List, TYPE_CHECKING
 
+from vllm.config import CompilationLevel
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.outputs import ModelRunnerOutput
@@ -11,6 +14,8 @@ from vllm.attention import get_attn_backend
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
+
+logger = init_logger(__name__)
 
 class CPUModelRunner(GPUModelRunner):
     #
@@ -28,10 +33,29 @@ class CPUModelRunner(GPUModelRunner):
             self.block_size,
             self.model_config.is_attention_free,
         ) if needs_attn_backend else None
-        self.input_data = ModelInputForCPUBuilder.ModelInputData(False)
-        self.chunked_prefill = True
+        self.input_data = ModelInputForCPUBuilder.ModelInputData(False, True)
         self.att_metadata_builder = self.attn_backend.get_builder_cls()(
             self)
+
+    @torch.inference_mode()
+    def warming_up_model(self, kv_cache: List[torch.Tensor]) -> None:
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config.level in [
+                CompilationLevel.NO_COMPILATION,
+                CompilationLevel.DYNAMO_AS_IS,
+        ]:
+            return
+
+        logger.info("Warming up model for the compilation...")
+        # Only generate graph for the generic shape
+        with _set_global_compilation_settings(), set_forward_context(None, self.vllm_config):
+            hidden_states = self.model(
+                input_ids=None,
+                positions=self.positions[:self.max_num_tokens],
+                kv_caches=kv_cache,
+                attn_metadata=None,
+                inputs_embeds=self.inputs_embeds[:self.max_num_tokens])
+        logger.info("Warming up done.")
 
     @torch.inference_mode()
     def execute_model(
@@ -283,3 +307,13 @@ class CPUModelRunner(GPUModelRunner):
         # TODO: Support prompt logprobs.
         logits_indices = query_start_loc[1:] - 1
         return input_ids, attn_metadata, logits_indices
+
+@contextmanager
+def _set_global_compilation_settings():
+    import torch._inductor.config
+
+    # Note: The CPPGEMM backend requires freezing parameters.
+    freezing_value = torch._inductor.config.freezing
+    torch._inductor.config.freezing = True
+    yield
+    torch._inductor.config.freezing = freezing_value
