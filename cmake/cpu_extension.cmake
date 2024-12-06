@@ -196,6 +196,7 @@ set(VLLM_EXT_SRC
 if (AVX512_FOUND AND NOT AVX512_DISABLED)
     set(VLLM_EXT_SRC
         "csrc/cpu/quant.cpp"
+        "csrc/cpu/shm_ccl.cpp"
         ${VLLM_EXT_SRC})
 endif()
 
