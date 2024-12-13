@@ -108,6 +108,8 @@ $ VLLM_TARGET_DEVICE=cpu python setup.py install
     - Dynamo + Inductor + Max Autotune + Epilogue Fusion
 ```
 
+- Setting environment variable `ENV TORCHINDUCTOR_COMPILE_THREADS=1` to avoid too many background compilation threads.
+
 (cpu-backend-performance-tips)=
 
 ## Performance tips
