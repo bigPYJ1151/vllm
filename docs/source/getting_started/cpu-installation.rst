@@ -116,6 +116,8 @@ Usage of torch.compile
    * - O3
      - Dynamo + Inductor + Max Autotune + Epilogue Fusion
 
+- Setting environment variable ``ENV TORCHINDUCTOR_COMPILE_THREADS=1`` to avoid too many background compilation threads.
+
 .. _cpu_backend_performance_tips:
 
 Performance tips
