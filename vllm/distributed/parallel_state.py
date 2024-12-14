@@ -244,7 +244,7 @@ class GroupCoordinator:
             CpuCommunicator)
         self.cpu_communicator: Optional[CpuCommunicator]
         if use_cpu_communicator and self.world_size > 1:
-            self.cpu_communicator = CpuCommunicator(group=self.device_group)
+            self.cpu_communicator = CpuCommunicator(group=self.cpu_group)
 
         from vllm.distributed.device_communicators.shm_broadcast import (
             MessageQueue)
@@ -447,8 +447,8 @@ class GroupCoordinator:
 
         if self.cpu_communicator is not None and \
                 not self.cpu_communicator.disabled:
-            return self.cpu_communicator.gather(input_, self.rank_in_group, self.ranks,
-                                                dst, dim)
+            return self.cpu_communicator.gather(input_, self.rank_in_group,
+                                                self.ranks, dst, dim)
         # Allocate output tensor.
         if self.rank_in_group == dst:
             gather_list = [torch.empty_like(input_) for _ in range(world_size)]
