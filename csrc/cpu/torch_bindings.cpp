@@ -18,18 +18,16 @@ void int8_scaled_mm_azp(torch::Tensor& c, const torch::Tensor& a,
                         const c10::optional<torch::Tensor>& azp,
                         const c10::optional<torch::Tensor>& bias);
 
-void init_shm_manager(const std::string& ip_port, const int64_t group_size,
-                      const int64_t rank, const int64_t rank_buffer_size);
+void init_shm_manager(const std::string& name, const int64_t group_size,
+                      const int64_t rank);
 
-std::string join_shm_manager(const std::string& ip_port,
-                             const int64_t group_size, const int64_t rank,
-                             const int64_t rank_buffer_size);
+std::string join_shm_manager(const std::string& name);
 
-void shm_allreduce(torch::Tensor& data, int64_t rank);
+void shm_allreduce(torch::Tensor& data);
 
 void shm_gather(torch::Tensor& data,
                 const std::optional<std::vector<torch::Tensor>>& outputs,
-                int64_t dst, int64_t rank);
+                int64_t dst);
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
@@ -143,18 +141,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // SHM CCL
 #ifdef __AVX512F__
-  ops.def(
-      "init_shm_manager(str ip_port, int group_size, int rank, int "
-      "rank_buffer_size) -> ()",
-      &init_shm_manager);
-  ops.def(
-      "join_shm_manager(str ip_port, int group_size, int rank, int "
-      "rank_buffer_size) -> str",
-      &join_shm_manager);
-  ops.def("shm_allreduce(Tensor! data, int rank) -> ()");
+  ops.def("init_shm_manager(str name, int group_size, int rank) -> ()",
+          &init_shm_manager);
+  ops.def("join_shm_manager(str name) -> str", &join_shm_manager);
+  ops.def("shm_allreduce(Tensor! data) -> ()");
   ops.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
   ops.def(
-      "shm_gather(Tensor data, Tensor[](a!)? outputs, int dst, int rank) -> "
+      "shm_gather(Tensor data, Tensor[](a!)? outputs, int dst) -> "
       "()");
   ops.impl("shm_gather", torch::kCPU, &shm_gather);
 #endif
