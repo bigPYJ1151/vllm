@@ -34,7 +34,7 @@ struct KernelVecType<c10::Half> {
 enum class ThreadSHMStat : char { THREAD_READY = 0, SHM_DATA_READY, DONE };
 
 struct ThreadSHMContext {
-  volatile ThreadSHMStat thread_stat;
+  volatile ThreadSHMStat thread_stats[MAX_SHM_RANK_NUM];
   int thread_id;
   int thread_num;
   int rank;
@@ -59,9 +59,9 @@ struct ThreadSHMContext {
       shm_contexts[i] = nullptr;
       thread_shm_ptrs[i] = nullptr;
       swizzled_ranks[i] = (i + rank) % group_size;
+      thread_stats[i] = ThreadSHMStat::DONE;
     }
     set_context(rank, this, thread_shm_ptr);
-    thread_stat = ThreadSHMStat::DONE;
   }
 
   void set_context(int rank, ThreadSHMContext* ptr, void* thread_shm_ptr) {
@@ -81,16 +81,10 @@ struct ThreadSHMContext {
 
   int get_swizzled_rank(int idx) { return swizzled_ranks[idx]; }
 
-  ThreadSHMStat get_thread_stat(int rank) const {
-    return shm_contexts[rank]->thread_stat;
-  }
-
   void wait_for_all(ThreadSHMStat prev_stat) {
     for (int idx = 1; idx < group_size; ++idx) {
       int rank = get_swizzled_rank(idx);
-      ThreadSHMStat stat = shm_contexts[rank]->thread_stat;
-      while (stat == prev_stat) {
-        stat = shm_contexts[rank]->thread_stat;
+      while (thread_stats[rank] == prev_stat) {
         ++_spinning_count;
         _mm_pause();
       }
@@ -98,7 +92,10 @@ struct ThreadSHMContext {
   }
 
   void set_thread_stat(ThreadSHMStat stat) {
-    shm_contexts[rank]->thread_stat = stat;
+    for (int idx = 1; idx < group_size; ++idx) {
+      int rank = get_swizzled_rank(idx);
+      shm_contexts[rank]->thread_stats[this->rank] = stat;
+    }
   }
 
   // DONE -> THREAD_READY -> SHM_DATA_READY -> DONE -> ...
@@ -119,20 +116,7 @@ struct ThreadSHMContext {
 
   std::string to_string() const {
     std::stringstream ss;
-    ss << "SHMContext: \nrank_stat: ";
-    switch (thread_stat) {
-      case ThreadSHMStat::THREAD_READY:
-        ss << "THREAD_READY, ";
-        break;
-      case ThreadSHMStat::SHM_DATA_READY:
-        ss << "THREAD_READY, ";
-        break;
-      case ThreadSHMStat::DONE:
-        ss << "DONE, ";
-        break;
-      default:
-        TORCH_CHECK(false, "Invalid RankStat type.");
-    }
+    ss << "SHMContext:";
     ss << "\nrank: " << rank;
     ss << "\ngroup_size: " << group_size;
     ss << "\nthread_num: " << thread_num;
