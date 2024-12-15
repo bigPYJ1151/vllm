@@ -39,8 +39,8 @@ struct ThreadSHMContext {
   int thread_num;
   int rank;
   int group_size;
+  size_t _spinning_count;
   int swizzled_ranks[MAX_SHM_RANK_NUM];
-  char _padding1[12];
   void* thread_shm_ptrs[MAX_SHM_RANK_NUM];
   ThreadSHMContext* shm_contexts[MAX_SHM_RANK_NUM];
 
@@ -49,7 +49,8 @@ struct ThreadSHMContext {
       : thread_id(thread_id),
         thread_num(thread_num),
         rank(rank),
-        group_size(group_size) {
+        group_size(group_size),
+        _spinning_count(0) {
     static_assert(sizeof(ThreadSHMContext) % 64 == 0);
     TORCH_CHECK(group_size <= MAX_SHM_RANK_NUM);
     TORCH_CHECK((size_t)this % 64 == 0);
@@ -90,6 +91,7 @@ struct ThreadSHMContext {
       ThreadSHMStat stat = shm_contexts[rank]->thread_stat;
       while (stat == prev_stat) {
         stat = shm_contexts[rank]->thread_stat;
+        ++_spinning_count;
         _mm_pause();
       }
     }
@@ -286,6 +288,14 @@ class SHMManager {
   }
 
   void destroy_shm() {
+    std::stringstream ss;
+    ss << "local rank " << _rank << ": [";
+    for (int thread_id = 0; thread_id < _thread_num; ++thread_id) {
+      ss << _shm_ctx[thread_id]._spinning_count << ", ";
+    }
+    ss << "]\n";
+    std::printf("%s\n", ss.str().c_str());
+
     for (int i = 0; i < MAX_SHM_RANK_NUM; ++i) {
       if (_shared_mem_ptrs[i] != nullptr) {
         munmap(_shared_mem_ptrs[i], compute_shm_size());
