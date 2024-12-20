@@ -277,12 +277,12 @@ class TorchSDPAMetadata(AttentionMetadata, PagedAttentionMetadata):
 class TorchSDPAMetadataBuilder(AttentionMetadataBuilder[TorchSDPAMetadata]):
 
     def __init__(self, input_builder: ModelInputForCPUBuilder) -> None:
-        self.chunked_prefill = input_builder.chunked_prefill
         self.input_data = input_builder.input_data
 
     def build(self, seq_lens: List[int], query_lens: List[int],
               cuda_graph_pad_size: int, batch_size: int) -> TorchSDPAMetadata:
         input_data = self.input_data
+        chunked_prefill = input_data.chunked_prefill
         prefill_seq_lens = seq_lens[0:input_data.num_prefills]
         prefill_query_lens = query_lens[0:input_data.num_prefills]
         slot_mapping = torch.tensor(input_data.slot_mapping,
@@ -290,7 +290,7 @@ class TorchSDPAMetadataBuilder(AttentionMetadataBuilder[TorchSDPAMetadata]):
                                     device="cpu")
 
         # For chunked-prefill
-        if self.chunked_prefill and input_data.num_prefill_tokens != 0:
+        if chunked_prefill and input_data.num_prefill_tokens != 0:
             prefill_block_tables = make_tensor_with_pad(
                 self.input_data.prefill_block_tables,
                 pad=0,
@@ -357,7 +357,7 @@ class TorchSDPAMetadataBuilder(AttentionMetadataBuilder[TorchSDPAMetadata]):
             }
 
         attn_metadata = TorchSDPAMetadata(
-            chunked_prefill=self.chunked_prefill,
+            chunked_prefill=chunked_prefill,
             seq_lens=prefill_seq_lens,
             seq_lens_tensor=seq_lens_tensor,
             max_query_len=max_query_len,

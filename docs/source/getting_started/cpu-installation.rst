@@ -10,6 +10,7 @@ vLLM initially supports basic model inferencing and serving on x86 CPU platform,
 - Chunked-prefill
 - Prefix-caching
 - FP8-E5M2 KV-Caching (TODO)
+- torch.compile
 
 Table of contents:
 
@@ -18,6 +19,7 @@ Table of contents:
 #. :ref:`Build from source <build_cpu_backend_from_source>`
 #. :ref:`Related runtime environment variables <env_intro>`
 #. :ref:`Intel Extension for PyTorch <ipex_guidance>`
+#. :ref:`Usage of torch.compile <torch_compile>`
 #. :ref:`Performance tips <cpu_backend_performance_tips>`
 
 .. _cpu_backend_requirements:
@@ -92,6 +94,30 @@ Intel Extension for PyTorch
 
 - `Intel Extension for PyTorch (IPEX) <https://github.com/intel/intel-extension-for-pytorch>`_ extends PyTorch with up-to-date features optimizations for an extra performance boost on Intel hardware.
 
+.. _torch_compile:
+
+Usage of torch.compile
+-----------------------
+
+- Using ``-O[0-3]`` to enable ``torch.compile`` on the CPU backend:
+
+.. list-table::
+   :header-rows: 1
+   :widths:  8 20
+
+   * - Levels
+     - Description
+   * - O0
+     - Eager mode + Custom Ops
+   * - O1 
+     - Same as ``O0``
+   * - O2 
+     - Dynamo + Eager mode + Custom Ops
+   * - O3
+     - Dynamo + Inductor + Max Autotune + Epilogue Fusion
+
+- Setting environment variable ``ENV TORCHINDUCTOR_COMPILE_THREADS=1`` to avoid too many background compilation threads.
+
 .. _cpu_backend_performance_tips:
 
 Performance tips
@@ -159,6 +185,5 @@ CPU Backend Considerations
     .. code-block:: console
 
          $ VLLM_CPU_KVCACHE_SPACE=40 VLLM_CPU_OMP_THREADS_BIND="0-31|32-63" vllm serve meta-llama/Llama-2-7b-chat-hf -tp=2 --distributed-executor-backend mp
-
 
   * Using Data Parallel for maximum throughput: to launch an LLM serving endpoint on each NUMA node along with one additional load balancer to dispatch the requests to those endpoints. Common solutions like `Nginx <../serving/deploying_with_nginx.html>`_ or HAProxy are recommended. Anyscale Ray project provides the feature on LLM `serving <https://docs.ray.io/en/latest/serve/index.html>`_. Here is the example to setup a scalable LLM serving with `Ray Serve <https://github.com/intel/llm-on-ray/blob/main/docs/setup.md>`_.
