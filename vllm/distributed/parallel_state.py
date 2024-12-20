@@ -166,6 +166,7 @@ class GroupCoordinator:
         use_tpu_communicator: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
+        use_cpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
     ):
@@ -204,6 +205,7 @@ class GroupCoordinator:
         self.use_tpu_communicator = use_tpu_communicator
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
+        self.use_cpu_communicator = use_cpu_communicator
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -243,6 +245,12 @@ class GroupCoordinator:
         self.xpu_communicator: Optional[XpuCommunicator]
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
+
+        from vllm.distributed.device_communicators.cpu_communicator import (
+            CpuCommunicator)
+        self.cpu_communicator: Optional[CpuCommunicator]
+        if use_cpu_communicator and self.world_size > 1:
+            self.cpu_communicator = CpuCommunicator(group=self.cpu_group)
 
         from vllm.distributed.device_communicators.shm_broadcast import (
             MessageQueue)
@@ -334,10 +342,9 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        if input_.is_cpu:
-            import intel_extension_for_pytorch as ipex
-            ipex.distributed.all_reduce(input_, group=self.device_group)
-            return input_
+        if self.cpu_communicator is not None and \
+                not self.cpu_communicator.disabled:
+            return self.cpu_communicator.all_reduce(input_)
 
         if self.tpu_communicator is not None and \
             not self.tpu_communicator.disabled:
@@ -443,6 +450,11 @@ class GroupCoordinator:
                 not self.xpu_communicator.disabled:
             return self.xpu_communicator.gather(input_, self.rank_in_group,
                                                 dst, dim)
+
+        if self.cpu_communicator is not None and \
+                not self.cpu_communicator.disabled:
+            return self.cpu_communicator.gather(input_, self.rank_in_group,
+                                                self.ranks, dst, dim)
         # Allocate output tensor.
         if self.rank_in_group == dst:
             gather_list = [torch.empty_like(input_) for _ in range(world_size)]
@@ -859,6 +871,7 @@ def init_world_group(ranks: List[int], local_rank: int,
         use_tpu_communicator=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
+        use_cpu_communicator=False,
         group_name="world",
     )
 
@@ -882,6 +895,7 @@ def init_model_parallel_group(
         use_tpu_communicator=True,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
+        use_cpu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
     )

@@ -49,6 +49,7 @@ class CPUExecutor(ExecutorBase):
         # To hint IPEX uses shared memory based AllReduce
         os.environ["LOCAL_WORLD_SIZE"] = str(
             self.parallel_config.tensor_parallel_size)
+        os.environ["VLLM_INSTANCE_ID"] = self.vllm_config.instance_id
 
         # Multiprocessing-based executor does not support multi-node setting.
         # Since it only works for single node, we can use the loopback address
