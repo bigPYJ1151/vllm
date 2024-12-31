@@ -2,7 +2,7 @@
 
 import gc
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, Any
 
 import numpy as np
 import torch
@@ -24,8 +24,6 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         LayerBlockType, cdiv, is_pin_memory_available)
-from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend,
-                                                   FlashAttentionMetadata)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.engine.mm_input_cache import MMInputCacheClient
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
@@ -159,8 +157,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config.compilation_config.cudagraph_capture_sizes))
 
         # Cache the device properties.
-        self.device_properties = torch.cuda.get_device_properties(self.device)
-        self.num_sms = self.device_properties.multi_processor_count
+        if torch.cuda.is_available():
+            self.device_properties = torch.cuda.get_device_properties(
+                self.device)
+            self.num_sms = self.device_properties.multi_processor_count
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = torch.zeros(self.max_num_tokens,
@@ -426,7 +426,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> Tuple[FlashAttentionMetadata, torch.Tensor]:
+    ) -> Tuple[Any, torch.Tensor]:
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionBackend, FlashAttentionMetadata)
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -615,6 +617,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         Returns:
             int: Length of common prefix in tokens.
         """
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionBackend, FlashAttentionMetadata)
         common_prefix_len = num_common_prefix_blocks * self.block_size
         if common_prefix_len == 0:
             # Common case.
@@ -1346,6 +1350,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_config: Configuration for the KV cache, including the KV 
             cache size of each layer
         """
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
         if len(kv_cache_config.groups) > 1:
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
