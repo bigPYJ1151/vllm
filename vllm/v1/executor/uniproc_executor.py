@@ -3,10 +3,15 @@ from typing import Optional, Tuple
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils import get_distributed_init_method, get_ip, get_open_port
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.gpu_worker import Worker
+
+if current_platform.is_cuda():
+    from vllm.v1.worker.gpu_worker import Worker
+else:
+    from vllm.v1.worker.cpu_worker import CPUWorker as Worker
 
 logger = init_logger(__name__)
 
