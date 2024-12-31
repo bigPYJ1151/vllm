@@ -447,6 +447,11 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+
+        # For warming-up
+        if attn_metadata is None:
+            return query
+
         assert k_scale == 1.0 and v_scale == 1.0
         if (attn_type == AttentionType.ENCODER
                 and (not attn_metadata.is_all_encoder_attn_metadata_set)):
@@ -516,8 +521,8 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
 
         output = torch.empty_like(query)
         if prefill_meta := attn_metadata.prefill_metadata:
-            assert attn_metadata.seq_lens is not None
             if not prefill_meta.prefill_metadata.chunked_prefill:  # type: ignore
+                assert attn_metadata.seq_lens is not None
                 self._run_sdpa_forward(output,
                                        query,
                                        key,

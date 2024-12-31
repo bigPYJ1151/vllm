@@ -172,7 +172,7 @@ class InputBatch:
         self,
         request: "CachedRequestState",
         req_index: Optional[int] = None,
-    ) -> None:
+    ) -> int:
         if req_index is None:
             req_index = self.num_reqs
         assert req_index < self.max_num_reqs
@@ -234,6 +234,8 @@ class InputBatch:
             self.num_logprobs[req_id] = num_logprobs
         if sampling_params.prompt_logprobs:
             self.prompt_logprob_reqs.add(req_id)
+
+        return req_index
 
     def remove_request(self, req_id: str) -> Optional[int]:
         req_index = self.req_id_to_index.pop(req_id, None)
