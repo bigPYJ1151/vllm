@@ -533,8 +533,8 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
 
         output = torch.empty_like(query)
         if prefill_meta := attn_metadata.prefill_metadata:
-            assert attn_metadata.seq_lens is not None
             if not prefill_meta.prefill_metadata.chunked_prefill:  # type: ignore
+                assert attn_metadata.seq_lens is not None
                 self._run_sdpa_forward(output,
                                        query,
                                        key,

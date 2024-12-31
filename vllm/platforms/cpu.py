@@ -67,6 +67,11 @@ class CpuPlatform(Platform):
         if not model_config.enforce_eager:
             model_config.enforce_eager = True
 
+        if model_config.enable_sleep_mode:
+            logger.warning(
+                "sleep mode is not supported on CPU, disable it.")
+            model_config.enable_sleep_mode = False
+
         cache_config = vllm_config.cache_config
 
         ipex_avaliable = find_spec("intel_extension_for_pytorch") is not None
@@ -127,7 +132,15 @@ class CpuPlatform(Platform):
                 parallel_config.sd_worker_cls = \
                     "vllm.worker.cpu_worker.CPUWorker"
             else:
-                parallel_config.worker_cls = "vllm.worker.cpu_worker.CPUWorker"
+                if envs.VLLM_USE_V1:
+                    parallel_config.worker_cls = \
+                        "vllm.v1.worker.cpu_worker.CPUWorker"
+                else:
+                    parallel_config.worker_cls = \
+                        "vllm.worker.cpu_worker.CPUWorker"
+
+        # Note: workaround for v1 gpu_model_runner
+        vllm_config.compilation_config.cudagraph_capture_sizes = []
 
         assert vllm_config.device_config.device_type == "cpu"
 
@@ -135,11 +148,17 @@ class CpuPlatform(Platform):
         # Environment variables for CPU executor
         #
 
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
         # Set default threads num for OpenMP parallel
         os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
 
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+
+        # Note: to avoid the error 'nthreads cannot be larger than environment
+        #  variable "NUMEXPR_MAX_THREADS" (64)'.
+        os.environ["NUMEXPR_MAX_THREADS"] = str(len(os.sched_getaffinity(0)))
 
         # Intel OpenMP setting
         ld_prealod_str = os.getenv("LD_PRELOAD", "")
