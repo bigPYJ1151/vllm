@@ -18,8 +18,6 @@ from vllm.sampling_params import SamplingType
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         LayerBlockType, bind_kv_cache, cdiv,
                         is_pin_memory_available)
-from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend,
-                                                   FlashAttentionMetadata)
 from vllm.v1.engine.mm_input_mapper import MMInputMapperClient
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -120,8 +118,10 @@ class GPUModelRunner:
             reversed(self.vllm_config.compilation_config.capture_sizes))
 
         # Cache the device properties.
-        self.device_properties = torch.cuda.get_device_properties(self.device)
-        self.num_sms = self.device_properties.multi_processor_count
+        if torch.cuda.is_available():
+            self.device_properties = torch.cuda.get_device_properties(
+                self.device)
+            self.num_sms = self.device_properties.multi_processor_count
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = torch.zeros(self.max_num_tokens,
@@ -266,6 +266,8 @@ class GPUModelRunner:
             self.input_batch.condense(removed_req_indices)
 
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput"):
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionBackend, FlashAttentionMetadata)
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -853,6 +855,7 @@ class GPUModelRunner:
                     elapsed_time, cuda_graph_size / (1 << 30))
 
     def initialize_kv_cache(self, num_blocks: int) -> None:
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
         assert len(self.kv_caches) == 0
         kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
