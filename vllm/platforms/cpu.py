@@ -100,7 +100,15 @@ class CpuPlatform(Platform):
                 parallel_config.sd_worker_cls = \
                     "vllm.worker.cpu_worker.CPUWorker"
             else:
-                parallel_config.worker_cls = "vllm.worker.cpu_worker.CPUWorker"
+                if envs.VLLM_USE_V1:
+                    parallel_config.worker_cls = \
+                        "vllm.v1.worker.cpu_worker.CPUWorker"
+                else:
+                    parallel_config.worker_cls = \
+                        "vllm.worker.cpu_worker.CPUWorker"
+
+        # Note: workaround for v1 gpu_model_runner
+        vllm_config.compilation_config.capture_sizes = []
 
         from vllm.config import CompilationLevel
         compilation_config = vllm_config.compilation_config
