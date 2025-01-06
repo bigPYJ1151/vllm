@@ -96,6 +96,8 @@ class ModelInputForCPUWithSamplingMetadata(ModelInputForCPU):
             "input_positions": self.input_positions,
             "token_type_ids": self.token_type_ids,
             "multi_modal_kwargs": self.multi_modal_kwargs,
+            "lora_requests": self.lora_requests,
+            "lora_mapping": self.lora_mapping,
         }
         _add_attn_metadata_broadcastable_dict(tensor_dict, self.attn_metadata)
         _add_sampling_metadata_broadcastable_dict(tensor_dict,
