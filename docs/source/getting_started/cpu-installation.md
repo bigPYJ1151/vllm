@@ -110,6 +110,8 @@ $ VLLM_TARGET_DEVICE=cpu python setup.py install
 
 - Setting environment variable `ENV TORCHINDUCTOR_COMPILE_THREADS=1` to avoid too many background compilation threads.
 
+- Setting environment variable `ENV TORCHINDUCTOR_CPP_WRAPPER=1` may improve performance further.
+
 (cpu-backend-performance-tips)=
 
 ## Performance tips
