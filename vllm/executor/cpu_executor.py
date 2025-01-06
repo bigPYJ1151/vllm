@@ -24,7 +24,7 @@ class CPUExecutor(ExecutorBase):
         assert self.device_config.device_type == "cpu"
         # Reminder: Please update docs/source/usage/compatibility_matrix.md
         # If the feature combo become valid
-        assert self.lora_config is None, "cpu backend doesn't support LoRA"
+        # assert self.lora_config is None, "cpu backend doesn't support LoRA"
 
         #
         # Environment variables for CPU executor
