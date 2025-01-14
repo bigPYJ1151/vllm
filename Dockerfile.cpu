@@ -22,7 +22,6 @@ ENV LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/usr/local/li
 
 RUN echo 'ulimit -c 0' >> ~/.bashrc
 
-RUN pip install intel_extension_for_pytorch==2.5.0
 
 WORKDIR /workspace
 
@@ -41,6 +40,10 @@ COPY requirements-common.txt requirements-common.txt
 COPY requirements-cpu.txt requirements-cpu.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -v -r requirements-cpu.txt
+
+RUN pip install http://mlpc.intel.com/downloads/cpu/ipex-2.6/rc0/intel_extension_for_pytorch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl
+RUN pip install http://mlpc.intel.com/downloads/cpu/ipex-2.6/stock_pt_whls/torch-2.6.0+cpu-cp310-cp310-linux_x86_64.whl
+RUN pip install http://mlpc.intel.com/downloads/cpu/ipex-2.6/stock_pt_whls/torchvision_whls/torchvision-0.21.0+cpu-cp310-cp310-linux_x86_64.whl
 
 COPY . .
 ARG GIT_REPO_CHECK=0
