@@ -68,8 +68,12 @@ struct FP16Vec16 : public Vec<FP16Vec16> {
 
   __m256i reg;
 
+  // normal load
   explicit FP16Vec16(const void *ptr)
       : reg((__m256i)_mm256_loadu_si256((__m256i *)ptr)) {}
+
+  // non-temproal load
+  explicit FP16Vec16(bool, void* ptr) : reg(_mm256_stream_load_si256((__m256i*)ptr)) {}
 
   explicit FP16Vec16(const FP32Vec16 &);
 
@@ -100,8 +104,12 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
 
   __m256i reg;
 
+  // normal load
   explicit BF16Vec16(const void *ptr)
       : reg((__m256i)_mm256_loadu_si256((__m256i *)ptr)) {}
+
+  // non-temproal load
+  explicit BF16Vec16(bool, void* ptr) : reg(_mm256_stream_load_si256((__m256i*)ptr)) {}
 
   explicit BF16Vec16(const FP32Vec16 &);
 
@@ -301,7 +309,11 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
 
   explicit FP32Vec16() : reg(_mm512_set1_ps(0.0)) {}
 
+  // normal load
   explicit FP32Vec16(const float *ptr) : reg(_mm512_loadu_ps(ptr)) {}
+
+  // non-temproal load
+  explicit FP32Vec16(bool, void* ptr) : reg((__m512)_mm512_stream_load_si512(ptr)) {}
 
   explicit FP32Vec16(__m512 data) : reg(data) {}
 
@@ -538,6 +550,37 @@ struct INT8Vec16: public Vec<INT8Vec16> {
     _mm_mask_storeu_epi8(ptr, mask, reg);
   }
 };
+
+struct INT8Vec64: public Vec<INT8Vec64> {
+  constexpr static int VEC_ELEM_NUM = 64;
+  union AliasReg {
+    __m512i reg;
+    int8_t values[VEC_ELEM_NUM];
+  };
+
+  __m512i reg;
+  
+  // normal load
+  explicit INT8Vec64(void* ptr) : reg(_mm512_loadu_epi8(ptr)) {}
+
+  // non-temproal load
+  explicit INT8Vec64(bool, void* ptr) : reg(_mm512_stream_load_si512(ptr)) {}
+
+  void save(void* ptr) const {
+    _mm512_storeu_epi8(ptr, reg);
+  }
+
+  void save(int8_t* ptr, const int elem_num) const {
+    constexpr uint64_t M = 0xFFFFFFFFFFFFFFFF;
+    __mmask64 mask = _cvtu64_mask64(M >> (64 - elem_num));
+    _mm512_mask_storeu_epi8(ptr, mask, reg);
+  }
+
+  // non-temproal save
+  void nt_save(int8_t *ptr) {
+    _mm512_stream_si512((__m512i*)ptr, reg);
+  }
+};
 #endif
 
 template <typename T> struct VecType { using vec_type = void; };
@@ -626,7 +669,6 @@ inline BF16Vec16::BF16Vec16(const FP32Vec16 &v) {
 #endif // __AVX512BF16__
 
 inline void prefetch(const void *addr) { _mm_prefetch(addr, _MM_HINT_T1); }
-
 }; // namespace vec_op
 
 #endif
