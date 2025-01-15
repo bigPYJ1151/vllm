@@ -1,6 +1,7 @@
 import dataclasses
 import weakref
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Dict, List, Optional, Set, Type,
                     TypeVar, Union)
@@ -8,8 +9,9 @@ from typing import (TYPE_CHECKING, Any, Dict, List, Optional, Set, Type,
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.attention import AttentionMetadata, get_attn_backend
-from vllm.config import VllmConfig
+from vllm.config import CompilationLevel, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
@@ -24,6 +26,7 @@ from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
                              MultiModalKwargs, MultiModalPlaceholderMap)
 from vllm.sequence import (IntermediateTensors, SequenceData,
                            SequenceGroupMetadata)
+from vllm.utils import supports_dynamo
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase, ModelRunnerInputBuilderBase,
     _add_attn_metadata_broadcastable_dict,
@@ -119,7 +122,8 @@ class ModelInputForCPUBuilder(ModelRunnerInputBuilderBase[ModelInputForCPU]):
 
     class ModelInputData:
 
-        def __init__(self, use_mrope: bool):
+        def __init__(self, use_mrope: bool, chunked_prefill: bool):
+            self.chunked_prefill = chunked_prefill
             self.use_mrope = use_mrope
             self.input_tokens: List[int] = []
             self.input_positions: List[int] = []
@@ -140,13 +144,16 @@ class ModelInputForCPUBuilder(ModelRunnerInputBuilderBase[ModelInputForCPU]):
             self.input_mrope_positions: List[List[int]] = [[]
                                                            for _ in range(3)]
 
-    def __init__(self,
-                 runner: "CPUModelRunner",
-                 finished_requests_ids: Optional[List[str]] = None) -> None:
+    def __init__(
+        self,
+        runner: "CPUModelRunner",
+        finished_requests_ids: Optional[List[str]] = None,
+        dummy_batch_size: Optional[int] = None,
+    ) -> None:
         super().__init__()
         self.seq_group_metadata_list: List[SequenceGroupMetadata] = []
         self.runner = runner
-
+        self.dummy_batch_size = dummy_batch_size
         self.chunked_prefill = (runner.scheduler_config.chunked_prefill_enabled
                                 or runner.cache_config.enable_prefix_caching)
         self.model_input_cls = self.runner._model_input_cls
@@ -157,7 +164,7 @@ class ModelInputForCPUBuilder(ModelRunnerInputBuilderBase[ModelInputForCPU]):
         self.multi_modal_input_mapper = self.runner.multi_modal_input_mapper
         self.enable_lora = self.runner.lora_config is not None
         self.input_data = ModelInputForCPUBuilder.ModelInputData(
-            self.runner.model_config.uses_mrope)
+            self.runner.model_config.uses_mrope, self.chunked_prefill)
         self.att_metadata_builder = self.runner.attn_backend.get_builder_cls()(
             self)
 
@@ -169,7 +176,10 @@ class ModelInputForCPUBuilder(ModelRunnerInputBuilderBase[ModelInputForCPU]):
         self.seq_group_metadata_list = seq_group_metadata_list
 
     def build(self) -> ModelInputForCPU:
-        self._build_input_data()
+        if self.dummy_batch_size is None:
+            self._build_input_data()
+        else:
+            self._build_dummy_input_data()
 
         input_data = self.input_data
         input_tokens = torch.tensor(input_data.input_tokens,
@@ -215,8 +225,25 @@ class ModelInputForCPUBuilder(ModelRunnerInputBuilderBase[ModelInputForCPU]):
                                     query_lens=input_data.query_lens,
                                     attn_metadata=attn_metadata,
                                     multi_modal_kwargs=multi_modal_kwargs,
+                                    virtual_engine=0,
                                     lora_mapping=lora_mapping,
                                     lora_requests=lora_requests)
+
+    def _build_dummy_input_data(self):
+        assert self.dummy_batch_size is not None
+        batch_size: int = self.dummy_batch_size
+        data = self.input_data
+
+        data.slot_mapping = [_PAD_SLOT_ID] * batch_size
+        assert data.input_positions is not None
+        data.input_positions.extend(range(0, batch_size))
+        data.input_tokens.extend([0] * batch_size)
+        data.num_prefills += 1
+        data.num_prefill_tokens += batch_size
+        data.query_lens.append(batch_size)
+        data.seq_lens.append(batch_size)
+        # Note: temporarily disable chunked-prefill for convenience.
+        data.chunked_prefill = False
 
     def _build_input_data(self):
         for seq_group_metadata in self.seq_group_metadata_list:
@@ -335,8 +362,8 @@ class ModelInputForCPUBuilder(ModelRunnerInputBuilderBase[ModelInputForCPU]):
         # The MROPE positions are prepared in _compute_multi_modal_input
         data.input_positions.extend(token_positions)
 
-        if data.token_type_ids is not None:
-            data.token_type_ids.extend(token_types if token_types else [])
+        if token_types is not None:
+            data.token_type_ids.extend(token_types)
 
         # Update fields
         data.input_tokens.extend(tokens)
@@ -509,6 +536,43 @@ class CPUModelRunnerBase(ModelRunnerBase[TModelInputForCPU]):
             )
             self.model = self.lora_manager.create_lora_manager(self.model)
 
+        if self.vllm_config.compilation_config.level ==\
+            CompilationLevel.DYNAMO_AS_IS and supports_dynamo():
+            backend = self.vllm_config.compilation_config.init_backend(
+                vllm_config=self.vllm_config)
+            self.model = torch.compile(
+                self.model,
+                fullgraph=envs.VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE,
+                backend=backend)
+
+    def warming_up_model(self, kv_cache: List[torch.Tensor]) -> None:
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config.level in [
+                CompilationLevel.NO_COMPILATION,
+                CompilationLevel.DYNAMO_AS_IS,
+        ]:
+            return
+
+        logger.info("Warming up model for the compilation...")
+        # Only generate graph for the generic shape
+        input_data = self._prepare_dummy_model_input_tensors(
+            self.scheduler_config.max_num_batched_tokens)
+        with _set_global_compilation_settings():
+            self.execute_model(
+                input_data,
+                kv_cache,
+                None,
+            )
+        logger.info("Warming up done.")
+
+    def _prepare_dummy_model_input_tensors(
+        self,
+        batch_size: int,
+    ) -> TModelInputForCPU:
+        builder = self._builder_cls(weakref.proxy(self), None, batch_size)
+
+        return builder.build()  # type: ignore
+
     def _prepare_model_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -563,6 +627,17 @@ class CPUModelRunnerBase(ModelRunnerBase[TModelInputForCPU]):
         if not self.lora_manager:
             raise RuntimeError("LoRA is not enabled.")
         return self.lora_manager.list_adapters()
+
+
+@contextmanager
+def _set_global_compilation_settings():
+    import torch._inductor.config
+
+    # Note: The CPPGEMM backend requires freezing parameters.
+    freezing_value = torch._inductor.config.freezing
+    torch._inductor.config.freezing = True
+    yield
+    torch._inductor.config.freezing = freezing_value
 
 
 class CPUModelRunner(CPUModelRunnerBase[ModelInputForCPUWithSamplingMetadata]):
@@ -637,8 +712,7 @@ class CPUModelRunner(CPUModelRunnerBase[ModelInputForCPUWithSamplingMetadata]):
             execute_model_kwargs.update(
                 {"previous_hidden_states": previous_hidden_states})
 
-        with set_forward_context(model_input.attn_metadata, self.vllm_config,
-                                 model_input.virtual_engine):
+        with set_forward_context(model_input.attn_metadata, self.vllm_config):
             hidden_states = model_executable(
                 input_ids=model_input.input_tokens,
                 positions=model_input.input_positions,
@@ -648,6 +722,10 @@ class CPUModelRunner(CPUModelRunnerBase[ModelInputForCPUWithSamplingMetadata]):
                 **execute_model_kwargs,
                 **multimodal_kwargs,
             )
+
+        # Skip sampling for warming-up
+        if model_input.sampling_metadata is None:
+            return []
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states,

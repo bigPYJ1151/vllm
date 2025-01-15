@@ -17,7 +17,8 @@ Table of contents:
 3. [Build from source](#build-cpu-backend-from-source)
 4. [Related runtime environment variables](#env-intro)
 5. [Intel Extension for PyTorch](#ipex-guidance)
-6. [Performance tips](#cpu-backend-performance-tips)
+6. [Usage of torch.compile](#torch_compile)
+7. [Performance tips](#cpu-backend-performance-tips)
 
 (cpu-backend-requirements)=
 
@@ -84,6 +85,32 @@ VLLM_TARGET_DEVICE=cpu python setup.py install
 ## Intel Extension for PyTorch
 
 - [Intel Extension for PyTorch (IPEX)](https://github.com/intel/intel-extension-for-pytorch) extends PyTorch with up-to-date features optimizations for an extra performance boost on Intel hardware.
+
+(torch_compile)=
+
+## Usage of torch.compile
+
+- Using `-O[0-3]` to enable `torch.compile` on the CPU backend:
+
+```{list-table}
+:header-rows: 1
+:widths:  8 20
+
+* - Levels
+    - Description
+* - O0
+    - Eager mode + Custom Ops
+* - O1 
+    - Same as ``O0``
+* - O2 
+    - Dynamo + Eager mode + Custom Ops
+* - O3
+    - Dynamo + Inductor + Max Autotune + Epilogue Fusion
+```
+
+- Setting environment variable `ENV TORCHINDUCTOR_COMPILE_THREADS=1` to avoid too many background compilation threads.
+
+- Setting environment variable `ENV TORCHINDUCTOR_CPP_WRAPPER=1` may improve performance further.
 
 (cpu-backend-performance-tips)=
 
