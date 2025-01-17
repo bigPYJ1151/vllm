@@ -278,7 +278,6 @@ class SHMManager {
       ss << _shm_ctx[thread_id]._spinning_count << ", ";
     }
     ss << "]\n";
-    std::printf("%s\n", ss.str().c_str());
 
     for (int i = 0; i < MAX_SHM_RANK_NUM; ++i) {
       if (_shared_mem_ptrs[i] != nullptr) {

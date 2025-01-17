@@ -1,4 +1,5 @@
 """A CPU worker class."""
+import os
 from typing import Dict, List, Optional, Set, Tuple, Type
 
 import torch
@@ -212,6 +213,7 @@ class CPUWorker(LocalOrDistributedWorkerBase):
             ret = torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
             if ret:
                 logger.info(ret)
+        os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
         self.device = torch.device("cpu")
         self.init_distributed_environment()
         # Set random seed.

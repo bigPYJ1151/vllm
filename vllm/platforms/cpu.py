@@ -115,6 +115,9 @@ class CpuPlatform(Platform):
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
+        # Bypass the default thread num setting 
+        os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
+
         # Intel OpenMP setting
         ld_prealod_str = os.getenv("LD_PRELOAD", "")
         if "libiomp5.so" in ld_prealod_str:
@@ -131,6 +134,7 @@ class CpuPlatform(Platform):
         # To hint IPEX uses shared memory based AllReduce
         os.environ["LOCAL_WORLD_SIZE"] = str(
             vllm_config.parallel_config.tensor_parallel_size)
+        os.environ["VLLM_INSTANCE_ID"] = vllm_config.instance_id
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
