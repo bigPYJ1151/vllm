@@ -32,6 +32,9 @@ class CPUWorker(Worker):
         # Environment variables for CPU worker
         #
 
+        # For init shm files
+        os.environ["VLLM_INSTANCE_ID"] = self.vllm_config.instance_id
+
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
