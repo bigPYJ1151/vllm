@@ -8,8 +8,9 @@
 namespace {
 #define MAX_SHM_RANK_NUM 8
 #define MAX_THREAD_NUM 12
-#define PER_THREAD_SHM_BUFFER_BYTES (2 * 1024 * 1024)
+#define PER_THREAD_SHM_BUFFER_BYTES (4 * 1024 * 1024)
 #define MIN_THREAD_PROCESS_SIZE (8 * 1024)
+#define MAX_P2P_SEND_TENSOR_NUM 8
 
 template <typename scalar_t>
 struct KernelVecType {
@@ -82,7 +83,7 @@ struct ThreadSHMContext {
   int get_swizzled_rank(int idx) { return swizzled_ranks[idx]; }
 
   void wait_for_all(ThreadSHMStat prev_stat) {
-    for (int idx = 1; idx < group_size; ++idx) {
+    for (int idx = 0; idx < group_size; ++idx) {
       int rank = get_swizzled_rank(idx);
       while (thread_stats[rank] == prev_stat) {
         ++_spinning_count;
@@ -91,13 +92,28 @@ struct ThreadSHMContext {
     }
   }
 
+  void wait_for_one(int rank, ThreadSHMStat prev_stat) {
+    while (thread_stats[rank] == prev_stat) {
+      ++_spinning_count;
+      _mm_pause();
+    }
+  }
+
   void set_thread_stat(ThreadSHMStat stat) {
-    for (int idx = 1; idx < group_size; ++idx) {
+    for (int idx = 0; idx < group_size; ++idx) {
       int rank = get_swizzled_rank(idx);
       shm_contexts[rank]->thread_stats[this->rank] = stat;
     }
   }
 
+  void set_thread_stat(int target_rank, ThreadSHMStat stat) {
+    for (int idx = 0; idx < group_size; ++idx) {
+      int rank = get_swizzled_rank(idx);
+      shm_contexts[rank]->thread_stats[target_rank] = stat;
+    }
+  }
+
+  // barrier for all ranks in the group, used for all2all ops
   // DONE -> THREAD_READY -> SHM_DATA_READY -> DONE -> ...
   void barrier(ThreadSHMStat next_stat) {
     if (next_stat == ThreadSHMStat::THREAD_READY) {
@@ -187,23 +203,22 @@ class SHMManager {
     return name + "_" + std::to_string(rank);
   }
 
-  static void create_singleton_instance(const std::string& name,
-                                        const int group_size, const int rank) {
-    std::call_once(SingletonCreationFlag, [&]() {
-      TORCH_CHECK(
-          SingletonInstance == nullptr,
-          "Duplicate initialization of SHMManager singleton is not allowed.");
-      SingletonInstance = std::make_unique<SHMManager>(name, rank, group_size);
-    });
+  static int64_t create_singleton_instance(const std::string& name,
+                                           const int group_size,
+                                           const int rank) {
+    std::lock_guard<std::mutex> guard(SingletonInstancesLock);
+    SingletonInstances.emplace_back(
+        std::make_unique<SHMManager>(name, rank, group_size));
+    return static_cast<int64_t>(SingletonInstances.size() - 1);
   }
 
-  static SHMManager* get_singleton_instance() {
-    return SingletonInstance.get();
+  static SHMManager* get_singleton_instance(int64_t handle) {
+    return SingletonInstances[handle].get();
   }
 
  protected:
-  static std::unique_ptr<SHMManager> SingletonInstance;
-  static std::once_flag SingletonCreationFlag;
+  static std::vector<std::unique_ptr<SHMManager>> SingletonInstances;
+  static std::mutex SingletonInstancesLock;
 
  private:
   static size_t round_to_alignment(size_t num) {
@@ -278,7 +293,6 @@ class SHMManager {
       ss << _shm_ctx[thread_id]._spinning_count << ", ";
     }
     ss << "]\n";
-    std::printf("%s\n", ss.str().c_str());
 
     for (int i = 0; i < MAX_SHM_RANK_NUM; ++i) {
       if (_shared_mem_ptrs[i] != nullptr) {
@@ -439,14 +453,17 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data,
 }
 };  // namespace shm_cc_ops
 
-std::unique_ptr<SHMManager> SHMManager::SingletonInstance = nullptr;
-std::once_flag SHMManager::SingletonCreationFlag = std::once_flag();
+std::vector<std::unique_ptr<SHMManager>> SHMManager::SingletonInstances = {};
+std::mutex SHMManager::SingletonInstancesLock = {};
 
 template <typename scalar_t>
 void shm_allreduce_sum(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num) {
   switch (ctx->group_size) {
     case 2:
       shm_cc_ops::all_reduce_sum_impl<scalar_t, 2>(ctx, data, elem_num);
+      break;
+    case 3:
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 3>(ctx, data, elem_num);
       break;
     case 4:
       shm_cc_ops::all_reduce_sum_impl<scalar_t, 4>(ctx, data, elem_num);
@@ -465,7 +482,7 @@ void shm_gather_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
                      scalar_t** outputs, const int dst) {
   CPU_KERNEL_GUARD_IN(shm_gather_impl)
   const int worldsize = ctx->group_size;
-
+  TORCH_CHECK_LT(dst, worldsize);
   shm_cc_ops::shm_cc_loop<scalar_t>(
       ctx, elem_num,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
@@ -499,9 +516,179 @@ void shm_gather_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
 
   return;
 }
+
+struct MemPiece {
+  void* ptr;
+  int64_t size;
+
+  template <typename T>
+  T* data_ptr() {
+    return reinterpret_cast<T*>(ptr);
+  }
+};
+
+struct TensorListMeta {
+  int64_t tensor_bytes[MAX_P2P_SEND_TENSOR_NUM];
+  torch::ScalarType tensor_types[MAX_P2P_SEND_TENSOR_NUM];
+  int64_t tensor_num;
+  int64_t total_bytes;
+
+  TensorListMeta() : tensor_num(0), total_bytes(0) {
+    static_assert(sizeof(TensorListMeta) % 64 == 0);
+    static_assert(sizeof(TensorListMeta) <
+                  MIN_THREAD_PROCESS_SIZE);  // To ensure the metadata always
+                                             // hold by the thread 0
+    for (int i = 0; i < MAX_P2P_SEND_TENSOR_NUM; ++i) {
+      tensor_bytes[i] = 0;
+      tensor_ptrs[i] = nullptr;
+      tensor_types[i] = torch::ScalarType::Undefined;
+    }
+  }
+
+  // For send and recv
+  void bind_tensor_list(std::vector<torch::Tensor>& tensor_list) {
+    TORCH_CHECK(tensor_types[0] == torch::ScalarType::Undefined,
+                "Re-bind TensorListMeta is not allowed.")
+    TORCH_CHECK_LE(tensor_list.size(), MAX_P2P_SEND_TENSOR_NUM);
+    tensor_num = tensor_list.size();
+    int64_t bytes_sum = 0;
+    for (int i = 0; i < tensor_list.size(); ++i) {
+      torch::Tensor& t = tensor_list[i];
+      TORCH_CHECK(t.is_contiguous());
+      tensor_bytes[i] = t.nbytes();
+      tensor_types[i] = t.scalar_type();
+      tensor_ptrs[i] = t.data_ptr();
+      bytes_sum += t.nbytes();
+    }
+    total_bytes = bytes_sum;
+  }
+
+  // For recv
+  std::vector<torch::Tensor> generate_tensor_list() {
+    std::vector<torch::Tensor> tensor_list;
+    tensor_list.reserve(tensor_num);
+
+    for (int i = 0; i < tensor_num; ++i) {
+      int64_t bytes = tensor_bytes[i];
+      auto type = tensor_types[i];
+      int64_t elem_bytes = torch::elementSize(type);
+
+      TORCH_CHECK_EQ(bytes % elem_bytes, 0);
+      int64_t elem_num = bytes / elem_bytes;
+      auto options = torch::TensorOptions().dtype(type).device(torch::kCPU);
+      tensor_list.emplace_back(torch::empty({elem_num}, options));
+    }
+    return tensor_list;
+  }
+
+  MemPiece get_data(int64_t offset) {
+    for (int i = 0; i < tensor_num; ++i) {
+      if (offset < tensor_bytes[i]) {
+        return {reinterpret_cast<int8_t*>(tensor_ptrs[i]) + offset,
+                tensor_bytes[i] - offset};
+      }
+      offset -= tensor_bytes[i];
+    }
+    return {nullptr, 0};
+  }
+
+ private:
+  void* tensor_ptrs[MAX_P2P_SEND_TENSOR_NUM];
+  int8_t _padding[40];
+};
+
+void shm_send_tensor_list_impl(ThreadSHMContext* ctx,
+                               const std::vector<torch::Tensor>& tensor_list) {
+  CPU_KERNEL_GUARD_IN(shm_send_tensor_list_impl)
+  std::vector<torch::Tensor> tensor_list_with_metadata;
+  tensor_list_with_metadata.reserve(1 + tensor_list.size());
+
+  auto options = torch::TensorOptions().dtype(torch::kInt8).device(torch::kCPU);
+  tensor_list_with_metadata.emplace_back(
+      torch::empty({sizeof(TensorListMeta)}, options));
+  tensor_list_with_metadata.insert(tensor_list_with_metadata.end(),
+                                   tensor_list.begin(), tensor_list.end());
+
+  torch::Tensor& metadata_tensor = tensor_list_with_metadata[0];
+  TORCH_CHECK_EQ(metadata_tensor.nbytes(), sizeof(TensorListMeta));
+
+  TensorListMeta* metadata = new (metadata_tensor.data_ptr()) TensorListMeta();
+  metadata->bind_tensor_list(tensor_list_with_metadata);
+
+  shm_cc_ops::shm_cc_loop<int8_t>(
+      ctx, metadata->total_bytes,
+      [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
+          int64_t data_elem_num) {
+        int rank = thread_ctx->rank;
+        // Wait until the receiver set the stat to DONE
+        thread_ctx->wait_for_one(rank, ThreadSHMStat::SHM_DATA_READY);
+
+        int64_t curr_shm_offset = 0;
+        while (curr_shm_offset < data_elem_num) {
+          MemPiece frag = metadata->get_data(data_offset + curr_shm_offset);
+          frag.size = std::min(frag.size, data_elem_num - curr_shm_offset);
+          shm_cc_ops::memcpy(
+              thread_ctx->get_thread_shm_ptr<int8_t>(rank) + curr_shm_offset,
+              frag.ptr, frag.size);
+          curr_shm_offset += frag.size;
+        }
+
+        thread_ctx->set_thread_stat(rank, ThreadSHMStat::SHM_DATA_READY);
+      });
+}
+
+std::vector<torch::Tensor> shm_recv_tensor_list_impl(ThreadSHMContext* ctx,
+                                                     int64_t src) {
+  CPU_KERNEL_GUARD_IN(shm_recv_tensor_list_impl)
+  auto options = torch::TensorOptions().dtype(torch::kInt8).device(torch::kCPU);
+  torch::Tensor metadata_tensor =
+      torch::empty({sizeof(TensorListMeta)}, options);
+
+  // Wait until the sender set the stat of the thread 0 to SHM_DATA_READY
+  ctx->wait_for_one(src, ThreadSHMStat::DONE);
+  shm_cc_ops::memcpy(metadata_tensor.data_ptr(),
+                     ctx->get_thread_shm_ptr<void>(src),
+                     sizeof(TensorListMeta));
+  TensorListMeta* src_metadata =
+      reinterpret_cast<TensorListMeta*>(metadata_tensor.data_ptr());
+  std::vector<torch::Tensor> tensor_list_with_metadata =
+      src_metadata->generate_tensor_list();
+
+  TensorListMeta metadata;
+  metadata.bind_tensor_list(tensor_list_with_metadata);
+  TORCH_CHECK_EQ(metadata.tensor_num, src_metadata->tensor_num);
+  TORCH_CHECK_EQ(metadata.total_bytes, src_metadata->total_bytes);
+
+  shm_cc_ops::shm_cc_loop<int8_t>(
+      ctx, metadata.total_bytes,
+      [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
+          int64_t data_elem_num) {
+        // Wait until the sender set the stat to SHM_DATA_READY
+        thread_ctx->wait_for_one(src, ThreadSHMStat::DONE);
+        int64_t curr_shm_offset = 0;
+        while (curr_shm_offset < data_elem_num) {
+          MemPiece frag = metadata.get_data(data_offset + curr_shm_offset);
+          frag.size = std::min(frag.size, data_elem_num - curr_shm_offset);
+          shm_cc_ops::memcpy(
+              frag.ptr,
+              thread_ctx->get_thread_shm_ptr<int8_t>(src) + curr_shm_offset,
+              frag.size);
+          curr_shm_offset += frag.size;
+        }
+
+        thread_ctx->set_thread_stat(src, ThreadSHMStat::DONE);
+      });
+
+  std::vector<torch::Tensor> tensor_list;
+  tensor_list.reserve(metadata.tensor_num - 1);
+  tensor_list.insert(tensor_list.begin(), tensor_list_with_metadata.begin() + 1,
+                     tensor_list_with_metadata.end());
+
+  return tensor_list;
+}
 }  // namespace
 
-void shm_gather(torch::Tensor& data,
+void shm_gather(int64_t handle, torch::Tensor& data,
                 const std::optional<std::vector<torch::Tensor>>& outputs,
                 int64_t dst) {
   TORCH_CHECK(data.is_contiguous())
@@ -514,11 +701,11 @@ void shm_gather(torch::Tensor& data,
       for (int i = 0; i < outputs->size(); ++i) {
         output_ptrs[i] = outputs->at(i).data_ptr<scalar_t>();
       }
-      shm_gather_impl(SHMManager::get_singleton_instance()->get_shm_ctx(),
+      shm_gather_impl(SHMManager::get_singleton_instance(handle)->get_shm_ctx(),
                       data.data_ptr<scalar_t>(), data.numel(), output_ptrs,
                       dst);
     } else {
-      shm_gather_impl(SHMManager::get_singleton_instance()->get_shm_ctx(),
+      shm_gather_impl(SHMManager::get_singleton_instance(handle)->get_shm_ctx(),
                       data.data_ptr<scalar_t>(), data.numel(), (scalar_t**)(0),
                       dst);
     }
@@ -527,23 +714,41 @@ void shm_gather(torch::Tensor& data,
   });
 }
 
-void shm_allreduce(torch::Tensor& data) {
+void shm_allreduce(int64_t handle, torch::Tensor& data) {
   TORCH_CHECK(data.is_contiguous())
   VLLM_DISPATCH_FLOATING_TYPES(data.scalar_type(), "shm_allreduce_sum", [&] {
     CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
-    shm_allreduce_sum(SHMManager::get_singleton_instance()->get_shm_ctx(),
+    shm_allreduce_sum(SHMManager::get_singleton_instance(handle)->get_shm_ctx(),
                       data.data_ptr<scalar_t>(), data.numel());
     CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
   });
 }
 
-void init_shm_manager(const std::string& name, const int64_t group_size,
-                      const int64_t rank) {
-  SHMManager::create_singleton_instance(name, group_size, rank);
+void shm_send_tensor_list(int64_t handle,
+                          const std::vector<torch::Tensor>& tensor_list,
+                          int64_t dst) {
+  CPU_KERNEL_GUARD_IN(shm_send_tensor_list)
+  shm_send_tensor_list_impl(
+      SHMManager::get_singleton_instance(handle)->get_shm_ctx(), tensor_list);
+  CPU_KERNEL_GUARD_OUT(shm_send_tensor_list)
 }
 
-std::string join_shm_manager(const std::string& name) {
-  TORCH_CHECK(SHMManager::get_singleton_instance());
-  SHMManager::get_singleton_instance()->join(name);
-  return SHMManager::get_singleton_instance()->get_shm_ctx()->to_string();
+std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src) {
+  CPU_KERNEL_GUARD_IN(shm_recv_tensor_list)
+  auto tensor_list = shm_recv_tensor_list_impl(
+      SHMManager::get_singleton_instance(handle)->get_shm_ctx(), src);
+  CPU_KERNEL_GUARD_OUT(shm_recv_tensor_list)
+  return tensor_list;
+}
+
+int64_t init_shm_manager(const std::string& name, const int64_t group_size,
+                         const int64_t rank) {
+  return SHMManager::create_singleton_instance(name, group_size, rank);
+}
+
+std::string join_shm_manager(int64_t handle, const std::string& name) {
+  auto shm_manager = SHMManager::get_singleton_instance(handle);
+  TORCH_CHECK(shm_manager);
+  shm_manager->join(name);
+  return shm_manager->get_shm_ctx()->to_string();
 }

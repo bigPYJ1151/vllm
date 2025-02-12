@@ -106,6 +106,11 @@ class CpuPlatform(Platform):
             else:
                 parallel_config.worker_cls = "vllm.worker.cpu_worker.CPUWorker"
 
+        # Note: We use VLLM_CPU_KVCACHE_SPACE to denote overall kv cache size,
+        # should divide it for each rank.
+        cache_config.cpu_kvcache_space_bytes //= (  # type: ignore
+            parallel_config.world_size)
+
         assert vllm_config.device_config.device_type == "cpu"
 
         #
@@ -114,6 +119,9 @@ class CpuPlatform(Platform):
 
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+
+        # Bypass the default thread num setting
+        os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
 
         # Intel OpenMP setting
         ld_prealod_str = os.getenv("LD_PRELOAD", "")
