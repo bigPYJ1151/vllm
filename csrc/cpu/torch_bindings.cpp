@@ -18,16 +18,22 @@ void int8_scaled_mm_azp(torch::Tensor& c, const torch::Tensor& a,
                         const std::optional<torch::Tensor>& azp,
                         const std::optional<torch::Tensor>& bias);
 
-void init_shm_manager(const std::string& name, const int64_t group_size,
-                      const int64_t rank);
+int64_t init_shm_manager(const std::string& name, const int64_t group_size,
+                         const int64_t rank);
 
-std::string join_shm_manager(const std::string& name);
+std::string join_shm_manager(int64_t handle, const std::string& name);
 
-void shm_allreduce(torch::Tensor& data);
+void shm_allreduce(int64_t handle, torch::Tensor& data);
 
-void shm_gather(torch::Tensor& data,
+void shm_gather(int64_t handle, torch::Tensor& data,
                 const std::optional<std::vector<torch::Tensor>>& outputs,
                 int64_t dst);
+
+void shm_send_tensor_list(int64_t handle,
+                          const std::vector<torch::Tensor>& tensor_list,
+                          int64_t dst);
+
+std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src);
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
@@ -141,15 +147,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // SHM CCL
 #ifdef __AVX512F__
-  ops.def("init_shm_manager(str name, int group_size, int rank) -> ()",
+  ops.def("init_shm_manager(str name, int group_size, int rank) -> int",
           &init_shm_manager);
-  ops.def("join_shm_manager(str name) -> str", &join_shm_manager);
-  ops.def("shm_allreduce(Tensor! data) -> ()");
+  ops.def("join_shm_manager(int handle, str name) -> str", &join_shm_manager);
+  ops.def("shm_allreduce(int handle, Tensor! data) -> ()");
   ops.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
   ops.def(
-      "shm_gather(Tensor data, Tensor[](a!)? outputs, int dst) -> "
+      "shm_gather(int handle, Tensor data, Tensor[](a!)? outputs, int dst) -> "
       "()");
   ops.impl("shm_gather", torch::kCPU, &shm_gather);
+  ops.def(
+      "shm_send_tensor_list(int handle, Tensor[](a) tensor_list, int dst) -> "
+      "()");
+  ops.impl("shm_send_tensor_list", torch::kCPU, &shm_send_tensor_list);
+  ops.def("shm_recv_tensor_list(int handle, int src) -> Tensor[](a)",
+          &shm_recv_tensor_list);
 #endif
 }
 
