@@ -201,9 +201,6 @@ class CPUWorker(LocalOrDistributedWorkerBase):
         else:
             self.profiler = None
 
-        # Note: For adapting mp executor which may use asyncio eventloop for the driver
-        self.runtime_thread_bind = True if self.rank == 0 else False
-
     def start_profile(self):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
@@ -217,8 +214,9 @@ class CPUWorker(LocalOrDistributedWorkerBase):
     def init_device(self) -> None:
         if self.local_omp_cpuid != "all":
             ret = torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
-            if not self.runtime_thread_bind and ret:
+            if ret:
                 logger.info(ret)
+
         os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
 
         # Note: unique identifier for creating allreduce shared memory
@@ -346,13 +344,6 @@ class CPUWorker(LocalOrDistributedWorkerBase):
         self,
         worker_input: WorkerInput,
     ) -> None:
-        if self.runtime_thread_bind:
-            self.runtime_thread_bind = False
-            if self.local_omp_cpuid != "all":
-                ret = torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
-                if self.runtime_thread_bind and ret:
-                    logger.info(ret)
-
         if (worker_input.blocks_to_copy is not None
                 and worker_input.blocks_to_copy.numel() > 0):
             self.cache_engine[worker_input.virtual_engine].copy(
