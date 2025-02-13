@@ -82,20 +82,28 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         # broadcasted to.
         self.non_driver_workers: List[ProcessWorkerWrapper] = []
 
+        # Move rank 0 driver to a new process
+        self.async_driver = (world_size > 1
+                             and self.device_config.device_type == "cpu")
+
         if world_size == 1:
             self.worker_monitor = None
         else:
             result_handler = ResultHandler()
-            for rank in range(1, world_size):
+            start_rank = 1 if not self.async_driver else 0
+            for rank in range(start_rank, world_size):
                 worker = ProcessWorkerWrapper(result_handler,
                                               WorkerWrapperBase,
                                               self.vllm_config, rank)
                 self.workers.append(worker)
+
+                if rank == 0:
+                    continue
+
                 if rank % tensor_parallel_size == 0:
                     self.tp_driver_workers.append(worker)
                 else:
                     self.non_driver_workers.append(worker)
-
             self.worker_monitor = WorkerMonitor(self.workers, result_handler)
             result_handler.start()
             self.worker_monitor.start()
@@ -103,7 +111,11 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         # Set up signal handlers to shutdown the executor cleanly
         # sometimes gc does not work well
 
-        self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
+        if not self.async_driver:
+            self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
+        else:
+            self.driver_worker = self.workers[0]
+            self.workers = self.workers[1:]
 
         all_kwargs = []
         distributed_init_method = get_distributed_init_method(
@@ -125,7 +137,11 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
-        self.driver_exec_model = make_async(self.driver_worker.execute_model)
+
+        if not self.async_driver:
+            self.driver_exec_model = make_async(
+                self.driver_worker.execute_model)  # type: ignore
+
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
     def shutdown(self):
@@ -141,7 +157,12 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         Passing None will cause the driver to stop the model execution
         loop running in each of the remote workers.
         """
-        return self.driver_worker.execute_model(execute_model_req)
+        if not self.async_driver:
+            return self.driver_worker.execute_model(  # type: ignore
+                execute_model_req)
+        else:
+            return self.driver_worker.execute_method("execute_model",
+                                                     execute_model_req).get()
 
     def _run_workers(
         self,
@@ -182,8 +203,12 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
             for worker in self.workers
         ]
 
-        driver_worker_output = run_method(self.driver_worker, sent_method,
-                                          args, kwargs)
+        if not self.async_driver:
+            driver_worker_method = getattr(self.driver_worker, sent_method)
+            driver_worker_output = driver_worker_method(*args, **kwargs)
+        else:
+            driver_worker_output = self.driver_worker.execute_method(
+                sent_method, *args, **kwargs).get()
 
         # Get the results of the workers.
         return [driver_worker_output
@@ -206,7 +231,12 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> List[SamplerOutput]:
         if not self.tp_driver_workers:
-            return await self.driver_exec_model(execute_model_req)
+            if not self.async_driver:
+                return await self.driver_exec_model(execute_model_req
+                                                    )  # type: ignore
+            else:
+                return await self.driver_worker.execute_method_async(
+                    "execute_model", execute_model_req)
 
         if self.pp_locks is None:
             # This locks each pipeline parallel stage so multiple virtual
@@ -218,11 +248,20 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
                 for _ in range(self.parallel_config.pipeline_parallel_size)
             ]
 
-        tasks = [
-            asyncio.create_task(
-                _run_task_with_lock(self.driver_exec_model, self.pp_locks[0],
-                                    execute_model_req))
-        ]
+        if not self.async_driver:
+            tasks = [
+                asyncio.create_task(
+                    _run_task_with_lock(self.driver_exec_model,
+                                        self.pp_locks[0], execute_model_req))
+            ]
+        else:
+            tasks = [
+                asyncio.create_task(
+                    _run_task_with_lock(
+                        self.driver_worker.execute_method_async,
+                        self.pp_locks[0], "execute_model", execute_model_req))
+            ]
+
         for pp_rank, driver_worker in enumerate(self.tp_driver_workers,
                                                 start=1):
             tasks.append(
