@@ -68,7 +68,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                        hidden_size: int, intermediate_size: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
         # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(torch.empty(num_experts,
+        w13_weight = torch.nn.Parameter(torch.zeros(num_experts,
                                                     2 * intermediate_size,
                                                     hidden_size,
                                                     dtype=params_dtype),
@@ -77,7 +77,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(torch.empty(num_experts,
+        w2_weight = torch.nn.Parameter(torch.zeros(num_experts,
                                                    hidden_size,
                                                    intermediate_size,
                                                    dtype=params_dtype),
@@ -94,7 +94,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
                     layer.w13_weight,
                     layer.w2_weight,
-                    use_prepack=True,
+                    use_prepack=False,
                 )
             else:
                 raise NotImplementedError("CPU MOE only supports x86 arch.")
@@ -357,16 +357,20 @@ class FusedMoE(torch.nn.Module):
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
+        loaded_weight_shard_dim = loaded_weight.size(shard_dim)
+        actual_shard_size = min(shard_size,
+                                loaded_weight_shard_dim - shard_size * tp_rank)
         loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank,
-                                             shard_size)
+                                             actual_shard_size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+            expert_data = expert_data.narrow(shard_dim, 0, actual_shard_size)
         # w3, up_proj: Load into second logical weight of w13.
         else:
             assert shard_id == "w3"
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            expert_data = expert_data.narrow(shard_dim, shard_size,
+                                             actual_shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(self, expert_data: torch.Tensor, shard_dim: int,
@@ -376,8 +380,12 @@ class FusedMoE(torch.nn.Module):
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
+        loaded_weight_shard_dim = loaded_weight.size(shard_dim)
+        actual_shard_size = min(shard_size,
+                                loaded_weight_shard_dim - shard_size * tp_rank)
         loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank,
-                                             shard_size)
+                                             actual_shard_size)
+        expert_data = expert_data.narrow(shard_dim, 0, actual_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
 
