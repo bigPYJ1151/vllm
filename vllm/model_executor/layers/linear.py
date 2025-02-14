@@ -351,8 +351,11 @@ class ColumnParallelLinear(LinearBase):
         if output_dim is not None and not use_bitsandbytes_4bit:
             shard_size = param_data.shape[output_dim]
             start_idx = tp_rank * shard_size
+            actual_shard_size = min(
+                loaded_weight.size(output_dim) - start_idx, shard_size)
             loaded_weight = loaded_weight.narrow(output_dim, start_idx,
-                                                 shard_size)
+                                                 actual_shard_size)
+            param_data = param_data.narrow(output_dim, 0, actual_shard_size)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -974,8 +977,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             if not use_bitsandbytes_4bit:
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx,
                                                      actual_shard_size)
-            param_data = param_data.narrow(output_dim, 0,
-                                           actual_shard_size)
+            param_data = param_data.narrow(output_dim, 0, actual_shard_size)
         # Special case for for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0
@@ -1096,7 +1098,7 @@ class RowParallelLinear(LinearBase):
         if input_dim is not None and not use_bitsandbytes_4bit:
             shard_size = param_data.shape[input_dim]
             start_idx = tp_rank * shard_size
-            actual_shard_size = min(shard_size, 
+            actual_shard_size = min(shard_size,
                                     loaded_weight.size(input_dim) - start_idx)
             loaded_weight = loaded_weight.narrow(input_dim, start_idx,
                                                  actual_shard_size)
