@@ -106,11 +106,6 @@ class CpuPlatform(Platform):
             else:
                 parallel_config.worker_cls = "vllm.worker.cpu_worker.CPUWorker"
 
-        # Note: We use VLLM_CPU_KVCACHE_SPACE to denote overall kv cache size,
-        # should divide it for each rank.
-        cache_config.cpu_kvcache_space_bytes //= (  # type: ignore
-            parallel_config.world_size)
-
         assert vllm_config.device_config.device_type == "cpu"
 
         #
