@@ -64,7 +64,7 @@ class CpuPlatform(Platform):
                 "CUDA graph is not supported on CPU, fallback to the eager "
                 "mode.")
             model_config.enforce_eager = True
-
+        
         cache_config = vllm_config.cache_config
 
         if cache_config and cache_config.block_size is None:
@@ -120,6 +120,12 @@ class CpuPlatform(Platform):
 
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+
+        # Bypass the default thread num setting
+        os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
+
+        # MLA attention is not supported
+        os.environ["VLLM_MLA_DISABLE"] = "1"
 
         # Intel OpenMP setting
         ld_prealod_str = os.getenv("LD_PRELOAD", "")
