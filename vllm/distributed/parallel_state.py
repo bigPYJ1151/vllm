@@ -568,6 +568,11 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
+        if (self.device_communicator is not None and 
+            self.device_communicator.device.type == 'cpu'): 
+            self.device_communicator.send_tensor_dict(tensor_dict, dst)
+            return None
+
         metadata_list: List[Tuple[Any, Any]] = []
         assert isinstance(
             tensor_dict,
@@ -622,6 +627,10 @@ class GroupCoordinator:
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
+
+        if (self.device_communicator is not None and 
+            self.device_communicator.device.type == 'cpu'): 
+            return self.device_communicator.recv_tensor_dict(src)
 
         recv_metadata_list = self.recv_object(src=src)
         tensor_dict: Dict[str, Any] = {}
