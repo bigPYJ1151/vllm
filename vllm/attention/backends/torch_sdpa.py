@@ -400,6 +400,8 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
+        *kargs,
+        **kwargs,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(
