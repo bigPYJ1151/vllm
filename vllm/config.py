@@ -3322,21 +3322,22 @@ class VllmConfig:
 
         if self.compilation_config is None:
             self.compilation_config = CompilationConfig()
-        if envs.VLLM_USE_V1 and self.model_config is not None and \
-            not self.model_config.enforce_eager:
-            # NOTE(woosuk): Currently, we use inductor because the piecewise
-            # CUDA graphs do not work properly with the custom CUDA kernels.
-            # FIXME(woosuk): Disable inductor to reduce the compilation time
-            # and avoid any potential issues with the inductor.
-            self.compilation_config.custom_ops = ["none"]
-            self.compilation_config.use_cudagraph = True
-            self.compilation_config.use_inductor = True
-            self.compilation_config.cudagraph_num_of_warmups = 1
-            self.compilation_config.pass_config.enable_fusion = False
-            self.compilation_config.pass_config.enable_reshape = False
-            self.compilation_config.level = CompilationLevel.PIECEWISE
 
-        self._set_cudagraph_sizes()
+        if current_platform.is_cuda():
+            if envs.VLLM_USE_V1 and not self.model_config.enforce_eager:
+                # NOTE(woosuk): Currently, we use inductor because the piecewise
+                # CUDA graphs do not work properly with the custom CUDA kernels.
+                # FIXME(woosuk): Disable inductor to reduce the compilation time
+                # and avoid any potential issues with the inductor.
+                self.compilation_config.custom_ops = ["none"]
+                self.compilation_config.use_cudagraph = True
+                self.compilation_config.use_inductor = True
+                self.compilation_config.cudagraph_num_of_warmups = 1
+                self.compilation_config.pass_config.enable_fusion = False
+                self.compilation_config.pass_config.enable_reshape = False
+                self.compilation_config.level = CompilationLevel.PIECEWISE
+
+            self._set_cudagraph_sizes()
 
         if self.cache_config is not None and \
             self.cache_config.cpu_offload_gb > 0 and \
