@@ -2091,6 +2091,7 @@ def make_zmq_socket(
     else:
         buf_size = -1  # Use system default buffer size
 
+    socket.setsockopt(zmq.constants.LINGER, 0)
     if type == zmq.constants.PULL:
         socket.setsockopt(zmq.constants.RCVHWM, 0)
         socket.setsockopt(zmq.constants.RCVBUF, buf_size)

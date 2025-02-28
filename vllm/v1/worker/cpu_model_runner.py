@@ -56,12 +56,6 @@ class CPUModelRunner(GPUModelRunner):
         self.model = get_model(vllm_config=self.vllm_config)
 
     def warming_up_model(self) -> None:
-        compilation_config = self.vllm_config.compilation_config
-        if compilation_config.level in [
-                CompilationLevel.NO_COMPILATION,
-                CompilationLevel.DYNAMO_AS_IS,
-        ]:
-            return
         logger.info("Warming up model for the compilation...")
         # Only generate graph for the generic shape
         with _set_global_compilation_settings():

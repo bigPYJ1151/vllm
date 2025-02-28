@@ -26,6 +26,13 @@ class CPUWorker(Worker):
 
         self.parallel_config.disable_custom_all_reduce = True
 
+        self.perf_count = 0
+        self.perf_start = 500
+        self.perf_end = 800
+        import pyinstrument
+        self.profiler = pyinstrument.Profiler()
+
+
     def init_device(self):
         assert self.device_config.device_type == "cpu"
         #
@@ -92,14 +99,6 @@ class CPUWorker(Worker):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
         self.model_runner.warming_up_model()
-
-    def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> Optional[ModelRunnerOutput]:
-        output = self.model_runner.execute_model(scheduler_output)
-        return output if self.rank == 0 else None
-
 
 def _get_cache_block_size_bytes(
     cache_config: CacheConfig,
