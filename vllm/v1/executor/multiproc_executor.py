@@ -11,6 +11,7 @@ from enum import Enum, auto
 from functools import partial
 from multiprocessing.process import BaseProcess
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor
 
 import cloudpickle
 import psutil
@@ -57,10 +58,11 @@ class MultiprocExecutor(Executor):
 
         self.world_size = self.parallel_config.world_size
         tensor_parallel_size = self.parallel_config.tensor_parallel_size
-        assert self.world_size == tensor_parallel_size, (
+        pp_parallel_size = self.parallel_config.pipeline_parallel_size
+        assert self.world_size == tensor_parallel_size * pp_parallel_size, (
             f"world_size ({self.world_size}) must be equal to the "
-            f"tensor_parallel_size ({tensor_parallel_size}). "
-            f"Pipeline parallelism is not yet implemented in v1")
+            f"tensor_parallel_size ({tensor_parallel_size}) x pipeline"
+            f" parallel_size ({pp_parallel_size}). ")
 
         # Set multiprocessing envs that are common to V0 and V1
         set_multiprocessing_worker_envs(self.parallel_config)
@@ -91,11 +93,22 @@ class MultiprocExecutor(Executor):
         for w in self.workers:
             w.worker_response_mq.wait_until_ready()
 
+        # For pipeline parallel, we use a thread pool for asynchronous
+        # execute_model. 
+        if self.max_concurrent_batches > 1:
+            self.io_thread_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mp_exec_io")
+        else:
+            self.io_thread_pool = None
+
     def collective_rpc(self,
                        method: Union[str, Callable],
                        timeout: Optional[float] = None,
                        args: Tuple = (),
-                       kwargs: Optional[Dict] = None) -> List[Any]:
+                       kwargs: Optional[Dict] = None,
+                       non_block: bool = False) -> List[Any]:
+        if non_block:
+            assert self.io_thread_pool is not None
+
         start_time = time.monotonic()
         kwargs = kwargs or {}
 
@@ -110,18 +123,28 @@ class MultiprocExecutor(Executor):
                     method, protocol=pickle.HIGHEST_PROTOCOL)
             self.rpc_broadcast_mq.enqueue((send_method, args, kwargs))
 
-            responses = [None] * self.world_size
-            for w in self.workers:
-                dequeue_timeout = timeout - (time.monotonic() - start_time
-                                             ) if timeout is not None else None
+            def get_response(w: WorkerProcHandle, 
+                             dequeue_timeout: Optional[float] = None):
                 status, result = w.worker_response_mq.dequeue(
-                    timeout=dequeue_timeout)
+                                        timeout=dequeue_timeout)
 
                 if status != WorkerProc.ResponseStatus.SUCCESS:
                     if isinstance(result, Exception):
                         raise result
                     else:
-                        raise RuntimeError("Worker failed")
+                        raise RuntimeError("Worker failed") 
+
+                return result
+
+            responses: List[Optional[Any]] = [None] * self.world_size
+            for w in self.workers:
+                dequeue_timeout = timeout - (time.monotonic() - start_time
+                                             ) if timeout is not None else None
+
+                if non_block:
+                    result = self.io_thread_pool.submit(get_response, w, dequeue_timeout) # type: ignore
+                else:
+                    result = get_response(w, dequeue_timeout) 
 
                 responses[w.rank] = result
 
@@ -170,8 +193,13 @@ class MultiprocExecutor(Executor):
 
     def shutdown(self):
         """Properly shut down the executor and its workers"""
-        if getattr(self, 'shutting_down', False):
+        if not getattr(self, 'shutting_down', False):
             self.shutting_down = True
+
+            if self.io_thread_pool is not None:
+                self.io_thread_pool.shutdown(wait=False, cancel_futures=True)
+                self.io_thread_pool = None
+
             for w in self.workers:
                 w.worker_response_mq = None
             self._ensure_worker_termination()
@@ -181,6 +209,10 @@ class MultiprocExecutor(Executor):
     def check_health(self) -> None:
         self.collective_rpc("check_health", timeout=10)
         return
+
+    @property
+    def max_concurrent_batches(self) -> int:
+        return self.parallel_config.pipeline_parallel_size
 
 
 @dataclass

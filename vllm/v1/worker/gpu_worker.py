@@ -8,6 +8,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
@@ -18,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
 from vllm.utils import GiB_bytes
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
@@ -219,13 +221,25 @@ class Worker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
-        output = self.model_runner.execute_model(scheduler_output)
-        return output if self.rank == 0 else None
+        intermediate_tensors = None
+        if not get_pp_group().is_first_rank:
+            intermediate_tensors = IntermediateTensors(get_pp_group().recv_tensor_dict(
+                    all_gather_group=get_tp_group()))
+        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+
+        if not get_pp_group().is_last_rank:
+            assert isinstance(output, IntermediateTensors)
+            get_pp_group().send_tensor_dict(output.tensors,
+                                            all_gather_group=get_tp_group())
+            return None
+
+        assert isinstance(output, ModelRunnerOutput)
+        return output if get_tp_group().rank_in_group == 0 else None
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:
