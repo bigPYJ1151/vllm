@@ -97,9 +97,10 @@ class MultiprocExecutor(Executor):
         # execute_model.
         self.io_thread_pool: Optional[ThreadPoolExecutor] = None
         if self.max_concurrent_batches > 1:
+            # Note: must use only 1 IO thread to keep dequeue sequence
+            # from the response queue
             self.io_thread_pool = ThreadPoolExecutor(
-                max_workers=self.max_concurrent_batches,
-                thread_name_prefix="mp_exec_io")
+                max_workers=1, thread_name_prefix="mp_exec_io")
 
     def collective_rpc(self,
                        method: Union[str, Callable],
