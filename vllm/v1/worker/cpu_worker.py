@@ -26,13 +26,6 @@ class CPUWorker(Worker):
 
         self.parallel_config.disable_custom_all_reduce = True
 
-        self.perf_count = 0
-        self.perf_start = 500
-        self.perf_end = 800
-        import pyinstrument
-        self.profiler = pyinstrument.Profiler()
-
-
     def init_device(self):
         assert self.device_config.device_type == "cpu"
         #
