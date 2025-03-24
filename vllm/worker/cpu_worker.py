@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """A CPU worker class."""
+import os
 from typing import Dict, List, Optional, Set, Tuple, Type
 
 import torch
@@ -15,7 +16,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.sequence import ExecuteModelRequest
-from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, bind_kv_cache
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType, bind_kv_cache
 from vllm.worker.cpu_enc_dec_model_runner import CPUEncoderDecoderModelRunner
 from vllm.worker.cpu_model_runner import CPUModelRunner, CPUModelRunnerBase
 from vllm.worker.cpu_pooling_model_runner import CPUPoolingModelRunner
@@ -40,16 +41,17 @@ class CPUCacheEngine:
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
-
+        self.device_config = device_config
         self.head_size = model_config.get_head_size()
-        self.num_layers = model_config.get_num_layers(parallel_config)
-        self.num_heads = model_config.get_num_kv_heads(parallel_config)
+        # Models like Jamba, have mixed typed layers, E.g Mamba
+        self.num_attention_layers = model_config.get_num_layers_by_block_type(
+            parallel_config, LayerBlockType.attention)
+        self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
 
         self.block_size = cache_config.block_size
-        # Note: In CacheConfig, num_gpu_blocks actual is num_cpu_blocks
-        # for CPU backend, because we want to reuse KV cache management
-        # in the scheduler.
         self.num_cpu_blocks = cache_config.num_gpu_blocks
+        if self.num_cpu_blocks:
+            self.num_cpu_blocks //= parallel_config.pipeline_parallel_size
 
         if cache_config.cache_dtype == "auto":
             self.dtype = model_config.dtype
@@ -60,13 +62,11 @@ class CPUCacheEngine:
                                       f"{cache_config.cache_dtype}.")
 
         # Get attention backend.
-        self.attn_backend = get_attn_backend(
-            self.model_config.get_head_size(),
-            self.model_config.dtype,
-            cache_config.cache_dtype,
-            self.block_size,
-            self.model_config.is_attention_free,
-        )
+        self.attn_backend = get_attn_backend(self.head_size,
+                                             model_config.dtype,
+                                             cache_config.cache_dtype,
+                                             self.block_size,
+                                             model_config.is_attention_free)
 
         # Initialize the cache.
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks)
@@ -77,11 +77,11 @@ class CPUCacheEngine:
     ) -> List[torch.Tensor]:
         """Allocates KV cache on CPU."""
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-            num_blocks, self.block_size, self.num_heads, self.head_size)
+            num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         kv_cache: List[torch.Tensor] = []
-        for _ in range(self.num_layers):
+        for _ in range(self.num_attention_layers):
             kv_cache.append(
-                torch.empty(kv_cache_shape, dtype=self.dtype, device="cpu"))
+                torch.zeros(kv_cache_shape, dtype=self.dtype, device="cpu"))
         return kv_cache
 
     def swap_in(self, src_to_dst: Dict[int, int]) -> None:
@@ -90,7 +90,7 @@ class CPUCacheEngine:
     def swap_out(self, src_to_dst: Dict[int, int]) -> None:
         raise NotImplementedError("Swap is not supported in CPUCacheEngine.")
 
-    def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
+    def copy(self, src_to_dsts: torch.Tensor) -> None:
         self.attn_backend.copy_blocks(self.cpu_cache, src_to_dsts)
 
     @staticmethod
@@ -102,11 +102,12 @@ class CPUCacheEngine:
     ) -> int:
         head_size = model_config.get_head_size()
         num_heads = model_config.get_num_kv_heads(parallel_config)
-        num_layers = model_config.get_num_layers(parallel_config)
+        num_attention_layers = model_config.get_num_layers_by_block_type(
+            parallel_config, LayerBlockType.attention)
 
         key_cache_block = block_size * num_heads * head_size
         value_cache_block = key_cache_block
-        total = num_layers * (key_cache_block + value_cache_block)
+        total = num_attention_layers * (key_cache_block + value_cache_block)
         if cache_dtype == "auto":
             dtype = model_config.dtype
         else:
@@ -138,12 +139,11 @@ class CPUWorker(LocalOrDistributedWorkerBase):
 
         self.local_rank = local_rank
         self.rank = rank
+        vllm_config.parallel_config.rank = rank
+
         self.distributed_init_method = distributed_init_method
 
         self.is_driver_worker = is_driver_worker
-        if self.is_driver_worker:
-            assert self.rank == 0, "The driver worker must have rank 0."
-
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
@@ -216,6 +216,13 @@ class CPUWorker(LocalOrDistributedWorkerBase):
             ret = torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
             if ret:
                 logger.info(ret)
+
+        os.environ["OMP_NUM_THREADS"] = str(torch.get_num_threads())
+
+        # Note: unique identifier for creating allreduce shared memory
+        os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(
+            ":")[-1]
+
         self.device = torch.device("cpu")
         self.init_distributed_environment()
         # Set random seed.
@@ -316,11 +323,6 @@ class CPUWorker(LocalOrDistributedWorkerBase):
         assert all(
             self.cpu_cache[ve] is not None
             for ve in range(self.parallel_config.pipeline_parallel_size))
-
-        # Populate the cache to warmup the memory
-        for ve in range(self.parallel_config.pipeline_parallel_size):
-            for layer_cache in self.cpu_cache[ve]:
-                layer_cache.fill_(0)
 
     @property
     def do_metadata_broadcast(self) -> bool:

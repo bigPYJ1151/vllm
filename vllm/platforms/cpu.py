@@ -102,12 +102,10 @@ class CpuPlatform(Platform):
                 f" {kv_cache_space}, expect a positive integer value.")
 
         parallel_config = vllm_config.parallel_config
-        if (parallel_config.distributed_executor_backend is not None
-                and parallel_config.distributed_executor_backend != "mp"):
-            logger.warning(("%s is not supported on CPU, fallback to mp "
-                            "distributed executor backend."),
-                           parallel_config.distributed_executor_backend)
+        if (parallel_config.distributed_executor_backend is None 
+                or parallel_config.distributed_executor_backend != "mp"):
             parallel_config.distributed_executor_backend = "mp"
+
         if parallel_config.worker_cls == "auto":
             if vllm_config.speculative_config:
                 parallel_config.worker_cls = \
