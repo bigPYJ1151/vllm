@@ -8,7 +8,7 @@ from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.utils import set_random_seed
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.scheduler import SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.cpu_model_runner import CPUModelRunner
 from vllm.v1.worker.gpu_worker import (Worker,
@@ -20,9 +20,9 @@ logger = init_logger(__name__)
 class CPUWorker(Worker):
 
     def __init__(self, vllm_config: VllmConfig, local_rank: int, rank: int,
-                 distributed_init_method: str):
+                 distributed_init_method: str, is_driver_worker: bool = False):
         super().__init__(vllm_config, local_rank, rank,
-                         distributed_init_method)
+                         distributed_init_method, is_driver_worker=is_driver_worker)
 
         self.parallel_config.disable_custom_all_reduce = True
 
