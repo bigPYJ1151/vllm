@@ -1,4 +1,4 @@
-from typing import Dict, List, cast
+from typing import Dict, List, Optional, cast
 
 import numpy as np
 import torch
@@ -34,6 +34,9 @@ class CPUInputBatch(InputBatch):
         self.presence_penalties = self.presence_penalties_cpu_tensor
         self.repetition_penalties = self.repetition_penalties_cpu_tensor
 
+        if self.allowed_token_ids_mask is not None:
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask_cpu_tensor
+
         # For reorder
         self.reorder_prompt_req_index_list = np.empty(self.max_num_reqs,
                                                       dtype=np.int64)
@@ -43,6 +46,11 @@ class CPUInputBatch(InputBatch):
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
         num_reqs = self.num_reqs
+        if self.all_greedy:
+            temperature = None
+        else:
+            temperature = self.temperature_cpu_tensor[:num_reqs]
+
         if not self.no_penalties:
             # The prompt tokens are used only for applying penalties during
             # the sampling process. Hence copy these tensors only when
@@ -51,8 +59,13 @@ class CPUInputBatch(InputBatch):
         else:
             prompt_token_ids = None
 
+        allowed_token_ids_mask: Optional[torch.Tensor] = None
+        if not self.no_allowed_token_ids:
+            assert self.allowed_token_ids_mask is not None
+            allowed_token_ids_mask = self.allowed_token_ids_mask[:num_reqs]
+
         return SamplingMetadata(
-            temperature=self.temperature[:num_reqs],
+            temperature=temperature,
             all_greedy=self.all_greedy,
             all_random=self.all_random,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
@@ -64,11 +77,12 @@ class CPUInputBatch(InputBatch):
             frequency_penalties=self.frequency_penalties[:num_reqs],
             presence_penalties=self.presence_penalties[:num_reqs],
             repetition_penalties=self.repetition_penalties[:num_reqs],
-            output_token_ids=cast(List[List[int]], self.req_output_token_ids),
-            spec_token_ids=None,
+            output_token_ids=cast(list[list[int]], self.req_output_token_ids),
             min_tokens=self.min_tokens,
             no_penalties=self.no_penalties,
             logit_bias=self.logit_bias[:num_reqs],
+            allowed_token_ids_mask=allowed_token_ids_mask,
+            bad_words_token_ids=self.bad_words_token_ids,
         )
 
     def _move_req(self, dst: int, src: int):
@@ -96,10 +110,19 @@ class CPUInputBatch(InputBatch):
         if min_tokens is not None:
             self.min_tokens[dst] = self.min_tokens[src]
 
+        self.request_lora_mapping[dst] = self.request_lora_mapping[src]
+
         generator = self.generators.pop(src, None)
         if generator is not None:
             self.generators[dst] = generator
         self.logit_bias[dst] = self.logit_bias[src]
+
+        if self.allowed_token_ids_mask_cpu_tensor is not None:
+            self.allowed_token_ids_mask_cpu_tensor[dst] = self.allowed_token_ids_mask_cpu_tensor[src]
+
+        bad_words_token_ids = self.bad_words_token_ids.pop(src, None)
+        if bad_words_token_ids is not None:
+            self.bad_words_token_ids[dst] = bad_words_token_ids
 
     def reorder(self) -> None:
         prompt_list_idx = 0
@@ -161,8 +184,14 @@ class CPUInputBatch(InputBatch):
         cached_repetition_penalties_cpu = self.repetition_penalties_cpu[
             reorder_prompt_req_index]
         cached_min_tokens = self.min_tokens.pop(reorder_prompt_req_index, None)
+        cached_request_lora_mapping = self.request_lora_mapping[reorder_prompt_req_index]
         cached_generator = self.generators.pop(reorder_prompt_req_index, None)
         cached_logit_bias = self.logit_bias[reorder_prompt_req_index]
+
+        if self.allowed_token_ids_mask_cpu_tensor is not None:
+            cached_allowed_token_ids_mask_cpu_tensor = self.allowed_token_ids_mask_cpu_tensor[reorder_prompt_req_index]
+
+        cached_bad_words_token_ids = self.bad_words_token_ids.pop(reorder_prompt_req_index, None)
 
         for idx in range(reorder_req_num):
             prompt_req_index = reorder_prompt_list[idx].item()
@@ -197,6 +226,13 @@ class CPUInputBatch(InputBatch):
             reorder_prompt_req_index] = cached_repetition_penalties_cpu
         if cached_min_tokens is not None:
             self.min_tokens[reorder_prompt_req_index] = cached_min_tokens
+        self.request_lora_mapping[reorder_prompt_req_index] = cached_request_lora_mapping
         if cached_generator is not None:
             self.generators[reorder_prompt_req_index] = cached_generator
         self.logit_bias[reorder_prompt_req_index] = cached_logit_bias
+
+        if self.allowed_token_ids_mask_cpu_tensor is not None:
+            self.allowed_token_ids_mask_cpu_tensor[reorder_prompt_req_index] = cached_allowed_token_ids_mask_cpu_tensor
+
+        if cached_bad_words_token_ids is not None:
+            self.bad_words_token_ids[reorder_prompt_req_index] = cached_bad_words_token_ids

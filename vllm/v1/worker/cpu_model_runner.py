@@ -10,7 +10,7 @@ from vllm.config import CompilationLevel, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.utils import bind_kv_cache
-from vllm.v1.core.scheduler import SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.worker.cpu_input_batch import CPUInputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 class CPUModelRunner(GPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self.chunked_prefill = True
         super().__init__(vllm_config, device)
 
         assert device == torch.device("cpu")
@@ -79,7 +80,6 @@ class CPUModelRunner(GPUModelRunner):
         num_scheduled_tokens = np.empty(num_reqs, dtype=np.int32)
         max_num_scheduled_tokens = 0
         for i, req_id in enumerate(self.input_batch.req_ids):
-            assert req_id is not None
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_scheduled_tokens[i] = num_tokens
             max_num_scheduled_tokens = max(max_num_scheduled_tokens,
@@ -191,7 +191,7 @@ class CPUModelRunner(GPUModelRunner):
         # token from the partial request.
         # TODO: Support prompt logprobs.
         logits_indices = query_start_loc[1:] - 1
-        return attn_metadata, logits_indices
+        return attn_metadata, logits_indices, None
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -200,27 +200,39 @@ class CPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV 
             cache size of each layer
         """
-        if len(kv_cache_config.groups) > 1:
+        if len(kv_cache_config.kv_cache_groups) > 1:
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
 
         kv_caches: Dict[str, torch.Tensor] = {}
 
-        for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
-            tensor_config = kv_cache_config.tensors[layer_name]
-            assert tensor_config.size % layer_spec.page_size_bytes == 0
-            num_blocks = tensor_config.size // layer_spec.page_size_bytes
-            if isinstance(layer_spec, FullAttentionSpec):
-                kv_cache_shape = TorchSDPABackend.get_kv_cache_shape(
-                    num_blocks, layer_spec.block_size, layer_spec.num_kv_heads,
-                    layer_spec.head_size)
-                dtype = layer_spec.dtype
-                kv_caches[layer_name] = torch.zeros(kv_cache_shape,
-                                                    dtype=dtype,
-                                                    device=self.device)
-            else:
-                raise NotImplementedError
+        for kv_cache_group in kv_cache_config.kv_cache_groups:
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            for layer_name in kv_cache_group.layer_names:
+                tensor_config = kv_cache_config.tensors[layer_name]
+                assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
+                num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                # `num_blocks` is the number of blocks the model runner can use.
+                # `kv_cache_config.num_blocks` is the number of blocks that
+                # KVCacheManager may allocate.
+                # Since different GPUs may have different number of layers and
+                # different memory capacities, `num_blocks` can be different on
+                # different GPUs, and `kv_cache_config.num_blocks` is set to
+                # the min of all `num_blocks`. Verify it here.
+                assert num_blocks >= kv_cache_config.num_blocks
+                if isinstance(kv_cache_spec, FullAttentionSpec):
+                    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                        num_blocks, kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                                                        dtype=dtype,
+                                                        device=self.device)
+                else:
+                    # TODO: add new branches when introducing more types of
+                    # KV cache specs.
+                    raise ValueError("Unknown KV cache spec type.")
 
         bind_kv_cache(
             kv_caches,
