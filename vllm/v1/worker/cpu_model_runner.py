@@ -66,7 +66,7 @@ class CPUModelRunner(GPUModelRunner):
         logger.info("Warming up model for the compilation...")
         # Only generate graph for the generic shape
         with _set_global_compilation_settings():
-            self._dummy_run(self.max_num_tokens, self.kv_caches)
+            self._dummy_run(self.max_num_tokens)
         logger.info("Warming up done.")
 
     def _prepare_inputs(self, scheduler_output: SchedulerOutput):
