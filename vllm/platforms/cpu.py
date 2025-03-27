@@ -43,7 +43,10 @@ class CpuPlatform(Platform):
             logger.info("Using CPU MLA backend.")
             return "vllm.attention.backends.cpu_mla.CPUMLABackend"
         logger.info("Using Torch SDPA backend.")
-        return "vllm.attention.backends.torch_sdpa.TorchSDPABackend"
+        if use_v1:
+            return "vllm.attention.backends.torch_sdpa.TorchSDPABackendV1"
+        else:
+            return "vllm.attention.backends.torch_sdpa.TorchSDPABackend"
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
@@ -68,8 +71,7 @@ class CpuPlatform(Platform):
             model_config.enforce_eager = True
 
         if model_config.enable_sleep_mode:
-            logger.warning(
-                "sleep mode is not supported on CPU, disable it.")
+            logger.warning("sleep mode is not supported on CPU, disable it.")
             model_config.enable_sleep_mode = False
 
         cache_config = vllm_config.cache_config
@@ -202,4 +204,11 @@ class CpuPlatform(Platform):
 
     @classmethod
     def supports_structured_output(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_v1(cls, model_config) -> bool:
+        """Returns whether the current platform can support v1 for the supplied
+        model configuration.
+        """
         return True

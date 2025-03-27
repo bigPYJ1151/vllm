@@ -465,8 +465,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> tuple[Any, torch.Tensor,
-               Optional[SpecDecodeMetadata]]:
+    ) -> tuple[Any, torch.Tensor, Optional[SpecDecodeMetadata]]:
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -580,10 +579,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Prepare for cascade attention if enabled & beneficial.
         common_prefix_len = 0
         if self.cascade_attn_enabled:
-            common_prefix_len = self._compute_cascade_attn_prefix_len(
-                num_scheduled_tokens,
-                scheduler_output.num_common_prefix_blocks,
-            )
+            pass
 
         attn_metadata = self.attn_metadata_builder.build(
             num_reqs=num_reqs,
@@ -1635,7 +1631,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
-        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
         if len(kv_cache_config.kv_cache_groups) > 1:
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
