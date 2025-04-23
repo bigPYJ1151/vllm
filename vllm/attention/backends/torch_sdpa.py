@@ -458,7 +458,7 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
 
         # For warming-up
         if attn_metadata is None:
-            return query
+            return torch.empty_like(query)
 
         attn_type = self.attn_type
         if (attn_type == AttentionType.ENCODER

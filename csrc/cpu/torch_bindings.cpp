@@ -30,7 +30,7 @@ void shm_gather(int64_t handle, torch::Tensor& data,
                 int64_t dst);
 
 void shm_all_gather(int64_t handle, const torch::Tensor& data,
-                    torch::Tensor& output); 
+                    torch::Tensor& output);
 
 void shm_send_tensor_list(int64_t handle,
                           const std::vector<torch::Tensor>& tensor_list,
@@ -40,6 +40,14 @@ std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src);
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
+
+  // The default behavior in PyTorch 2.6 is "requires_contiguous", so we need
+  // to override this for many GEMMs with the following tag. Otherwise,
+  // torch.compile will force all input tensors to be contiguous(), which
+  // will break many custom ops that require column-major weight matrices.
+  // TODO: remove this for PyTorch 2.8, when the default is planned to switch
+  // to match exact eager-mode strides.
+  at::Tag stride_tag = at::Tag::needs_fixed_stride_order;
 
   // Attention ops
   // Compute the attention between an input query and the cached keys/values
@@ -136,7 +144,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "cutlass_scaled_mm(Tensor! out, Tensor a,"
       "                  Tensor b, Tensor a_scales,"
-      "                  Tensor b_scales, Tensor? bias) -> ()");
+      "                  Tensor b_scales, Tensor? bias) -> ()",
+      {stride_tag});
   ops.impl("cutlass_scaled_mm", torch::kCPU, &int8_scaled_mm);
   // w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
   // quantization.
@@ -144,7 +153,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "cutlass_scaled_mm_azp(Tensor! out, Tensor a,"
       "                  Tensor b, Tensor a_scales,"
       "                  Tensor b_scales, Tensor azp_adj,"
-      "                  Tensor? azp, Tensor? bias) -> ()");
+      "                  Tensor? azp, Tensor? bias) -> ()",
+      {stride_tag});
   ops.impl("cutlass_scaled_mm_azp", torch::kCPU, &int8_scaled_mm_azp);
 #endif
 
@@ -160,8 +170,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "()");
   ops.impl("shm_gather", torch::kCPU, &shm_gather);
   ops.def(
-    "shm_all_gather(int handle, Tensor data, Tensor! output) -> "
-    "()");
+      "shm_all_gather(int handle, Tensor data, Tensor! output) -> "
+      "()");
   ops.impl("shm_all_gather", torch::kCPU, &shm_all_gather);
   ops.def(
       "shm_send_tensor_list(int handle, Tensor[](a) tensor_list, int dst) -> "
