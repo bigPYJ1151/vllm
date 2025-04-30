@@ -42,6 +42,26 @@ void shm_send_tensor_list(int64_t handle,
 
 std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src);
 
+// attention
+void decode_attention_cpu(at::Tensor& query, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& output,
+    at::Tensor& key, at::Tensor& value, at::Tensor& loc, at::Tensor& attn_logits,
+    at::Tensor& req_to_token, at::Tensor& req_pool_indices, at::Tensor& seq_lens,
+    double sm_scale, double logit_cap);
+
+void extend_attention_cpu(at::Tensor& q_extend, at::Tensor& k_extend, at::Tensor& v_extend,
+    at::Tensor& o_extend, at::Tensor& k_buffer, at::Tensor& v_buffer,
+    at::Tensor& req_to_token, at::Tensor& req_pool_indices, at::Tensor& seq_lens,
+    at::Tensor& extend_seq_lens, at::Tensor& extend_start_loc,
+    int64_t max_len_extend, double sm_scale, double logit_cap);
+
+void set_kv_buffer(
+    at::Tensor& k_buffer,
+    at::Tensor& v_buffer,
+    at::Tensor& key,
+    at::Tensor& value,
+    at::Tensor& loc
+);
+
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
 
@@ -173,6 +193,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("shm_send_tensor_list", torch::kCPU, &shm_send_tensor_list);
   ops.def("shm_recv_tensor_list(int handle, int src) -> Tensor[](a)",
           &shm_recv_tensor_list);
+#endif
+
+
+#if defined (__AVX512BF16__) && defined (__AVX512F__) && defined (__AVX512VNNI__)
+  ops.def("decode_attention_cpu(Tensor! query, Tensor! k_cache, Tensor! v_cache, Tensor! output, Tensor! key, Tensor! value, Tensor! loc, Tensor! attn_logits, Tensor! req_to_token, Tensor! req_pool_indices, Tensor! seq_lens, float sm_scale, float logit_cap) -> ()");
+  ops.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
+  ops.def("extend_attention_cpu(Tensor! q_extend, Tensor! k_extend, Tensor! v_extend, Tensor! o_extend, Tensor! k_buffer, Tensor! v_buffer, Tensor! req_to_token, Tensor! req_pool_indices, Tensor! seq_lens, Tensor! extend_seq_lens, Tensor! extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
+  ops.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
+  ops.def("set_kv_buffer(Tensor! k_buffer, Tensor! v_buffer, Tensor! key, Tensor! value, Tensor! loc) -> ()");
+  ops.impl("set_kv_buffer", torch::kCPU, &set_kv_buffer);
 #endif
 }
 

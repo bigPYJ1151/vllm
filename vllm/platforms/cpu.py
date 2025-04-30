@@ -37,16 +37,24 @@ class CpuPlatform(Platform):
                              dtype: torch.dtype, kv_cache_dtype: Optional[str],
                              block_size: int, use_v1: bool,
                              use_mla: bool) -> str:
-        if selected_backend and selected_backend != _Backend.TORCH_SDPA:
+        if selected_backend and selected_backend not in [_Backend.TORCH_SDPA, _Backend.INTEL_AMX]:
             logger.info("Cannot use %s backend on CPU.", selected_backend)
         if use_mla:
             logger.info("Using CPU MLA backend.")
             return "vllm.attention.backends.cpu_mla.CPUMLABackend"
-        logger.info("Using Torch SDPA backend.")
-        if use_v1:
-            return "vllm.v1.attention.backends.cpu_attn.TorchSDPABackend"
-        else:
-            return "vllm.attention.backends.torch_sdpa.TorchSDPABackend"
+        
+        if selected_backend == _Backend.TORCH_SDPA:
+            logger.info("Using Torch SDPA backend.")
+            if use_v1:
+                return "vllm.v1.attention.backends.torch_sdpa.TorchSDPABackend"
+            else:
+                return "vllm.attention.backends.torch_sdpa.TorchSDPABackend"
+        elif selected_backend == _Backend.INTEL_AMX:
+            logger.info("Using Intel AMX backend.")
+            if use_v1:
+                return "vllm.v1.attention.backends.intel_amx.IntelAMXBackend"
+            else:
+                raise RuntimeError("Intel AMX backend requires V1 support")
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
