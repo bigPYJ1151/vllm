@@ -7,9 +7,8 @@
 
 namespace {
 #define MAX_SHM_RANK_NUM 8
-#define MAX_THREAD_NUM 12
-#define PER_THREAD_SHM_BUFFER_BYTES (4 * 1024 * 1024)
-#define MIN_THREAD_PROCESS_SIZE (8 * 1024)
+#define PER_THREAD_SHM_BUFFER_BYTES (2 * 1024 * 1024)
+#define MIN_THREAD_PROCESS_SIZE (256)
 #define MAX_P2P_SEND_TENSOR_NUM 8
 
 template <typename scalar_t>
@@ -162,7 +161,7 @@ class SHMManager {
                       const int group_size)
       : _rank(rank),
         _group_size(group_size),
-        _thread_num(std::min(torch::get_num_threads(), MAX_THREAD_NUM)),
+        _thread_num(torch::get_num_threads()),
         _shm_names({""}),
         _shared_mem_ptrs({nullptr}),
         _shm_ctx(nullptr) {
