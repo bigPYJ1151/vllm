@@ -1366,3 +1366,11 @@ def flash_mla_with_kvcache(
         num_splits,
     )
     return out, softmax_lse
+
+if hasattr(torch.ops._C, "weight_packed_linear"):
+    @register_fake("_C::weight_packed_linear")
+    def weight_packed_linear_fake(mat1: torch.Tensor, mat2: torch.Tensor, bias: Optional[torch.Tensor], 
+                        is_vnni: bool) -> torch.Tensor:
+        return torch.empty((mat1.size(0), mat2.size(0)),
+                           dtype=mat1.dtype,
+                           device=mat2.device) 

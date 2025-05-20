@@ -26,6 +26,8 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            RowvLLMParameter)
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
+from vllm import envs
 
 logger = init_logger(__name__)
 
@@ -183,12 +185,32 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+        self._linear_method = UnquantizedLinearMethod._default_linear
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if current_platform.is_cpu() and envs.VLLM_CPU_SGL_KERNEL:
+            if torch._C._cpu._is_amx_tile_supported():
+                self._linear_method = UnquantizedLinearMethod._cpu_sgl_linear
+                packed_weight = torch.ops._C.convert_weight_packed(layer.weight)    
+                assert packed_weight.size() == layer.weight.size()
+                layer.weight.copy_(packed_weight)
+            else:
+                logger.warning("CPU SGL kernels require Intel AMX support.")
+
+    @staticmethod
+    def _cpu_sgl_linear(layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return torch.ops._C.weight_packed_linear(x, layer.weight, bias, True) 
+
+    @staticmethod
+    def _default_linear(layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return F.linear(x, layer.weight, bias)
+
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        return F.linear(x, layer.weight, bias)
+        return self._linear_method(layer, x, bias)
 
 
 class LinearBase(torch.nn.Module):

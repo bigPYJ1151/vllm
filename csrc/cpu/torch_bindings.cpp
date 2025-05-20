@@ -38,6 +38,11 @@ void shm_send_tensor_list(int64_t handle,
 
 std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src);
 
+at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias, bool is_vnni);
+
+at::Tensor convert_weight_packed(at::Tensor& weight);
+
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
 
@@ -179,6 +184,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("shm_send_tensor_list", torch::kCPU, &shm_send_tensor_list);
   ops.def("shm_recv_tensor_list(int handle, int src) -> Tensor[](a)",
           &shm_recv_tensor_list);
+#endif
+
+  // sgl-kernels
+#if defined (__AVX512BF16__) && defined (__AVX512F__) && defined (__AVX512VNNI__)
+  ops.def("weight_packed_linear(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!)? bias, bool is_vnni) -> Tensor");
+  ops.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
+  ops.def("convert_weight_packed(Tensor! weight) -> Tensor");
+  ops.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed);
 #endif
 }
 
