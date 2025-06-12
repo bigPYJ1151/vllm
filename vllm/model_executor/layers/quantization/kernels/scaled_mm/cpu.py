@@ -35,7 +35,7 @@ class CPUScaledMMLinearKernel(ScaledMMLinearKernel):
         replace_parameter(
             layer, self.w_q_name,
             torch.nn.Parameter(packed_weight, requires_grad=False))
-
+        assert layer.params_dtype == torch.bfloat16, "CPUScaledMMLinearKernel only supports bfloat16 output type."
         if layer.bias is not None:
             layer.bias = torch.nn.Parameter(layer.bias.to(torch.float32),
                         requires_grad=False) 
