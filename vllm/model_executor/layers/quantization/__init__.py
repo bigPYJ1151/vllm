@@ -34,6 +34,7 @@ QuantizationMethods = Literal[
     "moe_wna16",
     "torchao",
     "auto-round",
+    "deepseek_w8a8",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -111,6 +112,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .qqq import QQQConfig
     from .torchao import TorchAOConfig
     from .tpu_int8 import Int8TpuConfig
+    from .deepseek_w8a8 import DeepSeekW8A8Config
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "aqlm": AQLMConfig,
@@ -141,6 +143,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,
         "auto-round": AutoRoundConfig,
+        "deepseek_w8a8": DeepSeekW8A8Config,
     }
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)

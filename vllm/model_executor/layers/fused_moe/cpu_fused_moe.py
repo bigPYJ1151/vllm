@@ -51,7 +51,9 @@ class IPEXFusedMOE:
 class SGLFusedMOE:
 
     def __init__(self, layer: torch.nn.Module) -> None:
-        pass
+        self.w13_weight_scale = getattr(layer, "w13_weight_scale", None)
+        self.w2_weight_scale = getattr(layer, "w2_weight_scale", None)
+        self.use_w8a8 = self.w13_weight_scale is not None and self.w2_weight_scale is not None
 
     @staticmethod
     def _grouped_topk(
@@ -196,10 +198,10 @@ class SGLFusedMOE:
             topk_weights,
             topk_ids,
             True,
+            self.use_w8a8,
             False,
-            False,
-            None,
-            None,
+            self.w13_weight_scale,
+            self.w2_weight_scale,
             None,
             None,
             None,
