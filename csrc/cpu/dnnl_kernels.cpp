@@ -483,3 +483,50 @@ void dynamic_scaled_int8_quant(
         }
       });
 }
+
+int64_t create_onednn_mm_handler(const torch::Tensor& b,
+                                 const std::optional<torch::Tensor>& bias,
+                                 int64_t primitive_cache_size) {
+  TORCH_CHECK(b.dim() == 2);
+
+  MatMulPrimitiveHandler::Args args;
+  args.primitive_cache_size = primitive_cache_size;
+
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->is_contiguous());
+    args.use_bias = true;
+    args.bias_ptr = bias->data_ptr<float>();
+  } else {
+    args.use_bias = false;
+  }
+
+  args.b_k_size = b.size(0);
+  args.b_k_stride = b.stride(0);
+  args.b_n_size = b.size(1);
+  args.b_n_stride = b.stride(1);
+  args.b_ptr = b.data_ptr();
+
+  VLLM_DISPATCH_FLOATING_TYPES(b.scalar_type(), "create_onednn_mm_handler",
+                               [&] {
+                                 args.c_type = get_dnnl_type<scalar_t>();
+                                 args.ab_type = get_dnnl_type<scalar_t>();
+                               });
+
+  return reinterpret_cast<int64_t>(new MatMulPrimitiveHandler(args));
+}
+
+void onednn_mm(torch::Tensor& c,        // [M, OC], row-major
+               const torch::Tensor& a,  // [M, IC], row-major
+               int64_t handler) {
+  CPU_KERNEL_GUARD_IN(onednn_mm)
+  TORCH_CHECK(a.dim() == 2);
+  TORCH_CHECK(a.stride(-1) == 1);
+  TORCH_CHECK(c.is_contiguous());
+  MatMulPrimitiveHandler* ptr =
+      reinterpret_cast<MatMulPrimitiveHandler*>(handler);
+
+  VLLM_DISPATCH_FLOATING_TYPES(a.scalar_type(), "onednn_mm", [&] {
+    ptr->execute(a.data_ptr<scalar_t>(), a.size(0), a.stride(0),
+                 c.data_ptr<scalar_t>());
+  });
+}

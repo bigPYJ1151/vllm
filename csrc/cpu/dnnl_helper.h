@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <cassert>
+
 #include "oneapi/dnnl/dnnl.hpp"
 
 namespace c10 {
@@ -142,7 +143,7 @@ class W8A8MatMulPrimitiveHandler : public DNNLMatMulPrimitiveHandler {
 
  private:
   dnnl::matmul::primitive_desc create_primitive_desc(int64_t a_m_size,
-                                                     bool fisrt_time);
+                                                     bool first_time);
 
   void init_runtime_memory_cache(const Args& args);
 
@@ -152,6 +153,45 @@ class W8A8MatMulPrimitiveHandler : public DNNLMatMulPrimitiveHandler {
   const bool use_azp_;
   const QuantizationStrategy a_qs_;
   const QuantizationStrategy b_qs_;
+  std::shared_ptr<MSizeCache> m_size_cache_;
+};
+
+class MatMulPrimitiveHandler : public DNNLMatMulPrimitiveHandler {
+ public:
+  struct Args : public DNNLMatMulPrimitiveHandler::Args {
+    dnnl::memory::data_type ab_type;
+  };
+
+  struct ClassMatmulCacheKey {
+    dnnl_dim_t b_n_size;
+    dnnl_dim_t b_k_size;
+    bool use_bias;
+
+    friend bool operator==(const ClassMatmulCacheKey& l,
+                           const ClassMatmulCacheKey& r);
+  };
+
+  using MSizeCacheKey = std::pair<dnnl_dim_t, dnnl_dim_t>;
+  using MSizeCache = DNNLPrimitiveCache<MSizeCacheKey, dnnl::matmul>;
+  using ClassMatmulCache =
+      DNNLPrimitiveCache<ClassMatmulCacheKey, std::shared_ptr<MSizeCache>>;
+
+ public:
+  MatMulPrimitiveHandler(const Args& args);
+
+  void execute(const void* a, dnnl_dim_t a_m_size, dnnl_dim_t a_m_stride,
+               void* c);
+
+ private:
+  dnnl::matmul::primitive_desc create_primitive_desc(int64_t a_m_size,
+                                                     int64_t a_m_stride,
+                                                     bool first_time);
+
+  void init_runtime_memory_cache(const Args& args);
+
+  dnnl::matmul get_matmul_cache(dnnl_dim_t a_m_size, dnnl_dim_t a_m_stride);
+
+ private:
   std::shared_ptr<MSizeCache> m_size_cache_;
 };
 

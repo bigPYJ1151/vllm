@@ -1846,6 +1846,8 @@ if hasattr(torch.ops._C, "int8_scaled_mm_with_quant"):
 class CPUDNNLGEMMHandler:
 
     def __init__(self) -> None:
+        self.n = -1
+        self.k = -1
         self.handler: Optional[int] = None
 
     def __del__(self):
@@ -1853,8 +1855,30 @@ class CPUDNNLGEMMHandler:
             torch.ops._C.release_dnnl_matmul_handler(self.handler)
 
 
+def create_onednn_mm(
+    weight: torch.Tensor,  # [K, N]
+    bias: Optional[torch.Tensor],
+    primitive_cache_size: int = 128,
+) -> CPUDNNLGEMMHandler:
+    handler = CPUDNNLGEMMHandler()
+    handler.k, handler.n = weight.size()
+    handler.handler = torch.ops._C.create_onednn_mm_handler(
+        weight, bias, primitive_cache_size)
+    return handler
+
+
+def onednn_mm(
+    dnnl_handler: CPUDNNLGEMMHandler,
+    x: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    torch.ops._C.onednn_mm(output, x, dnnl_handler.handler)
+
+    return output
+
+
 def create_onednn_scaled_mm(
-    weight: torch.Tensor,
+    weight: torch.Tensor,  # [K, N]
     weight_scales: torch.Tensor,
     output_type: torch.dtype,
     dynamic_quant: bool,
@@ -1863,6 +1887,7 @@ def create_onednn_scaled_mm(
     primitive_cache_size: int = 128,
 ) -> CPUDNNLGEMMHandler:
     handler = CPUDNNLGEMMHandler()
+    handler.k, handler.n = weight.size()
     handler.handler = torch.ops._C.create_onednn_scaled_mm_handler(
         weight, weight_scales, output_type, dynamic_quant, use_azp, bias,
         primitive_cache_size)

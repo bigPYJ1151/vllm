@@ -142,20 +142,49 @@ direct_register_custom_op(
 )
 
 
-def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype):
+def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     return (torch._C._cpu._is_amx_tile_supported()
             and (dtype in (torch.bfloat16, torch.int8)) and k % 32 == 0
             and n % 16 == 0)
+
+
+def dispatch_cpu_unquantized_gemm(
+    layer: torch.nn.Module,
+    remove_weight: bool,
+) -> None:
+    if (not getattr(layer, "skip_bias_add", False)
+            and getattr(layer, "bias", None) is not None):
+        if remove_weight:
+            layer.bias = None
+        bias = layer.bias.to(torch.float32)
+    else:
+        bias = None
+
+    if envs.VLLM_CPU_SGL_KERNEL:
+        N, K = layer.weight.size()
+        dtype = layer.weight.dtype
+        if check_cpu_sgl_kernel(N, K, dtype):
+            packed_weight = torch.ops._C.convert_weight_packed(layer.weight)
+            layer.cpu_linear = lambda x: torch.ops._C.weight_packed_linear(
+                x, packed_weight, bias, True)
+            if remove_weight:
+                layer.weight = None
+            return
+
+    weight = layer.weight
+    if remove_weight:
+        layer.weight = None
+    handler = ops.create_onednn_mm(weight.t(), bias, 32)
+    layer.cpu_linear = lambda x: ops.onednn_mm(
+        handler, x, torch.empty((x.size(0), handler.n), dtype=x.dtype))
+    return
 
 
 def cpu_unquantized_gemm(layer: torch.nn.Module,
                          x: torch.Tensor,
                          weight: torch.Tensor,
                          bias: Optional[torch.Tensor] = None):
-    if getattr(layer, "use_cpu_sgl", False):
-        return torch.ops._C.weight_packed_linear(x, weight, bias, True)
-    else:
-        return torch.nn.functional.linear(x, weight, bias)
+    return layer.cpu_linear(x)
 
 
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
