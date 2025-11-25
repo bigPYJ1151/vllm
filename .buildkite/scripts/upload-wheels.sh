@@ -59,22 +59,30 @@ if [[ $version == *cpu* ]]; then
 fi
 
 # generate index for this commit
-aws s3 cp "$wheel" "s3://vllm-wheels/$BUILDKITE_COMMIT/"
-aws s3 cp "$normal_wheel" "s3://vllm-wheels/$BUILDKITE_COMMIT/"
+# aws s3 cp "$wheel" "s3://vllm-wheels/$BUILDKITE_COMMIT/"
+# aws s3 cp "$normal_wheel" "s3://vllm-wheels/$BUILDKITE_COMMIT/"
+echo "$wheel" 
+echo "s3://vllm-wheels/$BUILDKITE_COMMIT/"
+echo "$normal_wheel"
+echo "s3://vllm-wheels/$BUILDKITE_COMMIT/"
 
 if [[ $normal_wheel == *"cu129"* || $normal_wheel == *"cpu"* ]]; then
     # only upload index.html for cu129 wheels (default wheels) as it
     # is available on both x86 and arm64
     # also upload cpu wheels as is available on both x86 and arm64
-    aws s3 cp index.html "s3://vllm-wheels/$BUILDKITE_COMMIT/vllm/index.html"
-    aws s3 cp "s3://vllm-wheels/nightly/index.html" "s3://vllm-wheels/$BUILDKITE_COMMIT/index.html"
+    # aws s3 cp index.html "s3://vllm-wheels/$BUILDKITE_COMMIT/vllm/index.html"
+    # aws s3 cp "s3://vllm-wheels/nightly/index.html" "s3://vllm-wheels/$BUILDKITE_COMMIT/index.html"
+    echo index.html
+    echo "s3://vllm-wheels/$BUILDKITE_COMMIT/vllm/index.html"
+    echo "s3://vllm-wheels/nightly/index.html"
+    echo "s3://vllm-wheels/$BUILDKITE_COMMIT/index.html"
 else
     echo "Skipping index files for non-cu129, non-cpu wheels"
 fi
 
 # generate index for nightly
-aws s3 cp "$wheel" "s3://vllm-wheels/nightly/"
-aws s3 cp "$normal_wheel" "s3://vllm-wheels/nightly/"
+# aws s3 cp "$wheel" "s3://vllm-wheels/nightly/"
+# aws s3 cp "$normal_wheel" "s3://vllm-wheels/nightly/"
 
 if [[ $normal_wheel == *"cu129"* ]]; then
     # only upload index.html for cu129 wheels (default wheels) as it
@@ -84,5 +92,9 @@ else
     echo "Skipping index files for non-cu129 wheels"
 fi
 
-aws s3 cp "$wheel" "s3://vllm-wheels/$version/"
-aws s3 cp index.html "s3://vllm-wheels/$version/vllm/index.html"
+# aws s3 cp "$wheel" "s3://vllm-wheels/$version/"
+# aws s3 cp index.html "s3://vllm-wheels/$version/vllm/index.html"
+echo "$wheel"
+echo "s3://vllm-wheels/$version/"
+echo index.html
+echo "s3://vllm-wheels/$version/vllm/index.html"
