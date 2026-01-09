@@ -51,6 +51,7 @@ if __name__ == "__main__":
     Bandwidth_G = Mems / duration_ns
 
     print(
-        f"AWQ Gemm, duration: {duration_ns}, FLOPs: {FLOPs}, Mems: {Mems},"
+        f"AWQ Gemm, duration: {duration_ns}, "
+        f"FLOPs: {FLOPs}, Mems: {Mems},"
         f" FLOPS: {FLOPS_G}, Bandwidth: {Bandwidth_G}"
     )
