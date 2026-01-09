@@ -14,7 +14,7 @@ if __name__ == "__main__":
     N = 9728
     K = 2560
     OUTER_iteration = 1
-    Iteration = 1024 * 1
+    Iteration = 1024 * 32
 
     assert N % 32 == 0
     assert K % 32 == 0

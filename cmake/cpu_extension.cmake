@@ -41,6 +41,9 @@ else()
         "-DVLLM_CPU_EXTENSION")
 endif()
 
+list(APPEND CXX_COMPILE_FLAGS
+    "-fno-omit-frame-pointer")
+
 if (NOT MACOSX_FOUND)
     execute_process(COMMAND cat /proc/cpuinfo
                     RESULT_VARIABLE CPUINFO_RET

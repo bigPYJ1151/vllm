@@ -184,7 +184,7 @@ void cpu_gemm_wna16_impl(
   alignas(64) cpu_utils::Counter counter;
   cpu_utils::Counter* counter_ptr = &counter;
 
-#pragma omp parallel for schedule(static, 1)
+  // #pragma omp parallel for schedule(static, 1)
   for (int32_t thread_id = 0; thread_id < thread_num; ++thread_id) {
     scalar_t* __restrict__ b_buffer = nullptr;
     float* __restrict__ c_buffer = nullptr;
