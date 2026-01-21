@@ -2,12 +2,13 @@
 #include "cpu/utils.hpp"
 #include "cpu/micro_gemm/cpu_micro_gemm_vec.hpp"
 #include "cpu/cpu_arch_macros.h"
+#include "cpu/quant_utils.hpp"
 
 #ifdef CPU_CAPABILITY_AMXBF16
   #include "cpu/micro_gemm/cpu_micro_gemm_amx.hpp"
   #define AMX_DISPATCH(...)                                                    \
     case cpu_utils::ISA::AMX: {                                                \
-      using gemm_t = cpu_micro_gemm::MicroGemm<cpu_utils::ISA::AMX, scalar_t>; \
+      constexpr cpu_utils::ISA isa_t = cpu_utils::ISA::AMX; \
       return __VA_ARGS__();                                                    \
     }
 #else
@@ -19,8 +20,7 @@
     switch (ISA_TYPE) {                                               \
       AMX_DISPATCH(__VA_ARGS__)                                       \
       case cpu_utils::ISA::VEC: {                                     \
-        using gemm_t =                                                \
-            cpu_micro_gemm::MicroGemm<cpu_utils::ISA::VEC, scalar_t>; \
+        constexpr cpu_utils::ISA isa_t = cpu_utils::ISA::VEC; \
         return __VA_ARGS__();                                         \
       }                                                               \
       default: {                                                      \
@@ -138,10 +138,10 @@ void prepack_moe_weight_impl(scalar_t* __restrict__ weight_ptr,
   }
 }
 
-template <typename scalar_t, typename w_t, typename gemm_t>
+template <typename scalar_t, typename w_t, typename gemm_t, typename weight_processor_t>
 void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
                     w_t* __restrict__ w13, w_t* __restrict__ w2,
-                    w_t* __restrict__ w13_bias, w_t* __restrict__ w2_bias,
+                    scalar_t* __restrict__ w13_bias, scalar_t* __restrict__ w2_bias,
                     float* __restrict__ topk_weights,
                     int32_t* __restrict__ topk_id, FusedMOEAct act_type,
                     const int32_t token_num, const int32_t expert_num,
@@ -152,7 +152,10 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
   constexpr int32_t gemm_n_tile_size = gemm_t::NSize;
   constexpr int32_t gemm_m_tile_size = gemm_t::MaxMSize;
   constexpr int32_t min_w13_n_tile_size = 2 * gemm_n_tile_size;
-  static_assert(gemm_n_tile_size % 16 == 0);
+  constexpr int32_t weight_prepack_n_block_size = weight_processor_t::OUTPUT_BLOCK_SIZE;
+  constexpr int32_t weight_pack_factor = weight_processor_t::WEIGHT_PACK_FACTOR;
+  static_assert(gemm_n_tile_size % weight_prepack_n_block_size == 0);
+  constexpr bool is_mixed_precision = !std::is_same_v<scalar_t, w_t>;
 
   TORCH_CHECK_EQ(output_size_13 % min_w13_n_tile_size, 0);
   TORCH_CHECK_EQ(output_size_2 % gemm_n_tile_size, 0);
@@ -194,6 +197,7 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
   // allocate buffers
   int32_t common_buffer_offset = 0;
   int32_t w13_thread_buffer_offset = 0;
+  int32_t w2_thread_buffer_offset = 0;
   int32_t ws_thread_buffer_offset = 0;
 
   // common buffers
@@ -236,15 +240,29 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
   const int32_t w13_output_buffer_offset = w13_thread_buffer_offset;
   w13_thread_buffer_offset += w13_output_buffer_size;
 
+  const int32_t w13_weight_buffer_size = is_mixed_precision ? cpu_utils::round_up<64>(
+    w13_n_tile_size * input_size_13 * sizeof(scalar_t)
+  ) : 0;
+  const int32_t w13_weight_buffer_offset = w13_thread_buffer_offset;
+  w13_thread_buffer_offset += w13_weight_buffer_size;
+
+  // w2 GEMM thread buffers
+  const int32_t w2_weight_buffer_size = is_mixed_precision ? cpu_utils::round_up<64>(
+    w2_n_tile_size * input_size_2 * sizeof(scalar_t)
+  ) : 0; 
+  const int32_t w2_weight_buffer_offset = w2_thread_buffer_offset;
+  w2_thread_buffer_offset += w2_weight_buffer_size;
+
   // Weighted sum thread buffer
   const int32_t ws_output_buffer_size =
       cpu_utils::round_up<64>(output_size_2 * sizeof(float));
   const int32_t ws_output_buffer_offset = ws_thread_buffer_offset;
   ws_thread_buffer_offset += ws_output_buffer_size;
 
+  const int32_t max_thread_buffer_size = std::max(std::max(w13_thread_buffer_offset, w2_thread_buffer_offset), ws_thread_buffer_offset);
   const int32_t buffer_size =
       common_buffer_offset +
-      std::max(w13_thread_buffer_offset, ws_thread_buffer_offset) * thread_num;
+      max_thread_buffer_size * thread_num;
   cpu_utils::ScratchPadManager::get_scratchpad_manager()->realloc(buffer_size);
   uint8_t* common_buffer_start =
       cpu_utils::ScratchPadManager::get_scratchpad_manager()
@@ -303,7 +321,7 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
       const int32_t task_num = task_num_per_expert * expert_num;
 
       uint8_t* __restrict__ thread_buffer =
-          thread_buffer_start + thread_id * w13_thread_buffer_offset;
+          thread_buffer_start + thread_id * max_thread_buffer_size;
       scalar_t* __restrict__ w13_input_buffer =
           reinterpret_cast<scalar_t*>(thread_buffer + w13_input_buffer_offset);
       float* __restrict__ w13_output_buffer =
@@ -311,11 +329,14 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
       scalar_t* __restrict__ w13_gemm_output_buffer =
           reinterpret_cast<scalar_t*>(common_buffer_start +
                                       w13_gemm_output_buffer_offset);
+      scalar_t* __restrict__ w13_gemm_weight_buffer =
+          reinterpret_cast<scalar_t*>(thread_buffer +
+                                      w13_weight_buffer_size);
 
       gemm_t gemm;
 
       const int32_t input_size_13_bytes = input_size_13 * sizeof(scalar_t);
-      const int32_t w13_n_group_stride = 16 * input_size_13;
+      const int32_t w13_n_group_stride = weight_prepack_n_block_size * input_size_13;
       const int32_t w13_n_tile_stride = gemm_n_tile_size * input_size_13;
 
       for (;;) {
@@ -344,33 +365,44 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
                 (output_size_13 / 2) +
             curr_output_group_id * w13_n_tile_size / 2;
 
-        w_t* __restrict__ w13_weight_ptr_0 = nullptr;
-        w_t* __restrict__ w13_weight_ptr_1 = nullptr;
-        w_t* __restrict__ w13_bias_ptr_0 = nullptr;
-        w_t* __restrict__ w13_bias_ptr_1 = nullptr;
+        w_t* __restrict__ raw_w13_weight_ptr_0 = nullptr;
+        w_t* __restrict__ raw_w13_weight_ptr_1 = nullptr;
+        scalar_t* __restrict__ w13_bias_ptr_0 = nullptr;
+        scalar_t* __restrict__ w13_bias_ptr_1 = nullptr;
         if (act_type == FusedMOEAct::SwigluOAIAndMul) {
           // For SwigluOAIAndMul, up and down weights are interleaved
-          w13_weight_ptr_0 =
-              w13 + curr_expert_id * input_size_13 * output_size_13 +
-              curr_output_group_id * w13_n_tile_size * input_size_13;
-          w13_weight_ptr_1 =
-              w13_weight_ptr_0 + actual_n_tile_size / 2 * input_size_13;
+          raw_w13_weight_ptr_0 =
+              w13 + (curr_expert_id * input_size_13 * output_size_13 +
+              curr_output_group_id * w13_n_tile_size * input_size_13) / weight_pack_factor;
+          raw_w13_weight_ptr_1 =
+              raw_w13_weight_ptr_0 + (actual_n_tile_size / 2 * input_size_13) / weight_pack_factor;
           if (w13_bias != nullptr) {
             w13_bias_ptr_0 = w13_bias + curr_expert_id * output_size_13 +
                              curr_output_group_id * w13_n_tile_size;
             w13_bias_ptr_1 = w13_bias_ptr_0 + actual_n_tile_size / 2;
           }
         } else {
-          w13_weight_ptr_0 =
-              w13 + curr_expert_id * input_size_13 * output_size_13 +
-              curr_output_group_id * (w13_n_tile_size / 2) * input_size_13;
-          w13_weight_ptr_1 =
-              w13_weight_ptr_0 + output_size_13 / 2 * input_size_13;
+          raw_w13_weight_ptr_0 =
+              w13 + (curr_expert_id * input_size_13 * output_size_13 +
+              curr_output_group_id * (w13_n_tile_size / 2) * input_size_13) / weight_pack_factor;
+          raw_w13_weight_ptr_1 =
+              raw_w13_weight_ptr_0 + (output_size_13 / 2 * input_size_13) / weight_pack_factor;
           if (w13_bias != nullptr) {
             w13_bias_ptr_0 = w13_bias + curr_expert_id * output_size_13 +
                              curr_output_group_id * (w13_n_tile_size / 2);
             w13_bias_ptr_1 = w13_bias_ptr_0 + output_size_13 / 2;
           }
+        }
+
+        scalar_t* __restrict__ w13_weight_ptr_0 = nullptr;
+        scalar_t* __restrict__ w13_weight_ptr_1 = nullptr;
+
+        if constexpr (is_mixed_precision) {
+        // dequant
+        } else {
+        // use raw ptr
+            w13_weight_ptr_0 = raw_w13_weight_ptr_0;
+            w13_weight_ptr_1 = raw_w13_weight_ptr_1;
         }
 
         scalar_t* __restrict__ curr_w13_input_buffer = w13_input_buffer;
@@ -481,6 +513,11 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
       float* __restrict__ w2_gemm_output_buffer = reinterpret_cast<float*>(
           common_buffer_start + w2_gemm_output_buffer_offset);
 
+      uint8_t* __restrict__ thread_buffer =
+          thread_buffer_start + thread_id * max_thread_buffer_size;
+      scalar_t* __restrict__ w2_weight_buffer =
+          reinterpret_cast<scalar_t*>(thread_buffer + w2_weight_buffer_offset);
+
       gemm_t gemm;
 
       const int32_t w2_n_tile_stride = gemm_n_tile_size * input_size_2;
@@ -510,13 +547,21 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
             w2_gemm_output_buffer +
             cu_token_num_per_group_buffer[curr_expert_id] * output_size_2 +
             curr_output_group_id * w2_n_tile_size;
-        scalar_t* __restrict__ w2_weight_ptr =
-            w2 + curr_expert_id * output_size_2 * input_size_2 +
-            curr_output_group_id * w2_n_tile_size * input_size_2;
+        w_t* __restrict__ raw_w2_weight_ptr =
+            w2 + (curr_expert_id * output_size_2 * input_size_2 +
+            curr_output_group_id * w2_n_tile_size * input_size_2) / weight_pack_factor;
         scalar_t* __restrict__ w2_bias_ptr = nullptr;
         if (w2_bias != nullptr) {
           w2_bias_ptr = w2_bias + curr_expert_id * output_size_2 +
                         curr_output_group_id * w2_n_tile_size;
+        }
+
+        scalar_t* __restrict__ w2_weight_ptr = nullptr;
+        if constexpr (is_mixed_precision) {
+            // dequant
+        } else {
+            // use raw ptr
+            w2_weight_ptr = raw_w2_weight_ptr;
         }
 
         for (int32_t token_idx = 0; token_idx < curr_token_num;
@@ -678,6 +723,7 @@ void prepack_moe_weight(
   VLLM_DISPATCH_FLOATING_TYPES(
       weight.scalar_type(), "prepack_moe_weight", [&]() {
         CPU_ISA_DISPATCH_IMPL(isa_type, [&]() {
+          using gemm_t = cpu_micro_gemm::MicroGemm<isa_t, scalar_t>; 
           scalar_t* weight_ptr = weight.data_ptr<scalar_t>();
           scalar_t* packed_weight_ptr = packed_weight.data_ptr<scalar_t>();
           prepack_moe_weight_impl<scalar_t, gemm_t>(
@@ -687,6 +733,45 @@ void prepack_moe_weight(
       });
 }
 
+void prepack_moe_weight_mxfp4(
+    const torch::Tensor& weight,  // [expert_num, output_size, input_size // 8], int32
+    torch::Tensor& packed_weight, // [expert_num, output_size, input_size // 8], int32
+    const torch::Tensor& scale, // [expert_num, output_size, input_size // 32], uint8
+    torch::Tensor& packed_scale, // [expert_num, output_size, input_size // 32], uint8
+    const std::string& isa) {
+  TORCH_CHECK(weight.is_contiguous());
+  const int32_t expert_num = weight.size(0);
+  const int32_t output_size = weight.size(1);
+  const int32_t input_size = weight.size(2) * 8;
+  const int64_t weight_expert_stride = weight.stride(0);
+  const int64_t weight_output_stride = weight.stride(1);
+  const int64_t scale_expert_stride = scale.stride(0);
+  const int64_t scale_output_stride = scale.stride(1);
+  cpu_utils::ISA isa_type = cpu_utils::get_isa(isa);
+
+  int32_t* __restrict__ weight_ptr = weight.data_ptr<int32_t>();
+  uint8_t* __restrict__ scale_ptr = scale.data_ptr<uint8_t>();
+  int32_t* __restrict__ packed_weight_ptr = packed_weight.data_ptr<int32_t>();
+  uint8_t* __restrict__ packed_scale_ptr = packed_scale.data_ptr<uint8_t>();
+
+    CPU_ISA_DISPATCH_IMPL(isa_type, [&]() {
+        using weight_processor_t = cpu_quant_utils::WeightProcessor<cpu_quant_utils::QuantMethod::MXFP4, isa_t>;
+        constexpr int32_t OUTPUT_BLOCK_SIZE = weight_processor_t::OUTPUT_BLOCK_SIZE;
+        TORCH_CHECK_EQ(output_size % OUTPUT_BLOCK_SIZE, 0);
+        for (int32_t expert_id = 0; expert_id < expert_num; ++expert_id) {
+            // weight: [output_size, input_size // 8] -> [output_size // OUTPUT_BLOCK_SIZE, input_size // 8, OUTPUT_BLOCK_SIZE]
+            // scale: [output_size, input_size // 32] -> [output_size // OUTPUT_BLOCK_SIZE, input_size // 32, OUTPUT_BLOCK_SIZE]
+            for (int32_t output_offset = 0; output_offset < output_size; output_offset += OUTPUT_BLOCK_SIZE) {
+                weight_processor_t weight_processor;
+                int32_t* __restrict__ curr_weight_ptr = weight_ptr + expert_id * weight_expert_stride + output_offset * weight_output_stride;
+                int32_t* __restrict__ curr_packed_weight_ptr = packed_weight_ptr + expert_id * weight_expert_stride + output_offset * weight_output_stride;
+                uint8_t* __restrict__ curr_scale_ptr = scale_ptr + expert_id * scale_expert_stride + output_offset * scale_output_stride;
+                uint8_t* __restrict__ curr_packed_scale_ptr = packed_scale_ptr + expert_id * scale_expert_stride + output_offset * scale_output_stride;
+                weight_processor.prepack(curr_weight_ptr, curr_scale_ptr, (void*)0, curr_packed_weight_ptr, curr_packed_scale_ptr, (void*)0, input_size);
+        }}
+    });
+}
+
 void cpu_fused_moe(
     torch::Tensor& output,       // [token_num, output_size_2]
     const torch::Tensor& input,  // [token_num, input_size_13]
@@ -694,12 +779,14 @@ void cpu_fused_moe(
         w13,  // [expert_num, output_size_13, input_size_13], packed
     const torch::Tensor&
         w2,  // [expert_num, output_size_2, input_size_2], packed
+    const std::optional<torch::Tensor>& w13_scale,
+    const std::optional<torch::Tensor>& w2_scale,
     const std::optional<torch::Tensor>&
         w13_bias,  // [expert_num, output_size_13]
     const std::optional<torch::Tensor>& w2_bias,  // [expert_num, output_size_2]
     const torch::Tensor& topk_weights,            // [token_num, k], float32
     const torch::Tensor& topk_id,                 // [token_num, k], int32
-    const std::string& act, const std::string& isa) {
+    const std::string& act, const std::string& isa, const std::string& quant_method) {
   const int32_t token_num = input.size(0);
   const int32_t input_size_13 = input.size(1);
   const int64_t input_stride = input.stride(0);
@@ -710,11 +797,13 @@ void cpu_fused_moe(
   const int32_t output_size_2 = w2.size(1);
   const int32_t topk_num = topk_id.size(1);
   const FusedMOEAct act_type = get_act_type(act);
-  cpu_utils::ISA isa_type = cpu_utils::get_isa(isa);
+  const cpu_utils::ISA isa_type = cpu_utils::get_isa(isa);
 
-  VLLM_DISPATCH_FLOATING_TYPES(w13.scalar_type(), "cpu_fused_moe", [&]() {
+  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "cpu_fused_moe", [&]() {
     CPU_ISA_DISPATCH_IMPL(isa_type, [&]() {
-      fused_moe_impl<scalar_t, scalar_t, gemm_t>(
+      using gemm_t = cpu_micro_gemm::MicroGemm<isa_t, scalar_t>; 
+      using weight_processor_t = cpu_quant_utils::WeightProcessor<cpu_quant_utils::QuantMethod::NONE, isa_t>;
+      fused_moe_impl<scalar_t, scalar_t, gemm_t, weight_processor_t>(
           output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
           w13.data_ptr<scalar_t>(), w2.data_ptr<scalar_t>(),
           w13_bias.has_value() ? w13_bias->data_ptr<scalar_t>() : nullptr,

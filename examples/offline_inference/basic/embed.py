@@ -12,7 +12,7 @@ def parse_args():
     parser = EngineArgs.add_cli_args(parser)
     # Set example specific arguments
     parser.set_defaults(
-        model="intfloat/e5-small",
+        model="Qwen/Qwen3-Embedding-0.6B",
         runner="pooling",
         enforce_eager=True,
     )

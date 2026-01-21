@@ -3042,6 +3042,9 @@ def cpu_fused_moe(
     topk_ids: torch.Tensor,
     act: str,
     isa: str,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    quant_method: str = "none",
 ) -> torch.Tensor:
     output = torch.empty_like(input)
     torch.ops._C.cpu_fused_moe(
@@ -3049,15 +3052,27 @@ def cpu_fused_moe(
         input,
         w13,
         w2,
+        w13_scale,
+        w2_scale,
         w13_bias,
         w2_bias,
         topk_weights,
         topk_ids,
         act,
         isa,
+        quant_method,
     )
     return output
 
+def cpu_prepack_moe_weight_mxfp4(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    isa: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    packed_weight = torch.empty_like(weight)
+    packed_scale = torch.empty_like(scale)
+    torch.ops._C.prepack_moe_weight_mxfp4(weight, packed_weight, scale, packed_scale, isa)
+    return packed_weight, packed_scale
 
 if hasattr(torch.ops._qutlass_C, "matmul_mxf4_bf16_tn"):
 

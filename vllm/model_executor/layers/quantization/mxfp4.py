@@ -78,6 +78,9 @@ class Mxfp4Backend(Enum):
     # Triton Backend
     TRITON = 6
 
+    # CPU Backend
+    CPU = 7
+
 
 def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
     """
@@ -170,6 +173,9 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
     elif current_platform.is_rocm() and has_triton_kernels():
         logger.info_once("Using Triton backend")
         return Mxfp4Backend.TRITON
+    elif current_platform.is_cpu():
+        logger.info_once("Using CPU MXFP4 backend")
+        return Mxfp4Backend.CPU
 
     return Mxfp4Backend.NONE
 
@@ -783,6 +789,46 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight
             layer.w13_weight = w13_weight
             layer.w2_weight = w2_weight
+        elif self.mxfp4_backend == Mxfp4Backend.CPU:
+            from vllm._custom_ops import cpu_prepack_moe_weight_mxfp4
+            def depack_4bits(value: torch.Tensor):
+                value = value.view(dtype=torch.uint8)
+                loaded_blocks_lo = value & 0x0F
+                loaded_blocks_hi = value >> 4
+                loaded_blocks = torch.stack((loaded_blocks_lo, loaded_blocks_hi), dim=-1)
+                loaded_blocks = loaded_blocks.view(*loaded_blocks.shape[:-2], loaded_blocks.shape[-2] * 2)
+                return loaded_blocks
+
+            supports_amx = torch._C._cpu._is_amx_tile_supported()
+            isa = "amx" if supports_amx else "vec" 
+
+            print("w13 shape: ", layer.w13_weight.size())
+            print("scale13 shape: ", layer.w13_weight_scale.size())
+            depacked_weight13 = depack_4bits(layer.w13_weight)
+            scale13 = layer.w13_weight_scale
+
+            packed_w13, packed_scale13 = cpu_prepack_moe_weight_mxfp4(
+                layer.w13_weight.view(torch.int32), layer.w13_weight_scale, isa,
+            )
+
+            depack_packed_weight13 = depack_4bits(packed_w13.view(torch.uint8))
+            print("depack_packed_weight13 shape: ", depack_packed_weight13.size())
+            print("packed_scale13 shape: ", packed_scale13.size())
+
+            torch.set_printoptions(profile="full", linewidth=5000, sci_mode=False)
+            # print("scale13: ", scale13[1, 16:32, :])
+            # print("packed_scale13: ", packed_scale13[1, 16:32, :].view(90, 16))
+            # print("w3: ", depacked_weight13[1, 16:32, :])
+            # print("depack_packed_weight13: ", depack_packed_weight13[1, 16:32, :].view(-1, 128))
+
+            packed_w2, packed_scale2 = cpu_prepack_moe_weight_mxfp4(
+                layer.w2_weight.view(torch.int32), layer.w2_weight_scale, isa,
+            )
+            layer.w13_weight.data = packed_w13 
+            layer.w13_weight_scale.data = packed_scale13 
+            layer.w2_weight.data = packed_w2 
+            layer.w2_weight_scale.data = packed_scale2 
+            assert False, "stop here"
         else:
             raise ValueError(
                 f"Unsupported mxfp4_backend: {self.mxfp4_backend}: "
@@ -792,7 +838,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        if self.mxfp4_backend == Mxfp4Backend.MARLIN:
+        if (self.mxfp4_backend == Mxfp4Backend.MARLIN or 
+           self.mxfp4_backend == Mxfp4Backend.CPU):
             return mxfp4_w4a16_moe_quant_config(
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,

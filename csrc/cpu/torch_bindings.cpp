@@ -115,11 +115,20 @@ void prepack_moe_weight(const torch::Tensor& weight,
 
 void cpu_fused_moe(torch::Tensor& output, const torch::Tensor& input,
                    const torch::Tensor& w13, const torch::Tensor& w2,
+                   const std::optional<torch::Tensor>& w13_scale,
+                   const std::optional<torch::Tensor>& w2_scale,
                    const std::optional<torch::Tensor>& w13_bias,
                    const std::optional<torch::Tensor>& w2_bias,
                    const torch::Tensor& topk_weights,
                    const torch::Tensor& topk_id, const std::string& act,
-                   const std::string& isa);
+                   const std::string& isa, const std::string& quant_method);
+
+void prepack_moe_weight_mxfp4(
+    const torch::Tensor& weight,  
+    torch::Tensor& packed_weight, 
+    const torch::Tensor& scale,
+    torch::Tensor& packed_scale, 
+    const std::string& isa);
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
@@ -316,9 +325,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("prepack_moe_weight", torch::kCPU, &prepack_moe_weight);
   ops.def(
       "cpu_fused_moe(Tensor(a0!) output, Tensor input, Tensor w13, Tensor w2, "
-      "Tensor? w13_bias, Tensor? w2_bias, Tensor topk_weights, Tensor topk_id, "
-      "str act, str isa) -> ()");
+      "Tensor? w13_scale, Tensor? w2_scale, Tensor? w13_bias, Tensor? w2_bias, Tensor topk_weights, Tensor topk_id, "
+      "str act, str isa, str quant_method) -> ()");
   ops.impl("cpu_fused_moe", torch::kCPU, &cpu_fused_moe);
+  ops.def(
+      "prepack_moe_weight_mxfp4(Tensor weight, Tensor(a1!) packed_weight, Tensor scale, Tensor(a3!) packed_scale, str isa) -> ()");
+  ops.impl("prepack_moe_weight_mxfp4", torch::kCPU, &prepack_moe_weight_mxfp4);
 #endif
 }
 
