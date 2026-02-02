@@ -16,42 +16,82 @@ inline QuantMethod get_quantmethod(const std::string& method) {
   }
 }
 
+#define DEFINE_INIT \
+    private: \
+        weight_t* __restrict__ curr_input_weight_ptr_; \
+        scalar_t* __restrict__ curr_output_weight_ptr_; \
+        scalar_t* __restrict__ output_weight_ptr_; \
+        scale_t* __restrict__ curr_scale_ptr_; \
+        zero_point_t* __restrict__ curr_zero_point_ptr_; \
+    \
+    public: \
+        FORCE_INLINE WeightProcessor( \
+            weight_t* __restrict__ weight_ptr, \
+            scalar_t* __restrict__ output_weight_ptr, \
+            scale_t* __restrict__ scale_ptr, \
+            zero_point_t* __restrict__ zp_ptr, \
+            const int32_t input_size, \
+            const int32_t output_size, \
+            const int32_t expert_idx, \
+            const int32_t output_idx \
+        ) \
+        \
+
 #define DEFINE_PREPACK \
-        template<typename WT, typename ST, typename ZT> \
         void prepack( \
-            WT* __restrict__ weight_ptr, \
-            ST* __restrict__ scale_ptr, \
-            ZT* __restrict__ zp_ptr, \
-            WT* __restrict__ packed_weight_ptr, \
-            ST* __restrict__ packed_scale_ptr, \
-            ZT* __restrict__ packed_zp_ptr, \
+            weight_t* __restrict__ weight_ptr, \
+            scale_t* __restrict__ scale_ptr, \
+            zero_point_t* __restrict__ zp_ptr, \
+            weight_t* __restrict__ packed_weight_ptr, \
+            scale_t* __restrict__ packed_scale_ptr, \
+            zero_point_t* __restrict__ packed_zp_ptr, \
             const int32_t input_size \
         ) 
 
-template<QuantMethod quant_method, cpu_utils::ISA isa>
+template<QuantMethod quant_method, cpu_utils::ISA isa, typename scalar_t>
 class WeightProcessor {
 public:
     static constexpr int32_t OUTPUT_BLOCK_SIZE = 16;
     static constexpr int32_t WEIGHT_PACK_FACTOR = 1;
+    using weight_t = scalar_t;
+    using scale_t = void;
+    using zero_point_t = void;
 
 DEFINE_PREPACK {
-        TORCH_CHECK(false, "Unreachable"); 
+        TORCH_CHECK(false, "Not implemented"); 
     }
 };
 
-template<cpu_utils::ISA isa>
-class WeightProcessor<QuantMethod::NONE, isa> {
+template<cpu_utils::ISA isa, typename scalar_t>
+class WeightProcessor<QuantMethod::NONE, isa, scalar_t> {
 public:
     static constexpr int32_t OUTPUT_BLOCK_SIZE = 16;
     static constexpr int32_t WEIGHT_PACK_FACTOR = 1;
+    using weight_t = scalar_t;
+    using scale_t = void;
+    using zero_point_t = void;
+
+    DEFINE_INIT: 
+    curr_input_weight_ptr_(weight_ptr + (expert_idx * input_size * output_size + output_idx * input_size) / WEIGHT_PACK_FACTOR),
+    curr_output_weight_ptr_(curr_input_weight_ptr_),
+    output_weight_ptr_(curr_input_weight_ptr_),
+    curr_scale_ptr_(nullptr),
+    curr_zero_point_ptr_(nullptr)
+    {}
 
     DEFINE_PREPACK {}
+
+    FORCE_INLINE scalar_t* get_processed_weight_ptr() const {return output_weight_ptr_;}
 };
 
 template<>
-class WeightProcessor<QuantMethod::MXFP4, cpu_utils::ISA::VEC> {
+class WeightProcessor<QuantMethod::MXFP4, cpu_utils::ISA::VEC, c10::BFloat16> {
 public:
     static constexpr int32_t OUTPUT_BLOCK_SIZE = 16;
+    static constexpr int32_t WEIGHT_PACK_FACTOR = 4;
+    using weight_t = int32_t;
+    using scale_t = uint8_t;
+    using zero_point_t = void;
 
     DEFINE_PREPACK {
         TORCH_CHECK(false, "Unreachable"); 
@@ -59,13 +99,17 @@ public:
 };
 
 template<>
-class WeightProcessor<QuantMethod::MXFP4, cpu_utils::ISA::AMX> {
+class WeightProcessor<QuantMethod::MXFP4, cpu_utils::ISA::AMX, c10::BFloat16> {
 public:
     static constexpr int32_t OUTPUT_BLOCK_SIZE = 16;
+    static constexpr int32_t WEIGHT_PACK_FACTOR = 4;
+    using weight_t = int32_t;
+    using scale_t = uint8_t;
+    using zero_point_t = void;
 
     DEFINE_PREPACK{
-        static_assert(std::is_same_v<WT, int32_t>);
-        static_assert(std::is_same_v<ST, uint8_t>);
+        static_assert(std::is_same_v<weight_t, int32_t>);
+        static_assert(std::is_same_v<scale_t, uint8_t>);
 
         // pack scale, just transpose [OUTPUT_BLOCK_SIZE, input_size // 32]  
         {

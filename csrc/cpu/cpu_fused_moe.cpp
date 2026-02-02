@@ -138,12 +138,20 @@ void prepack_moe_weight_impl(scalar_t* __restrict__ weight_ptr,
   }
 }
 
-template <typename scalar_t, typename w_t, typename gemm_t, typename weight_processor_t>
+template <typename scalar_t, typename w_t, typename gemm_t, typename weight_processor_t,
+            typename scale_t = typename weight_processor_t::scale_t,
+            typename zp_t = typename weight_processor_t::zp_t
+>
 void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
                     w_t* __restrict__ w13, w_t* __restrict__ w2,
                     scalar_t* __restrict__ w13_bias, scalar_t* __restrict__ w2_bias,
                     float* __restrict__ topk_weights,
-                    int32_t* __restrict__ topk_id, FusedMOEAct act_type,
+                    int32_t* __restrict__ topk_id,
+                    scale_t* __restrict__ w13_scale,
+                    zp_t* __restrict__ w13_zp,
+                    scale_t* __restrict__ w2_scale,
+                    zp_t* __restrict__ w2_zp,
+                    FusedMOEAct act_type,
                     const int32_t token_num, const int32_t expert_num,
                     const int32_t topk_num, const int32_t input_size_13,
                     const int32_t output_size_13, const int32_t input_size_2,
@@ -153,7 +161,6 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
   constexpr int32_t gemm_m_tile_size = gemm_t::MaxMSize;
   constexpr int32_t min_w13_n_tile_size = 2 * gemm_n_tile_size;
   constexpr int32_t weight_prepack_n_block_size = weight_processor_t::OUTPUT_BLOCK_SIZE;
-  constexpr int32_t weight_pack_factor = weight_processor_t::WEIGHT_PACK_FACTOR;
   static_assert(gemm_n_tile_size % weight_prepack_n_block_size == 0);
   constexpr bool is_mixed_precision = !std::is_same_v<scalar_t, w_t>;
 
@@ -329,9 +336,12 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
       scalar_t* __restrict__ w13_gemm_output_buffer =
           reinterpret_cast<scalar_t*>(common_buffer_start +
                                       w13_gemm_output_buffer_offset);
-      scalar_t* __restrict__ w13_gemm_weight_buffer =
+      scalar_t* __restrict__ w13_gemm_weight_buffer_0 =
           reinterpret_cast<scalar_t*>(thread_buffer +
-                                      w13_weight_buffer_size);
+                                      w13_weight_buffer_offset);
+      scalar_t* __restrict__ w13_gemm_weight_buffer_1 =
+          reinterpret_cast<scalar_t*>(thread_buffer +
+                                      w13_weight_buffer_offset + w13_weight_buffer_size / 2);
 
       gemm_t gemm;
 
@@ -365,28 +375,22 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
                 (output_size_13 / 2) +
             curr_output_group_id * w13_n_tile_size / 2;
 
-        w_t* __restrict__ raw_w13_weight_ptr_0 = nullptr;
-        w_t* __restrict__ raw_w13_weight_ptr_1 = nullptr;
+        int32_t w13_weight_output_idx_0;
+        int32_t w13_weight_output_idx_1;
         scalar_t* __restrict__ w13_bias_ptr_0 = nullptr;
         scalar_t* __restrict__ w13_bias_ptr_1 = nullptr;
         if (act_type == FusedMOEAct::SwigluOAIAndMul) {
           // For SwigluOAIAndMul, up and down weights are interleaved
-          raw_w13_weight_ptr_0 =
-              w13 + (curr_expert_id * input_size_13 * output_size_13 +
-              curr_output_group_id * w13_n_tile_size * input_size_13) / weight_pack_factor;
-          raw_w13_weight_ptr_1 =
-              raw_w13_weight_ptr_0 + (actual_n_tile_size / 2 * input_size_13) / weight_pack_factor;
+          w13_weight_output_idx_0 = curr_output_group_id * w13_n_tile_size;
+          w13_weight_output_idx_1 = w13_weight_output_idx_0 + actual_n_tile_size / 2;
           if (w13_bias != nullptr) {
             w13_bias_ptr_0 = w13_bias + curr_expert_id * output_size_13 +
                              curr_output_group_id * w13_n_tile_size;
             w13_bias_ptr_1 = w13_bias_ptr_0 + actual_n_tile_size / 2;
           }
         } else {
-          raw_w13_weight_ptr_0 =
-              w13 + (curr_expert_id * input_size_13 * output_size_13 +
-              curr_output_group_id * (w13_n_tile_size / 2) * input_size_13) / weight_pack_factor;
-          raw_w13_weight_ptr_1 =
-              raw_w13_weight_ptr_0 + (output_size_13 / 2 * input_size_13) / weight_pack_factor;
+            w13_weight_output_idx_0 = curr_output_group_id * w13_n_tile_size / 2;
+            w13_weight_output_idx_1 = w13_weight_output_idx_0 + output_size_13 / 2;
           if (w13_bias != nullptr) {
             w13_bias_ptr_0 = w13_bias + curr_expert_id * output_size_13 +
                              curr_output_group_id * (w13_n_tile_size / 2);
@@ -394,16 +398,10 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
           }
         }
 
-        scalar_t* __restrict__ w13_weight_ptr_0 = nullptr;
-        scalar_t* __restrict__ w13_weight_ptr_1 = nullptr;
-
-        if constexpr (is_mixed_precision) {
         // dequant
-        } else {
         // use raw ptr
-            w13_weight_ptr_0 = raw_w13_weight_ptr_0;
-            w13_weight_ptr_1 = raw_w13_weight_ptr_1;
-        }
+        weight_processor_t w13_weight_processor_0(w13, w13_gemm_weight_buffer_0, w13_scale, w13_zp, input_size_13, output_size_13, curr_expert_id, w13_weight_output_idx_0);
+        weight_processor_t w13_weight_processor_1(w13, w13_gemm_weight_buffer_1, w13_scale, w13_zp, input_size_13, output_size_13, curr_expert_id, w13_weight_output_idx_1);
 
         scalar_t* __restrict__ curr_w13_input_buffer = w13_input_buffer;
         for (int32_t token_idx = 0; token_idx < curr_token_num;
@@ -439,8 +437,8 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
 
           // gemm + act
           {
-            scalar_t* __restrict__ w13_weight_ptr_0_iter = w13_weight_ptr_0;
-            scalar_t* __restrict__ w13_weight_ptr_1_iter = w13_weight_ptr_1;
+            scalar_t* __restrict__ w13_weight_ptr_0_iter = w13_weight_processor_0.get_processed_weight_ptr();
+            scalar_t* __restrict__ w13_weight_ptr_1_iter = w13_weight_processor_1.get_processed_weight_ptr();
             scalar_t* __restrict__ w13_bias_ptr_0_iter = w13_bias_ptr_0;
             scalar_t* __restrict__ w13_bias_ptr_1_iter = w13_bias_ptr_1;
             scalar_t* __restrict__ curr_w13_input_buffer_iter =
@@ -547,29 +545,21 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
             w2_gemm_output_buffer +
             cu_token_num_per_group_buffer[curr_expert_id] * output_size_2 +
             curr_output_group_id * w2_n_tile_size;
-        w_t* __restrict__ raw_w2_weight_ptr =
-            w2 + (curr_expert_id * output_size_2 * input_size_2 +
-            curr_output_group_id * w2_n_tile_size * input_size_2) / weight_pack_factor;
+        const int32_t w2_output_idx = curr_output_group_id * w2_n_tile_size;
         scalar_t* __restrict__ w2_bias_ptr = nullptr;
         if (w2_bias != nullptr) {
           w2_bias_ptr = w2_bias + curr_expert_id * output_size_2 +
                         curr_output_group_id * w2_n_tile_size;
         }
 
-        scalar_t* __restrict__ w2_weight_ptr = nullptr;
-        if constexpr (is_mixed_precision) {
-            // dequant
-        } else {
-            // use raw ptr
-            w2_weight_ptr = raw_w2_weight_ptr;
-        }
+        weight_processor_t w2_weight_processor(w2, w2_weight_buffer, w2_scale, w2_zp, input_size_2, output_size_2, curr_expert_id, w2_output_idx);
 
         for (int32_t token_idx = 0; token_idx < curr_token_num;
              token_idx += gemm_m_tile_size) {
           const int32_t actual_token_num =
               std::min(gemm_m_tile_size, curr_token_num - token_idx);
 
-          scalar_t* __restrict__ w2_weight_ptr_iter = w2_weight_ptr;
+          scalar_t* __restrict__ w2_weight_ptr_iter = w2_weight_processor.get_processed_weight_ptr();
           scalar_t* __restrict__ w2_bias_ptr_iter = w2_bias_ptr;
           float* __restrict__ curr_w2_gemm_output_buffer_iter =
               curr_w2_gemm_output_buffer;
@@ -755,7 +745,7 @@ void prepack_moe_weight_mxfp4(
   uint8_t* __restrict__ packed_scale_ptr = packed_scale.data_ptr<uint8_t>();
 
     CPU_ISA_DISPATCH_IMPL(isa_type, [&]() {
-        using weight_processor_t = cpu_quant_utils::WeightProcessor<cpu_quant_utils::QuantMethod::MXFP4, isa_t>;
+        using weight_processor_t = cpu_quant_utils::WeightProcessor<cpu_quant_utils::QuantMethod::MXFP4, isa_t, c10::BFloat16>;
         constexpr int32_t OUTPUT_BLOCK_SIZE = weight_processor_t::OUTPUT_BLOCK_SIZE;
         TORCH_CHECK_EQ(output_size % OUTPUT_BLOCK_SIZE, 0);
         for (int32_t expert_id = 0; expert_id < expert_num; ++expert_id) {
@@ -802,13 +792,14 @@ void cpu_fused_moe(
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "cpu_fused_moe", [&]() {
     CPU_ISA_DISPATCH_IMPL(isa_type, [&]() {
       using gemm_t = cpu_micro_gemm::MicroGemm<isa_t, scalar_t>; 
-      using weight_processor_t = cpu_quant_utils::WeightProcessor<cpu_quant_utils::QuantMethod::NONE, isa_t>;
+      using weight_processor_t = cpu_quant_utils::WeightProcessor<cpu_quant_utils::QuantMethod::NONE, isa_t, scalar_t>;
       fused_moe_impl<scalar_t, scalar_t, gemm_t, weight_processor_t>(
           output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
           w13.data_ptr<scalar_t>(), w2.data_ptr<scalar_t>(),
           w13_bias.has_value() ? w13_bias->data_ptr<scalar_t>() : nullptr,
           w2_bias.has_value() ? w2_bias->data_ptr<scalar_t>() : nullptr,
-          topk_weights.data_ptr<float>(), topk_id.data_ptr<int32_t>(), act_type,
+          topk_weights.data_ptr<float>(), topk_id.data_ptr<int32_t>(),
+          (void*)0, (void*)0, (void*)0, (void*)0, act_type,
           token_num, expert_num, topk_num, input_size_13, output_size_13,
           input_size_2, output_size_2);
     });
