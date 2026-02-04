@@ -16,7 +16,7 @@ inline QuantMethod get_quantmethod(const std::string& method) {
   }
 }
 
-#define DEFINE_INIT \
+#define DEFINE_WP_METHODS \
     private: \
         weight_t* __restrict__ curr_input_weight_ptr_; \
         scalar_t* __restrict__ curr_output_weight_ptr_; \
@@ -25,6 +25,8 @@ inline QuantMethod get_quantmethod(const std::string& method) {
         zero_point_t* __restrict__ curr_zero_point_ptr_; \
     \
     public: \
+        FORCE_INLINE scalar_t* get_processed_weight_ptr() const {return output_weight_ptr_;} \
+\
         FORCE_INLINE WeightProcessor( \
             weight_t* __restrict__ weight_ptr, \
             scalar_t* __restrict__ output_weight_ptr, \
@@ -37,7 +39,7 @@ inline QuantMethod get_quantmethod(const std::string& method) {
         ) \
         \
 
-#define DEFINE_PREPACK \
+#define DEFINE_WP_PREPACK \
         void prepack( \
             weight_t* __restrict__ weight_ptr, \
             scale_t* __restrict__ scale_ptr, \
@@ -46,7 +48,7 @@ inline QuantMethod get_quantmethod(const std::string& method) {
             scale_t* __restrict__ packed_scale_ptr, \
             zero_point_t* __restrict__ packed_zp_ptr, \
             const int32_t input_size \
-        ) 
+        )
 
 template<QuantMethod quant_method, cpu_utils::ISA isa, typename scalar_t>
 class WeightProcessor {
@@ -57,7 +59,7 @@ public:
     using scale_t = void;
     using zero_point_t = void;
 
-DEFINE_PREPACK {
+DEFINE_WP_METHODS {
         TORCH_CHECK(false, "Not implemented"); 
     }
 };
@@ -71,7 +73,7 @@ public:
     using scale_t = void;
     using zero_point_t = void;
 
-    DEFINE_INIT: 
+    DEFINE_WP_METHODS: 
     curr_input_weight_ptr_(weight_ptr + (expert_idx * input_size * output_size + output_idx * input_size) / WEIGHT_PACK_FACTOR),
     curr_output_weight_ptr_(curr_input_weight_ptr_),
     output_weight_ptr_(curr_input_weight_ptr_),
@@ -79,9 +81,8 @@ public:
     curr_zero_point_ptr_(nullptr)
     {}
 
-    DEFINE_PREPACK {}
+    DEFINE_WP_PREPACK {}
 
-    FORCE_INLINE scalar_t* get_processed_weight_ptr() const {return output_weight_ptr_;}
 };
 
 template<>
@@ -93,7 +94,7 @@ public:
     using scale_t = uint8_t;
     using zero_point_t = void;
 
-    DEFINE_PREPACK {
+    DEFINE_WP_PREPACK {
         TORCH_CHECK(false, "Unreachable"); 
     }
 };
@@ -103,11 +104,33 @@ class WeightProcessor<QuantMethod::MXFP4, cpu_utils::ISA::AMX, c10::BFloat16> {
 public:
     static constexpr int32_t OUTPUT_BLOCK_SIZE = 16;
     static constexpr int32_t WEIGHT_PACK_FACTOR = 4;
+    static constexpr int32_t SCALE_BLOCK_SIZE = 32;
+    using scalar_t = c10::BFloat16;
     using weight_t = int32_t;
     using scale_t = uint8_t;
     using zero_point_t = void;
 
-    DEFINE_PREPACK{
+    DEFINE_WP_METHODS:
+    curr_input_weight_ptr_(weight_ptr + (expert_idx * input_size * output_size + output_idx * input_size) / WEIGHT_PACK_FACTOR),
+    curr_output_weight_ptr_(output_weight_ptr),
+    output_weight_ptr_(curr_output_weight_ptr_),
+    curr_scale_ptr_(scale_ptr + (expert_idx * input_size * output_size + output_idx * input_size) / SCALE_BLOCK_SIZE),
+    curr_zero_point_ptr_(nullptr)
+    {}
+
+    FORCE_INLINE void dequant(const int32_t tile_size_n, const int32_t tile_size_k) {
+        const int32_t n_iterations = tile_size_n / 32;
+        const int32_t k_iterations = tile_size_k / 32;
+        for (int32_t n = 0; n < n_iterations; ++n) {
+            for (int32_t k = 0; k < k_iterations; ++k) {
+                // in each iteration, dequant 2 x [16, 32] elements
+                scalar_t* 
+                scalar_t* 
+            }
+        }
+    }
+
+    DEFINE_WP_PREPACK{
         static_assert(std::is_same_v<weight_t, int32_t>);
         static_assert(std::is_same_v<scale_t, uint8_t>);
 
