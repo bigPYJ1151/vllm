@@ -85,6 +85,44 @@ public:
 
 };
 
+namespace  {
+alignas(64) static const uint16_t MXFP4_TO_BF16_LUT[32] = {
+        0x0000,
+        0x3f00,
+        0x3f80,
+        0x3fc0,
+        0x4000,
+        0x4040,
+        0x4080,
+        0x40c0,
+        0x0000, // convert -0 to +0
+        0xbf00,
+        0xbf80,
+        0xbfc0,
+        0xc000,
+        0xc040,
+        0xc080,
+        0xc0c0,
+// padding
+        0x0000, 
+        0x3f00,
+        0x3f80,
+        0x3fc0,
+        0x4000,
+        0x4040,
+        0x4080,
+        0x40c0,
+        0x0000,
+        0xbf00,
+        0xbf80,
+        0xbfc0,
+        0xc000,
+        0xc040,
+        0xc080,
+        0xc0c0
+};
+}
+
 template<>
 class WeightProcessor<QuantMethod::MXFP4, cpu_utils::ISA::VEC, c10::BFloat16> {
 public:
@@ -119,13 +157,37 @@ public:
     {}
 
     FORCE_INLINE void dequant(const int32_t tile_size_n, const int32_t tile_size_k) {
-        const int32_t n_iterations = tile_size_n / 32;
+        const int32_t n_iterations = tile_size_n / 16;
         const int32_t k_iterations = tile_size_k / 32;
+        scalar_t* __restrict__ curr_output_ptr = curr_output_weight_ptr_;
+        weight_t* __restrict__ curr_input_ptr = curr_input_weight_ptr_;
+        scale_t* __restrict__ curr_scale_ptr = curr_scale_ptr_;
+
+        vec_op::BF16Vec32 mxfp4_to_bf16_lut(MXFP4_TO_BF16_LUT);
         for (int32_t n = 0; n < n_iterations; ++n) {
             for (int32_t k = 0; k < k_iterations; ++k) {
-                // in each iteration, dequant 2 x [16, 32] elements
-                scalar_t* 
-                scalar_t* 
+                // in each iteration, dequant [16, 32] elements
+                // load scales for 16 x 32 blocks, extand to 16 bits, and duplicate for VNNI format
+                __m128i scales = _mm_loadu_epi8(curr_scale_ptr);
+                __m512i scales_512 = _mm512_cvtepu8_epi32(scales);
+                scales_512 = _mm512_or_epi32(scales_512, _mm512_slli_epi32(scales_512, 16));
+                // shift scales to BF16 exponent bits 
+                vec_op::BF16Vec32 scales_vec(_mm512_slli_epi32(scales_512, 7));
+
+                for (int32_t i = 0; i < 4; ++i) {
+                    vec_op::BF16Vec32 packed_mxfp4_vec(curr_input_ptr);
+                    for (int32_t j = 0; j < 4; ++j) {
+                        vec_op::BF16Vec32 value_vec = vec_op::convert_mxfp4_to_bf16(packed_mxfp4_vec >> (j * 4), mxfp4_to_bf16_lut, scales_vec);
+                        value_vec.save(curr_output_ptr);
+                        // update
+                        curr_output_ptr += 32;
+                    }
+                    // update
+                    curr_input_ptr += 16;
+                }
+
+                // update
+                curr_scale_ptr += 16;
             }
         }
     }

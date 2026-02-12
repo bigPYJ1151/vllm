@@ -260,6 +260,8 @@ class CpuPlatform(Platform):
                     "size_asserts": False,
                     "nan_asserts": False,
                     "epilogue_fusion": True,
+                    "cpp.dynamic_threads": True, # OMP thread num are static, don't need to generate `num_threads` macro
+                    "cpp.enable_kernel_profile": True,
                 }
             )
 
@@ -267,6 +269,10 @@ class CpuPlatform(Platform):
             compilation_config.mode = CompilationMode.NONE
 
         assert vllm_config.device_config.device_type == "cpu"
+
+        profiler_config = vllm_config.profiler_config
+        if profiler_config.profiler == "torch":
+            profiler_config.torch_profiler_dump_cuda_time_total = False
 
         #
         # Environment variables for CPU executor

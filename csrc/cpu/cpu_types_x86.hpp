@@ -177,6 +177,10 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
             (__m128i)vec8_data.reg, 3)) {}
 
   void save(void* ptr) const { *reinterpret_cast<__m512i*>(ptr) = reg; }
+
+  BF16Vec32 operator>>(int32_t bits) const {
+    return BF16Vec32(_mm512_srli_epi16(reg, bits));
+  }
 };
 #else
 struct BF16Vec32 : public Vec<BF16Vec32> {
@@ -776,7 +780,7 @@ inline void non_temporal_save(FP32Vec16& vec, void* ptr) {
   _mm512_stream_ps((float*)ptr, vec.reg);
 }
 
-static void interleave_save(const BF16Vec16& vec0, const BF16Vec16& vec1,
+inline void interleave_save(const BF16Vec16& vec0, const BF16Vec16& vec1,
                             void* ptr) {
   __m512i vec_0 = _mm512_cvtepu16_epi32(vec0.reg);
   __m512i vec_1 = _mm512_cvtepu16_epi32(vec1.reg);
@@ -785,13 +789,20 @@ static void interleave_save(const BF16Vec16& vec0, const BF16Vec16& vec1,
   _mm512_storeu_epi32(ptr, vec_0);
 }
 
-static void interleave_save(const FP16Vec16& vec0, const FP16Vec16& vec1,
+inline void interleave_save(const FP16Vec16& vec0, const FP16Vec16& vec1,
                             void* ptr) {
   __m512i vec_0 = _mm512_cvtepu16_epi32(vec0.reg);
   __m512i vec_1 = _mm512_cvtepu16_epi32(vec1.reg);
   vec_1 = _mm512_slli_epi32(vec_1, 16);
   vec_0 = _mm512_or_si512(vec_0, vec_1);
   _mm512_storeu_epi32(ptr, vec_0);
+}
+
+inline BF16Vec32 convert_mxfp4_to_bf16(const BF16Vec32& mxfp4_vec, const BF16Vec32& lut, const BF16Vec32& shifted_scales_vec) {
+    __m512i value = _mm512_permutexvar_epi16(mxfp4_vec.reg, lut.reg);
+    __mmask32 mask = _mm512_cmp_epi16_mask(value, _mm512_setzero_si512(), _MM_CMPINT_EQ);
+    value = _mm512_mask_add_epi16(value, mask, value, shifted_scales_vec.reg);
+    return BF16Vec32(value);
 }
 
 #endif
