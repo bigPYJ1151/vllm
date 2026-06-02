@@ -28,18 +28,9 @@ from vllm.v1.attention.backends.utils import (
     KVCacheLayoutType,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
+from vllm.v1.kv_cache_interface import (AttentionSpec, CrossAttentionSpec, EncoderOnlyAttentionSpec)
 
 logger = init_logger(__name__)
-
-_CPU_ARCH_PREFER_MIXED_BATCH = (
-    CpuArchEnum.X86,
-    CpuArchEnum.ARM,
-    CpuArchEnum.S390X,
-    CpuArchEnum.RISCV,
-    CpuArchEnum.POWERPC,
-)
-
 
 class CPUAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [
@@ -116,13 +107,7 @@ class CPUAttentionMetadata:
     slot_mapping: torch.Tensor
     scheduler_metadata: torch.Tensor | None
     causal: bool = True
-
-    # can be removed after deprecate sdpa
-    use_sdpa_prefill: bool = False
-    num_decode_tokens: int = 0
-    sdpa_attn_masks: list[torch.Tensor | None] | None = None
-    sdpa_start_loc: torch.Tensor | None = None
-
+    encoder_cache: torch.Tensor | None = None
 
 class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]):
     def __init__(
@@ -133,17 +118,6 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-
-        self.use_sdpa_prefill = False
-        reorder_batch_threshold = None
-        if current_platform.get_cpu_architecture() not in _CPU_ARCH_PREFER_MIXED_BATCH:
-            # in this case, decode seqs are reordered to the front of prefill seqs
-            # to split decode and prefill. Then use SDPA for prefill and
-            # cpu_attention_with_kv_cache for decode
-            reorder_batch_threshold = 1
-            self.use_sdpa_prefill = True
-
-        self._init_reorder_batch_threshold(reorder_batch_threshold, False)
 
         self.kv_cache_spec = kv_cache_spec
         self.vllm_config = vllm_config
@@ -167,6 +141,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             kv_cache_dtype_str,
         )
         self.is_cross_attention = isinstance(kv_cache_spec, CrossAttentionSpec)
+        self.is_encoder_only_attention = isinstance(kv_cache_spec, EncoderOnlyAttentionSpec)
 
     def build(
         self,
@@ -184,23 +159,24 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         slot_mapping = common_attn_metadata.slot_mapping
         causal = False if self.is_cross_attention else common_attn_metadata.causal
 
-        sdpa_start_loc = query_start_loc
-        num_decode_tokens = 0
-        if self.use_sdpa_prefill and causal:
-            # Decoder, need reorder and truncate
-            assert self.reorder_batch_threshold
-            (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
-                split_decodes_and_prefills(
-                    common_attn_metadata,
-                    decode_threshold=self.reorder_batch_threshold,
-                    require_uniform=True,
-                )
+        encoder_cache_tensor = None
+        if self.is_encoder_only_attention:
+            block_nums = (seq_lens + self.block_size - 1) // self.block_size
+            start_block_ids = torch.zeros_like(seq_lens)
+            torch.cumsum(block_nums[:-1], 0, out=start_block_ids[1:])
+            total_block_num: int = block_nums.sum().item()
+            max_block_num = block_nums.max().item()
+            block_offsets = torch.arange(0, max_block_num, dtype=block_table_tensor.dtype)
+            encoder_block_table = start_block_ids[:, None] + block_offsets[None, :]
+            torch.ops._C.compute_slot_mapping_kernel_impl(
+                query_start_loc,
+                common_attn_metadata.positions,
+                encoder_block_table,
+                slot_mapping,
+                self.block_size,
             )
-            num_reqs = num_decodes
-            sdpa_start_loc = sdpa_start_loc[num_decodes:] - num_decode_tokens
-            seq_lens = seq_lens[:num_decodes]
-            query_start_loc = query_start_loc[: num_decodes + 1]
-            block_table_tensor = block_table_tensor[:num_decodes]
+            encoder_cache_tensor = torch.empty((total_block_num, self.num_kv_heads, self.block_size, 2 * self.head_dim), dtype=self.dtype)
+            block_table_tensor = encoder_block_table
 
         scheduler_metadata = ops.cpu_attn_get_scheduler_metadata(
             num_reqs=num_reqs,
@@ -227,9 +203,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             slot_mapping=slot_mapping,
             scheduler_metadata=scheduler_metadata,
             causal=causal,
-            use_sdpa_prefill=self.use_sdpa_prefill,
-            num_decode_tokens=num_decode_tokens,
-            sdpa_start_loc=sdpa_start_loc,
+            encoder_cache=encoder_cache_tensor,
         )
 
         return attn_metadata
@@ -325,22 +299,14 @@ class CPUAttentionBackendImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Handle encoder attention differently - no KV cache needed
+        # For encoder attention
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
-            return self._run_sdpa_forward(
-                query[:num_actual_tokens],
-                key[:num_actual_tokens],
-                value[:num_actual_tokens],
-                output[:num_actual_tokens],
-                attn_metadata,
-                self.attn_type,
-            )
+            kv_cache = attn_metadata.encoder_cache
 
-        # For decoder and cross-attention, use KV cache, size are
-        # [num_blocks, num_kv_heads, block_size, 2 * head_size]
-        # Make a view [num_blocks, num_kv_heads, block_size * 2, head_size]
-        # Then slice KV at dim 2
+        # KV cache size are [num_blocks, num_kv_heads, block_size, 
+        # 2 * head_size]. Make a view [num_blocks, num_kv_heads, 
+        # block_size * 2, head_size]. Then slice KV at dim 2
         num_blocks, num_kv_heads, block_size, _ = kv_cache.size()
         kv_cache = kv_cache.view((num_blocks, num_kv_heads, block_size * 2, -1))
         key_cache, value_cache = kv_cache.chunk(2, dim=2)
@@ -365,39 +331,25 @@ class CPUAttentionBackendImpl(AttentionImpl):
                 kv_cache_dtype=self.kv_cache_dtype,
             )
 
-        if attn_metadata.use_sdpa_prefill:
-            assert self.sinks is None, "Attention sink is unsupported in SDPA prefill"
-            num_decode_tokens = attn_metadata.num_decode_tokens
-            self._run_sdpa_forward(
-                query[num_decode_tokens:num_actual_tokens],
-                key[num_decode_tokens:num_actual_tokens],
-                value[num_decode_tokens:num_actual_tokens],
-                output[num_decode_tokens:num_actual_tokens],
-                attn_metadata,
-                self.attn_type,
-            )
-            num_actual_tokens = num_decode_tokens
-
-        if num_actual_tokens > 0:
-            ops.cpu_attention_with_kv_cache(
-                query=query[:num_actual_tokens],
-                key_cache=key_cache,
-                value_cache=value_cache,
-                output=output[:num_actual_tokens],  # type: ignore
-                query_start_loc=attn_metadata.query_start_loc,
-                seq_lens=attn_metadata.seq_lens,
-                scale=self.scale,
-                causal=attn_metadata.causal,
-                alibi_slopes=self.alibi_slopes,  # type: ignore
-                sliding_window=self.sliding_window,
-                block_table=attn_metadata.block_table,
-                softcap=self.logits_soft_cap,
-                scheduler_metadata=attn_metadata.scheduler_metadata,
-                s_aux=self.sinks,
-                k_scale=layer._k_scale_float,
-                v_scale=layer._v_scale_float,
-                kv_cache_dtype=self.kv_cache_dtype,
-            )
+        ops.cpu_attention_with_kv_cache(
+            query=query[:num_actual_tokens],
+            key_cache=key_cache,
+            value_cache=value_cache,
+            output=output[:num_actual_tokens],  # type: ignore
+            query_start_loc=attn_metadata.query_start_loc,
+            seq_lens=attn_metadata.seq_lens,
+            scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,  # type: ignore
+            sliding_window=self.sliding_window,
+            block_table=attn_metadata.block_table,
+            softcap=self.logits_soft_cap,
+            scheduler_metadata=attn_metadata.scheduler_metadata,
+            s_aux=self.sinks,
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
 
         return output
 

@@ -13,9 +13,10 @@ def parse_args():
     parser = EngineArgs.add_cli_args(parser)
     # Set example specific arguments
     parser.set_defaults(
-        model="intfloat/e5-small",
+        model="BAAI/bge-base-en-v1.5",
         runner="pooling",
         enforce_eager=True,
+        dtype="bfloat16"
     )
     return parser.parse_args()
 
