@@ -529,6 +529,7 @@ def run_whisper(question: str, audio_count: int) -> ModelRequestData:
         max_model_len=448,
         max_num_seqs=5,
         limit_mm_per_prompt={"audio": audio_count},
+        enforce_eager=True,
     )
 
     return ModelRequestData(
