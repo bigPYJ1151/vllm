@@ -462,8 +462,7 @@ stop_agents() {
                 sleep 1
             done
             if kill -0 "$pid" >/dev/null 2>&1; then
-                warn "agent pid=$pid did not stop after SIGTERM; sending SIGKILL"
-                kill -9 "$pid" || true
+                warn "agent pid=$pid did not stop after SIGTERM; Will stop after current job done"
             fi
         else
             warn "stale PID file: $pid_file"
