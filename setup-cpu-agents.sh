@@ -17,7 +17,7 @@ HF_TOKEN_VALUE=${HF_TOKEN:-}
 QUEUE=${QUEUE:-intel_cpu}
 HOST_ID=${HOST_ID:-}
 BUILDKITE_AGENT_BIN_VALUE=${BUILDKITE_AGENT_BIN:-}
-LOG_DIR=${LOG_DIR:-/tmp/buildkite-cpu-agents}
+LOG_DIR=${LOG_DIR:-/var/log/buildkite-cpu-agents}
 CLEANUP_SCHEDULE=${CLEANUP_SCHEDULE:-@daily}
 CLEANUP_KEEP_STORAGE=${CLEANUP_KEEP_STORAGE:-100GB}
 CLEANUP_LOG_DAYS=${CLEANUP_LOG_DAYS:-7}
@@ -41,7 +41,7 @@ Options:
   --queue QUEUE             Buildkite queue tag. Default: intel_cpu
   --host-id ID              Host identifier in agent names. Default: hostname
   --agent-bin PATH          buildkite-agent path. Env: BUILDKITE_AGENT_BIN
-  --log-dir DIR             PID/log directory. Default: /tmp/buildkite-cpu-agents
+    --log-dir DIR             PID/log directory. Default: /var/log/buildkite-cpu-agents
     --cleanup-schedule CRON   Cleanup cron schedule. Default: @daily
                             HH:MM format is also accepted.
   --cleanup-keep-storage N  BuildKit keep-storage value. Default: 100GB
@@ -385,6 +385,68 @@ metadata_value() {
     sed -n "s/^${key}=//p" "$file" | head -n 1
 }
 
+is_live_pid() {
+    local pid=${1:-}
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" >/dev/null 2>&1
+}
+
+pid_file_from_meta() {
+    local meta_file=$1
+
+    printf '%s\n' "${meta_file%.env}.pid"
+}
+
+cleanup_state_for_meta() {
+    local meta_file=$1
+
+    rm -f "$meta_file" "$(pid_file_from_meta "$meta_file")"
+}
+
+metadata_label() {
+    local meta_file=$1
+    local host node slot
+
+    host=$(metadata_value HOST_ID "$meta_file")
+    node=$(metadata_value NUMA_NODE "$meta_file")
+    slot=$(metadata_value AGENT_SLOT "$meta_file")
+
+    if [[ -n "$host" || -n "$node" || -n "$slot" ]]; then
+        printf 'host=%s node=%s slot=%s\n' "${host:-?}" "${node:-?}" "${slot:-?}"
+    else
+        basename "$meta_file"
+    fi
+}
+
+preflight_start_state() {
+    local meta_files meta pid label
+    local -a active_entries=()
+
+    shopt -s nullglob
+    meta_files=("$LOG_DIR"/*.env)
+    shopt -u nullglob
+
+    for meta in "${meta_files[@]}"; do
+        pid=$(metadata_value PID "$meta")
+        label=$(metadata_label "$meta")
+        if is_live_pid "$pid"; then
+            active_entries+=("$label (pid=$pid)")
+        else
+            warn "pruning stale managed metadata before start: $label (pid=${pid:-missing})"
+            cleanup_state_for_meta "$meta"
+        fi
+    done
+
+    if [[ ${#active_entries[@]} -gt 0 ]]; then
+        warn "active managed agents detected; start is blocked"
+        for label in "${active_entries[@]}"; do
+            warn "  $label"
+        done
+        die "refusing to start while managed agents are active; run stop first"
+    fi
+}
+
 start_agents() {
     validate_common_numbers
     [[ -n "$BUILDKITE_TOKEN_VALUE" ]] || die "--token or BUILDKITE_TOKEN is required for start"
@@ -395,6 +457,8 @@ start_agents() {
 
     agent_bin=$(resolve_agent_bin)
     host=$(host_id)
+
+    preflight_start_state
 
     load_topology
     max_agents=$((${#NODES[@]} * AGENTS_PER_NUMA))
@@ -443,31 +507,32 @@ start_agents() {
 stop_agents() {
     mkdir -p "$LOG_DIR"
     shopt -s nullglob
-    local pid_files=("$LOG_DIR"/*.pid)
+    local meta_files=("$LOG_DIR"/*.env)
     shopt -u nullglob
 
-    if [[ ${#pid_files[@]} -eq 0 ]]; then
-        warn "no managed agent PID files found in $LOG_DIR"
+    if [[ ${#meta_files[@]} -eq 0 ]]; then
+        warn "no managed agent metadata files found in $LOG_DIR"
         return 0
     fi
 
-    local pid_file pid
-    for pid_file in "${pid_files[@]}"; do
-        pid=$(cat "$pid_file")
-        if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
-            log "Stopping agent pid=$pid ($pid_file)"
+    local meta pid label
+    for meta in "${meta_files[@]}"; do
+        pid=$(metadata_value PID "$meta")
+        label=$(metadata_label "$meta")
+        if is_live_pid "$pid"; then
+            log "Stopping agent $label pid=$pid"
             kill "$pid" || true
             for _ in 1 2 3 4 5; do
-                kill -0 "$pid" >/dev/null 2>&1 || break
+                is_live_pid "$pid" || break
                 sleep 1
             done
-            if kill -0 "$pid" >/dev/null 2>&1; then
+            if is_live_pid "$pid"; then
                 warn "agent pid=$pid did not stop after SIGTERM; Will stop after current job done"
             fi
         else
-            warn "stale PID file: $pid_file"
+            warn "stale managed metadata: $label (pid=${pid:-missing})"
         fi
-        rm -f "$pid_file"
+        cleanup_state_for_meta "$meta"
     done
 }
 
@@ -500,9 +565,12 @@ status_agents() {
             slot=$(metadata_value AGENT_SLOT "$meta")
             queue=$(metadata_value QUEUE "$meta")
             core_range=$(metadata_value CORE_RANGE "$meta")
-            live=no
-            if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+            live=stale
+            if is_live_pid "$pid"; then
                 live=yes
+            else
+                warn "removing stale managed metadata: $(metadata_label "$meta") (pid=${pid:-missing})"
+                cleanup_state_for_meta "$meta"
             fi
             printf '%-6s pid=%-8s node=%-4s slot=%-4s queue=%-12s cores=%s\n' \
                 "$live" "$pid" "$node" "$slot" "$queue" "$core_range"
