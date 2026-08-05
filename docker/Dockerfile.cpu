@@ -231,6 +231,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -r requirements/test/cpu.txt --torch-backend cpu && \
     pre-commit install --hook-type pre-commit --hook-type commit-msg
 
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/ccache \
+    --mount=type=bind,from=vllm-triton-cpu-build,src=/vllm-workspace/dist,target=dist \
+    if [ "$TARGETARCH" = "amd64" ] || [ "$VLLM_CPU_X86" != "0" ]; then \
+        uv pip install "$(realpath dist/*.whl)"; \
+        mkdir -p /root/triton-cpu-wheel/ \
+        cp "$(realpath dist/*.whl)" /root/triton-cpu-wheel/ \
+    fi
+
 ENTRYPOINT ["bash"]
 
 ######################### TEST IMAGE #########################
