@@ -12,6 +12,9 @@
 #   vllm-openai-zen: vLLM from source + zentorch from PyPI via vllm[zen]
 #   vllm-test: used for CI tests
 #   vllm-dev: used for development
+#   vllm-dev-nonroot: vllm-dev, runnable as any arbitrary non-root UID via
+#     `docker run --user <uid>:0` (no rebuild needed), for bind-mounted
+#     worktree development
 #
 # Build arguments:
 #   PYTHON_VERSION=3.13|3.12 (default)|3.11|3.10
@@ -232,6 +235,42 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     pre-commit install --hook-type pre-commit --hook-type commit-msg
 
 ENTRYPOINT ["bash"]
+
+######################### DEV IMAGE (NON-ROOT, OPT-IN) #########################
+# Arbitrary-UID non-root variant of `vllm-dev`, same pattern as
+# `vllm-openai-nonroot` in docker/Dockerfile: a `dev` user (UID 2000, GID 0)
+# plus an entrypoint wrapper that patches $HOME/$USER/passwd for whatever UID
+# actually runs the container. Works for any host user with no rebuild:
+#   docker run --user $(id -u):0 ... vllm-dev-nonroot
+#
+# /opt/venv and /opt/uv are left root-owned - already world-readable/
+# executable, which is enough to run vllm/tests as non-root, and a chgrp/chmod
+# -R sweep for group-write would copy-up their multi-GB contents into this
+# layer for no real benefit (measured: 12.5GB -> 21GB).
+#
+# Build via:
+#   docker build --target vllm-dev-nonroot -t vllm-dev-nonroot -f docker/Dockerfile.cpu .
+FROM vllm-dev AS vllm-dev-nonroot
+
+RUN useradd --uid 2000 --gid 0 --create-home --home-dir /home/dev --shell /bin/bash dev \
+    && mkdir -p /home/dev/.cache/ccache /home/dev/.cache/uv \
+    && chown -R 2000:0 /home/dev \
+    && chmod -R g+rwX /home/dev \
+    # so the entrypoint wrapper can add a passwd entry for arbitrary UIDs
+    && chgrp 0 /etc/passwd /etc/group \
+    && chmod g=u /etc/passwd /etc/group \
+    # /root/.local/bin is unreachable for non-root (/root is mode 700)
+    && cp /root/.local/bin/uv /usr/local/bin/uv
+
+ENV CCACHE_DIR=/home/dev/.cache/ccache
+ENV UV_CACHE_DIR=/home/dev/.cache/uv
+
+COPY docker/entrypoints/vllm-dev-nonroot-entrypoint.sh /usr/local/bin/vllm-dev-nonroot-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/vllm-dev-nonroot-entrypoint.sh
+
+USER dev
+WORKDIR /vllm-workspace
+ENTRYPOINT ["/usr/local/bin/vllm-dev-nonroot-entrypoint.sh"]
 
 ######################### TEST IMAGE #########################
 FROM vllm-test-deps AS vllm-test
