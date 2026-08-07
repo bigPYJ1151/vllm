@@ -1,0 +1,27 @@
+{
+  "build_tag": "O3-release",
+  "cpu_binding_tag": "cpu192-222",
+  "args": {
+    "models": null,
+    "linear_types": "qkv,o_proj,gate_up,down,moe_gate,lm_head",
+    "tp_sizes": "1,2,4,8",
+    "m_list": null,
+    "dtype": "bf16,fp16",
+    "kernels": "onednn,sgl",
+    "iters": 20,
+    "warmup": 5,
+    "repeats": 5,
+    "use_bias": true,
+    "seed": 0,
+    "build_tag": "O3-release",
+    "cpu_binding_tag": "cpu192-222",
+    "output_dir": "/home/sdp/vllm/.claude/worktrees/profile_sglang_gemm/.agent-workspace/linear-kernel-bench/results",
+    "quick": false
+  },
+  "git_rev": "7e724dca897dda9e3fd05abcfe5b0f6d77c564b1",
+  "git_diff_stat": "",
+  "torch_version": "2.13.0+cpu",
+  "python_version": "3.12.13",
+  "amx_tile_supported": true,
+  "cpus_allowed_list_at_runtime": "192-222"
+}
