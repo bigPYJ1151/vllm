@@ -201,6 +201,19 @@ join_csv() {
     awk 'BEGIN { first = 1 } { if (!first) printf ","; printf "%s", $1; first = 0 } END { printf "\n" }'
 }
 
+tag_value() {
+    local key=$1 tags=$2 pair
+
+    IFS=',' read -ra pairs <<<"$tags"
+    for pair in "${pairs[@]}"; do
+        if [[ "${pair%%=*}" == "$key" ]]; then
+            echo "${pair#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 contains_word() {
     local needle=$1
     shift
@@ -465,7 +478,7 @@ start_agents() {
     mkdir -p "$LOG_DIR"
 
     local agent_bin host max_agents requested node slot core_range pid_file log_file meta_file agent_name
-    local old_pid agent_pid agent_tags
+    local old_pid agent_pid agent_tags label_value name_suffix
 
     agent_bin=$(resolve_agent_bin)
     host=$(host_id)
@@ -474,6 +487,9 @@ start_agents() {
     if [[ -n "$TAGS_VALUE" ]]; then
         agent_tags="$agent_tags,$TAGS_VALUE"
     fi
+
+    label_value=$(tag_value "label" "$TAGS_VALUE") || label_value=""
+    name_suffix=${label_value:-%random}
 
     preflight_start_state
 
@@ -491,7 +507,7 @@ start_agents() {
         pid_file="$LOG_DIR/agent-${host}-numa${node}-slot${slot}.pid"
         log_file="$LOG_DIR/agent-${host}-numa${node}-slot${slot}.log"
         meta_file="$LOG_DIR/agent-${host}-numa${node}-slot${slot}.env"
-        agent_name="cpu-${host}-numa${node}-slot${slot}-%n"
+        agent_name="cpu-${host}-numa${node}-slot${slot}-${name_suffix}"
 
         if [[ -f "$pid_file" ]]; then
             old_pid=$(cat "$pid_file")
