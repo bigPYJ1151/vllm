@@ -15,6 +15,7 @@ NUM_AGENTS=${NUM_AGENTS:-}
 BUILDKITE_TOKEN_VALUE=${BUILDKITE_TOKEN:-}
 HF_TOKEN_VALUE=${HF_TOKEN:-}
 QUEUE=${QUEUE:-intel_cpu}
+TAGS_VALUE=${TAGS:-}
 HOST_ID=${HOST_ID:-}
 BUILDKITE_AGENT_BIN_VALUE=${BUILDKITE_AGENT_BIN:-}
 LOG_DIR=${LOG_DIR:-/var/log/buildkite-cpu-agents}
@@ -39,6 +40,9 @@ Options:
   --token TOKEN             Buildkite agent token. Env: BUILDKITE_TOKEN
   --hf-token TOKEN          Hugging Face token exported to agents. Env: HF_TOKEN
   --queue QUEUE             Buildkite queue tag. Default: intel_cpu
+  --tags TAGS               Extra buildkite agent tags (comma-separated
+                            key=value pairs), added alongside the queue tag.
+                            Repeatable; values are combined. Env: TAGS
   --host-id ID              Host identifier in agent names. Default: hostname
   --agent-bin PATH          buildkite-agent path. Env: BUILDKITE_AGENT_BIN
     --log-dir DIR             PID/log directory. Default: /var/log/buildkite-cpu-agents
@@ -91,6 +95,14 @@ parse_args() {
                 ;;
             --queue)
                 QUEUE=${2:?"--queue requires a value"}
+                shift 2
+                ;;
+            --tags)
+                if [[ -n "$TAGS_VALUE" ]]; then
+                    TAGS_VALUE="$TAGS_VALUE,${2:?"--tags requires a value"}"
+                else
+                    TAGS_VALUE=${2:?"--tags requires a value"}
+                fi
                 shift 2
                 ;;
             --host-id)
@@ -453,10 +465,15 @@ start_agents() {
     mkdir -p "$LOG_DIR"
 
     local agent_bin host max_agents requested node slot core_range pid_file log_file meta_file agent_name
-    local old_pid agent_pid
+    local old_pid agent_pid agent_tags
 
     agent_bin=$(resolve_agent_bin)
     host=$(host_id)
+
+    agent_tags="queue=$QUEUE"
+    if [[ -n "$TAGS_VALUE" ]]; then
+        agent_tags="$agent_tags,$TAGS_VALUE"
+    fi
 
     preflight_start_state
 
@@ -493,7 +510,7 @@ start_agents() {
             fi
             exec "$agent_bin" start \
                 --token "$BUILDKITE_TOKEN_VALUE" \
-                --tags "queue=$QUEUE" \
+                --tags "$agent_tags" \
                 --name "$agent_name"
         ) >"$log_file" 2>&1 &
 
