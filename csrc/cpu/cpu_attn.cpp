@@ -24,14 +24,8 @@ bool cpu_attn_has_isa(const std::string& isa) {
 #endif
   }
   if (isa == "amx_fp8") {
-#ifdef CPU_CAPABILITY_AMXFP8
-    // Guard with runtime CPUID check: the binary may be compiled with
-    // -mamx-fp8 (CPU_CAPABILITY_AMXFP8 defined) but run on a CPU that
-    // has AMX-BF16 without AMX-FP8 (e.g. Sapphire Rapids, Emerald Rapids).
-    return runtime_has_amx_fp8();
-#else
+    // Temporarily disabled for DMR performance evaluation.
     return false;
-#endif
   }
   return false;
 }
