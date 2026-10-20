@@ -205,12 +205,14 @@ Notes:
 
 The CPU backend uses a different mechanism from `--numa-bind`. CPU execution is
 configured through CPU-specific environment variables such as
-`VLLM_CPU_OMP_THREADS_BIND`, `VLLM_CPU_NUM_OF_RESERVED_CPU`, and
-`CPU_VISIBLE_MEMORY_NODES`, rather than the GPU-oriented `--numa-bind*` CLI
-options.
+`VLLM_CPU_OMP_THREADS_BIND`, `VLLM_CPU_NUM_OF_RESERVED_CPU`,
+`VLLM_CPU_BIND_GRANULARITY`, and `CPU_VISIBLE_MEMORY_NODES`, rather than the
+GPU-oriented `--numa-bind*` CLI options.
 
 By default, `VLLM_CPU_OMP_THREADS_BIND=auto` derives OpenMP placement from the
-available CPU and NUMA topology for each CPU worker. To override the automatic
+available CPU and NUMA topology for each CPU worker, with one NUMA node per
+rank. Set `VLLM_CPU_BIND_GRANULARITY=cbb` to bind each rank to one CBB (CPU cores
+sharing a last-level cache) instead. To override the automatic
 policy, set `VLLM_CPU_OMP_THREADS_BIND` explicitly using the CPU list format
 documented for the CPU backend, or use `nobind` to disable this behavior.
 

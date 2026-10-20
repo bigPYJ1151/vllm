@@ -62,7 +62,9 @@ class CPUWorker(Worker):
 
         # On s390x, numa_node may be a synthetic book ID that doesn't
         # correspond to a real memory node. Fall back to first visible node.
-        if cpu_core.numa_node in allowed_memory_nodes:
+        if "VLLM_CPU_RANK_MEMORY_NODE" in os.environ:
+            memory_node = int(os.environ["VLLM_CPU_RANK_MEMORY_NODE"])
+        elif cpu_core.numa_node in allowed_memory_nodes:
             memory_node = cpu_core.numa_node
         else:
             logger.warning(
@@ -77,9 +79,11 @@ class CPUWorker(Worker):
 
         memory_status = get_memory_node_info(memory_node)
         memory_fraction = vllm_config.cache_config.gpu_memory_utilization
-        self.requested_cpu_memory = math.ceil(
-            memory_status.total_memory * memory_fraction
-        )
+        # Under CBB binding, a rank owns one CBB's share of its memory node
+        # regardless of how many ranks are launched.
+        cbbs_on_node = int(os.environ.get("VLLM_CPU_CBBS_ON_NODE", "1"))
+        self.rank_total_memory = memory_status.total_memory // cbbs_on_node
+        self.requested_cpu_memory = math.ceil(self.rank_total_memory * memory_fraction)
 
         super().__init__(
             vllm_config,
@@ -195,7 +199,10 @@ class CPUWorker(Worker):
         allowed_cpu_list = get_allowed_cpu_list()
         cpu_core = allowed_cpu_list[0]
 
-        memory_status = get_memory_node_info(cpu_core.numa_node)
+        memory_node = int(
+            os.environ.get("VLLM_CPU_RANK_MEMORY_NODE", cpu_core.numa_node)
+        )
+        memory_status = get_memory_node_info(memory_node)
         available_memory = memory_status.available_memory
         explicit_kv_cache_size = self.cache_config.kv_cache_memory_bytes
 
@@ -204,7 +211,7 @@ class CPUWorker(Worker):
         if explicit_kv_cache_size is not None:
             if explicit_kv_cache_size > available_memory:
                 raise ValueError(
-                    f"Available memory on node {cpu_core.numa_node} "
+                    f"Available memory on node {memory_node} "
                     f"({format_gib(available_memory)}/"
                     f"{format_gib(memory_status.total_memory)} GiB) on kv cache"
                     f" allocation is less than requested memory for kv "
@@ -216,7 +223,7 @@ class CPUWorker(Worker):
             msg = (
                 f"Explicitly set ({format_gib(kv_cache_size)}/"
                 f"{format_gib(memory_status.total_memory)}) GiB for KV cache "
-                f"on node {cpu_core.numa_node}."
+                f"on node {memory_node}."
             )
         else:
             consumed_memory = psutil.Process(os.getpid()).memory_info().rss
@@ -225,12 +232,12 @@ class CPUWorker(Worker):
                 # The worker's own footprint already fills its reservation, so
                 # freeing memory elsewhere cannot help: only a larger
                 # reservation or an explicit KV cache size can.
-                in_use = math.ceil(consumed_memory / memory_status.total_memory * 100)
+                in_use = math.ceil(consumed_memory / self.rank_total_memory * 100)
                 raise ValueError(
                     f"The worker already uses {format_gib(consumed_memory)} GiB "
                     "(model weights and runtime), more than the "
                     f"{format_gib(self.requested_cpu_memory)} GiB of CPU memory "
-                    f"reserved for it on node {cpu_core.numa_node}, leaving none "
+                    f"reserved for it on node {memory_node}, leaving none "
                     "for the KV cache. On the CPU backend, the "
                     "`--gpu-memory-utilization` flag controls the fraction of CPU "
                     "memory reserved (despite its name). To resolve: increase "
@@ -240,7 +247,7 @@ class CPUWorker(Worker):
                 )
             if requested_memory_for_kv > available_memory:
                 raise ValueError(
-                    f"Available memory on node {cpu_core.numa_node} "
+                    f"Available memory on node {memory_node} "
                     f"({format_gib(available_memory)}/"
                     f"{format_gib(memory_status.total_memory)} GiB) on kv cache"
                     f" allocation is less than requested memory for kv "
@@ -252,7 +259,7 @@ class CPUWorker(Worker):
             msg = (
                 f"Auto set ({format_gib(kv_cache_size)}/"
                 f"{format_gib(memory_status.total_memory)}) GiB for KV cache "
-                f"on node {cpu_core.numa_node}, with "
+                f"on node {memory_node}, with "
                 f"{format_gib(self.requested_cpu_memory)} GiB requested memory"
                 f" for the worker. {format_gib(consumed_memory)} GiB"
                 f" memory was consumed by non-kv usages."

@@ -102,6 +102,10 @@ class OMPProcessManager:
             envs_dict["OMP_PLACES"] = f"{{{cpu_list_str}}}"
             envs_dict["OMP_PROC_BIND"] = "true"
 
+        if self.rank_memory_info:
+            memory_node, cbbs_on_node = self.rank_memory_info[local_rank]
+            envs_dict["VLLM_CPU_RANK_MEMORY_NODE"] = str(memory_node)
+            envs_dict["VLLM_CPU_CBBS_ON_NODE"] = str(cbbs_on_node)
         # backup envs
         old_envs_dict = {}
         for k in envs_dict:
@@ -126,6 +130,9 @@ class OMPProcessManager:
         self.auto_setup = vllm_mask == "auto"
         self.reserved_cpu_list = []
         self.cpu_lists = []
+        # (memory node, number of CBBs on that node) of each local rank,
+        # only filled under VLLM_CPU_BIND_GRANULARITY=cbb
+        self.rank_memory_info: list[tuple[int, int]] = []
 
         if self.auto_setup:
             # auto generate CPU lists
@@ -214,21 +221,47 @@ class OMPProcessManager:
         if cpu_arch == CpuArchEnum.S390X:
             allowed_numa_nodes = sorted(set(cpu.numa_node for cpu in logical_cpu_list))
 
-        assert (
-            len(allowed_numa_nodes) >= local_world_size or self.simulate_multi_node
-        ), (
-            f"Not enough allowed NUMA nodes to bind threads of "
-            f"{local_world_size} local CPUWorkers. "
-            f"Allowed NUMA nodes are {allowed_numa_nodes}. "
-            "Please try to bind threads manually or decrease DP/TP/PP."
+        # The simulated multi-NUMA binding takes precedence over CBB binding
+        use_cbb = (
+            envs.VLLM_CPU_BIND_GRANULARITY == "cbb" and not self.simulate_multi_node
         )
+        cbbs: list[cr_utils.CBBInfo] = []
+        cbb_rank_offset = 0
+        if use_cbb:
+            cbbs = cr_utils.get_visible_cbbs()
+            cbb_rank_offset = local_world_size * (self.local_dp_rank or 0)
+            assert len(cbbs) >= cbb_rank_offset + local_world_size, (
+                f"Not enough allowed CBBs to bind threads of "
+                f"{local_world_size} local CPUWorkers (rank offset "
+                f"{cbb_rank_offset}). Allowed CBBs are "
+                f"{[(x.numa_node, x.llc_id) for x in cbbs]}. "
+                "Please try to bind threads manually or decrease DP/TP/PP."
+            )
+        else:
+            assert (
+                len(allowed_numa_nodes) >= local_world_size or self.simulate_multi_node
+            ), (
+                f"Not enough allowed NUMA nodes to bind threads of "
+                f"{local_world_size} local CPUWorkers. "
+                f"Allowed NUMA nodes are {allowed_numa_nodes}. "
+                "Please try to bind threads manually or decrease DP/TP/PP."
+            )
 
         # Generate OMP CPU list for each rank
         cpu_lists_of_ranks = []
         reserved_cpu_list = []
         total_cpu_num = 0
         for local_rank in range(self.local_world_size):
-            if not self.simulate_multi_node:
+            if use_cbb:
+                cbb = cbbs[cbb_rank_offset + local_rank]
+                selected_logical_cpu_list = cbb.cpus
+                self.rank_memory_info.append(
+                    (
+                        cbb.numa_node,
+                        sum(1 for x in cbbs if x.numa_node == cbb.numa_node),
+                    )
+                )
+            elif not self.simulate_multi_node:
                 selected_numa_node = allowed_numa_nodes[local_rank]
                 selected_logical_cpu_list = [
                     x for x in logical_cpu_list if x.numa_node == selected_numa_node

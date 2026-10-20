@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
+    VLLM_CPU_BIND_GRANULARITY: Literal["numa", "cbb"] = "numa"
     VLLM_CPU_CI_ENV: bool = False
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
@@ -905,6 +906,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_CPU_NUM_OF_RESERVED_CPU", "0"))
         if "VLLM_CPU_NUM_OF_RESERVED_CPU" in os.environ
         else None
+    ),
+    # (CPU backend only) allocation unit of a rank when
+    # VLLM_CPU_OMP_THREADS_BIND=auto. "numa": one NUMA node per rank.
+    # "cbb": one CBB (CPUs sharing a last-level cache) per rank.
+    "VLLM_CPU_BIND_GRANULARITY": env_with_choices(
+        "VLLM_CPU_BIND_GRANULARITY", "numa", ["numa", "cbb"]
     ),
     # (CPU backend only) whether vLLM is running in a CI environment.
     "VLLM_CPU_CI_ENV": lambda: bool(int(os.getenv("VLLM_CPU_CI_ENV", "0"))),

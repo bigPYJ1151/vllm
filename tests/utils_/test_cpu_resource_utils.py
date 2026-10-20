@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cgroup memory readers and SHM allocation preflight checks."""
 
+import json
 import sys
 from io import StringIO
 from types import SimpleNamespace
@@ -267,3 +268,140 @@ def test_omp_manager_binds_each_dp_rank_to_its_assigned_node(monkeypatch):
     assert rank0 and rank1
     assert rank0 <= set(range(8))
     assert rank1 <= set(range(8, 16))
+
+
+# Trimmed `lscpu --json --extended=CPU,CORE,NODE,CACHE` of a 2-CBB-per-node
+# machine: CPUs 0-1 / 2-3 on node 0 (L3 0 / 1), CPUs 4-5 / 6-7 on node 1.
+_LSCPU_CACHE_JSON = """{"cpus": [
+  {"cpu": 0, "core": 0, "node": 0, "l1d:l1i:l2:l3": "0:0:0:0"},
+  {"cpu": 1, "core": 1, "node": 0, "l1d:l1i:l2:l3": "2:2:0:0"},
+  {"cpu": 2, "core": 2, "node": 0, "l1d:l1i:l2:l3": "72:72:9:1"},
+  {"cpu": 3, "core": 3, "node": 0, "l1d:l1i:l2:l3": "74:74:9:1"},
+  {"cpu": 4, "core": 4, "node": 1, "l1d:l1i:l2:l3": "80:80:10:2"},
+  {"cpu": 5, "core": 5, "node": 1, "l1d:l1i:l2:l3": "82:82:10:2"},
+  {"cpu": 6, "core": 6, "node": 1, "l1d:l1i:l2:l3": "88:88:11:3"},
+  {"cpu": 7, "core": 7, "node": 1, "l1d:l1i:l2:l3": "90:90:11:3"}
+]}"""
+
+
+def _cpus():
+    return json.loads(_LSCPU_CACHE_JSON, object_hook=cru.LogicalCPUInfo.json_decoder)[
+        "cpus"
+    ]
+
+
+def test_lscpu_cache_column_gives_llc_id():
+    assert [x.llc_id for x in _cpus()] == [0, 0, 1, 1, 2, 2, 3, 3]
+
+
+@pytest.mark.parametrize("key", ["l1d:l1i:l2:l3", "cache"])
+def test_lscpu_cache_column_key_variants(key):
+    cpu = cru.LogicalCPUInfo.json_decoder(
+        {"cpu": 0, "core": 0, "node": 0, key: "72:72:9:1"}
+    )
+    assert cpu.llc_id == 1
+
+
+@pytest.mark.parametrize("cache", ["-", "", "::-:-"])
+def test_missing_lscpu_cache_gives_unknown_llc_id(cache):
+    cpu = cru.LogicalCPUInfo.json_decoder(
+        {"cpu": 0, "core": 0, "node": 0, "l1d:l1i:l2:l3": cache}
+    )
+    assert cpu.llc_id == -1
+
+
+def test_absent_lscpu_cache_column_gives_unknown_llc_id():
+    cpu = cru.LogicalCPUInfo.json_decoder({"cpu": 0, "core": 0, "node": 0})
+    assert cpu.llc_id == -1
+
+
+def test_group_cpus_by_cbb_follows_memory_node_order():
+    groups = cru.group_cpus_by_cbb(_cpus(), [1, 0])
+    assert [(g.numa_node, g.llc_id) for g in groups] == [(1, 2), (1, 3), (0, 0), (0, 1)]
+    assert [[c.id for c in g.cpus] for g in groups] == [[4, 5], [6, 7], [0, 1], [2, 3]]
+
+
+def test_group_cpus_by_cbb_skips_masked_nodes():
+    groups = cru.group_cpus_by_cbb(_cpus(), [1])
+    assert [(g.numa_node, g.llc_id) for g in groups] == [(1, 2), (1, 3)]
+
+
+def test_group_cpus_by_cbb_without_llc_info_is_one_group_per_node():
+    cpus = [cru.LogicalCPUInfo(i, i, i // 4) for i in range(8)]
+    groups = cru.group_cpus_by_cbb(cpus, [0, 1])
+    assert [[c.id for c in g.cpus] for g in groups] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def _omp_manager(monkeypatch, *, local_world_size, local_dp_rank, cbbs):
+    from types import SimpleNamespace
+
+    import vllm.utils.ompmultiprocessing as omp
+
+    monkeypatch.setattr(omp.envs, "VLLM_CPU_BIND_GRANULARITY", "cbb", raising=False)
+    monkeypatch.setattr(
+        omp,
+        "current_platform",
+        SimpleNamespace(get_cpu_architecture=lambda: omp.CpuArchEnum.X86),
+    )
+    monkeypatch.setattr(omp.cr_utils, "get_visible_memory_node", lambda: [0, 1])
+    monkeypatch.setattr(omp.cr_utils, "get_allowed_cpu_list", lambda: _cpus())
+    monkeypatch.setattr(omp.cr_utils, "get_visible_cbbs", lambda: cbbs)
+    manager = omp.OMPProcessManager.__new__(omp.OMPProcessManager)
+    manager.local_world_size = local_world_size
+    manager.local_dp_rank = local_dp_rank
+    manager.simulate_multi_node = False
+    manager.reserve_cpu_num = 0
+    manager.rank_memory_info = []
+    return manager
+
+
+def test_cbb_autobind_assigns_one_cbb_per_rank(monkeypatch):
+    manager = _omp_manager(
+        monkeypatch,
+        local_world_size=3,
+        local_dp_rank=None,
+        cbbs=cru.group_cpus_by_cbb(_cpus(), [0, 1]),
+    )
+    cpu_lists, reserved = manager._get_autobind_cpu_ids(lambda cpus: cpus)
+    assert [[c.id for c in x] for x in cpu_lists] == [[0, 1], [2, 3], [4, 5]]
+    assert reserved == []
+    # Two CBBs per node, whatever the world size.
+    assert manager.rank_memory_info == [(0, 2), (0, 2), (1, 2)]
+
+
+def test_cbb_autobind_offsets_ranks_by_dp_rank(monkeypatch):
+    manager = _omp_manager(
+        monkeypatch,
+        local_world_size=2,
+        local_dp_rank=1,
+        cbbs=cru.group_cpus_by_cbb(_cpus(), [0, 1]),
+    )
+    cpu_lists, _ = manager._get_autobind_cpu_ids(lambda cpus: cpus)
+    assert [[c.id for c in x] for x in cpu_lists] == [[4, 5], [6, 7]]
+    assert manager.rank_memory_info == [(1, 2), (1, 2)]
+
+
+def test_cbb_autobind_rejects_more_ranks_than_cbbs(monkeypatch):
+    manager = _omp_manager(
+        monkeypatch,
+        local_world_size=5,
+        local_dp_rank=None,
+        cbbs=cru.group_cpus_by_cbb(_cpus(), [0, 1]),
+    )
+    with pytest.raises(AssertionError, match="Not enough allowed CBBs"):
+        manager._get_autobind_cpu_ids(lambda cpus: cpus)
+
+
+def test_simulated_multi_numa_takes_precedence_over_cbb(monkeypatch):
+    manager = _omp_manager(
+        monkeypatch,
+        local_world_size=4,
+        local_dp_rank=0,
+        cbbs=cru.group_cpus_by_cbb(_cpus(), [0, 1]),
+    )
+    manager.simulate_multi_node = True
+    manager.internal_dp_size = 1
+    cpu_lists, _ = manager._get_autobind_cpu_ids(lambda cpus: cpus)
+    # 4 simulated nodes of 2 CPUs each, and no CBB memory info
+    assert [[c.id for c in x] for x in cpu_lists] == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert manager.rank_memory_info == []

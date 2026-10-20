@@ -29,6 +29,7 @@ def _worker(monkeypatch, *, reserved, rss, total=8 * GiB, available=4 * GiB):
 
     worker = CPUWorker.__new__(CPUWorker)
     worker.requested_cpu_memory = reserved
+    worker.rank_total_memory = total
     worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=None)
     monkeypatch.setattr(CPUWorker, "_should_warm_up_model", lambda self: False)
     monkeypatch.setattr(
@@ -68,3 +69,44 @@ def test_short_node_memory_still_asks_to_free_memory(monkeypatch):
 def test_budget_that_fits_sizes_the_kv_cache(monkeypatch):
     worker = _worker(monkeypatch, reserved=3 * GiB, rss=1 * GiB)
     assert worker.determine_available_memory() == 2 * GiB
+
+
+def test_cbb_binding_splits_node_memory_by_cbbs_on_node(monkeypatch):
+    """Each rank owns one CBB's share of its node, whatever the TP size."""
+    import vllm.v1.worker.cpu_worker as cpu_worker_mod
+    from vllm.v1.worker.cpu_worker import CPUWorker
+
+    membind = []
+    queried = []
+
+    def node_info(node):
+        queried.append(node)
+        return MemoryNodeInfo(total_memory=100 * GiB, available_memory=100 * GiB)
+
+    monkeypatch.setenv("VLLM_CPU_RANK_MEMORY_NODE", "1")
+    monkeypatch.setenv("VLLM_CPU_CBBS_ON_NODE", "4")
+    monkeypatch.setattr(
+        cpu_worker_mod, "get_allowed_cpu_list", lambda: [SimpleNamespace(numa_node=0)]
+    )
+    monkeypatch.setattr(cpu_worker_mod, "get_visible_memory_node", lambda: [0, 1])
+    monkeypatch.setattr(cpu_worker_mod, "get_memory_node_info", node_info)
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(_C=SimpleNamespace(init_cpu_memory_env=membind.append))
+    )
+    monkeypatch.setattr(cpu_worker_mod, "torch", fake_torch)
+    monkeypatch.setattr(
+        cpu_worker_mod.Worker,
+        "__init__",
+        lambda self, *a, **k: setattr(self, "parallel_config", SimpleNamespace()),
+    )
+
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            gpu_memory_utilization=0.8, kv_cache_memory_bytes=None
+        )
+    )
+    worker = CPUWorker(vllm_config, 0, 0, "")
+
+    assert membind == [[1]]
+    assert worker.requested_cpu_memory == 20 * GiB
+    assert queried == [1]

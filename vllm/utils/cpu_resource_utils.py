@@ -24,6 +24,8 @@ class LogicalCPUInfo:
     id: int = -1
     physical_core: int = -1
     numa_node: int = -1
+    # Last-level cache id, -1 if unknown
+    llc_id: int = -1
 
     @classmethod
     def _int(cls, value: str) -> int:
@@ -40,10 +42,17 @@ class LogicalCPUInfo:
         numa_node = obj_dict.get("node")
 
         if not (id is None or physical_core is None or numa_node is None):
+            # The lscpu CACHE column holds "L1d:L1i:L2:L3" ids, e.g. "2:2:0:0",
+            # and is keyed by its header "l1d:l1i:l2:l3" (or "cache" in older lscpu)
+            cache = next(
+                (str(v) for k, v in obj_dict.items() if k == "cache" or ":" in k),
+                "",
+            )
             return LogicalCPUInfo(
                 id=LogicalCPUInfo._int(id),
                 physical_core=LogicalCPUInfo._int(physical_core),
                 numa_node=LogicalCPUInfo._int(numa_node),
+                llc_id=LogicalCPUInfo._int(cache.split(":")[-1]),
             )
         else:
             return obj_dict
@@ -278,6 +287,35 @@ def get_visible_memory_node(assigned_node_ids: list[int] | None = None) -> list[
     return allowed_memory_node_list
 
 
+@dataclass
+class CBBInfo:
+    numa_node: int
+    llc_id: int
+    cpus: list[LogicalCPUInfo]
+
+
+def group_cpus_by_cbb(
+    cpu_list: list[LogicalCPUInfo], memory_nodes: list[int]
+) -> list[CBBInfo]:
+    """Group CPUs into CBBs (CPUs sharing a last-level cache within a NUMA node).
+
+    CBBs are ordered by the given memory node order, then by LLC id. CPUs
+    without a known LLC id form a single CBB per node.
+    """
+    cbbs: list[CBBInfo] = []
+    for node in memory_nodes:
+        llc_to_cpus: dict[int, list[LogicalCPUInfo]] = {}
+        for cpu in cpu_list:
+            if cpu.numa_node == node:
+                llc_to_cpus.setdefault(cpu.llc_id, []).append(cpu)
+        cbbs.extend(CBBInfo(node, llc, llc_to_cpus[llc]) for llc in sorted(llc_to_cpus))
+    return cbbs
+
+
+def get_visible_cbbs() -> list[CBBInfo]:
+    return group_cpus_by_cbb(get_allowed_cpu_list(), get_visible_memory_node())
+
+
 @cache
 def _synthesize_cpu_list() -> list[LogicalCPUInfo]:
     """Synthesize a flat CPU list: each logical CPU is its own core on
@@ -299,7 +337,9 @@ def _get_cpu_list() -> list[LogicalCPUInfo]:
         )
     else:
         lscpu_output = subprocess.check_output(
-            "lscpu --json --extended=CPU,CORE,NODE --online", shell=True, text=True
+            "lscpu --json --extended=CPU,CORE,NODE,CACHE --online",
+            shell=True,
+            text=True,
         )
 
     # For platforms without NUMA, map bare `-` node to 0 so non-NUMA
