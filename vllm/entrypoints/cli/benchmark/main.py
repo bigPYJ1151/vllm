@@ -41,6 +41,7 @@ def _import_bench_subcommand_modules() -> None:
     import vllm.entrypoints.cli.benchmark.forward  # noqa: F401
     import vllm.entrypoints.cli.benchmark.latency  # noqa: F401
     import vllm.entrypoints.cli.benchmark.mm_processor  # noqa: F401
+    import vllm.entrypoints.cli.benchmark.one_batch  # noqa: F401
     import vllm.entrypoints.cli.benchmark.serve  # noqa: F401
     import vllm.entrypoints.cli.benchmark.startup  # noqa: F401
     import vllm.entrypoints.cli.benchmark.sweep  # noqa: F401
