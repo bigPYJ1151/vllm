@@ -279,3 +279,101 @@ void cpu_attention_with_kv_cache(
             });
       });
 }
+
+namespace {
+
+// kv_cache: [num_blocks, num_kv_heads, block_size, 2 * head_size] ->
+// (key_cache, value_cache), each [num_blocks, num_kv_heads, block_size,
+// head_size] views.
+std::pair<torch::Tensor, torch::Tensor> split_kv_cache(
+    const torch::Tensor& kv_cache) {
+  const int64_t num_blocks = kv_cache.size(0);
+  const int64_t num_kv_heads = kv_cache.size(1);
+  const int64_t block_size = kv_cache.size(2);
+  const auto kv = kv_cache.view({num_blocks, num_kv_heads, block_size * 2, -1});
+  const auto kv_pair = kv.chunk(2, 2);
+  return {kv_pair[0], kv_pair[1]};
+}
+
+}  // namespace
+
+void cpu_attn_reshape_and_cache_kv_cache(
+    const torch::Tensor& key, const torch::Tensor& value,
+    const torch::Tensor& kv_cache, const torch::Tensor& slot_mapping,
+    const std::string& isa, const double k_scale, const double v_scale,
+    const std::string& kv_cache_dtype) {
+  auto [key_cache, value_cache] = split_kv_cache(kv_cache);
+  cpu_attn_reshape_and_cache(key, value, key_cache, value_cache, slot_mapping,
+                             isa, k_scale, v_scale, kv_cache_dtype);
+}
+
+void cpu_attention_with_kv_cache_kv_cache(
+    const torch::Tensor& query, const torch::Tensor& kv_cache,
+    torch::Tensor& output, const int64_t num_actual_tokens,
+    const torch::Tensor& query_start_loc, const torch::Tensor& seq_lens,
+    const double scale, const bool causal,
+    const std::optional<torch::Tensor>& alibi_slopes,
+    const int64_t sliding_window, const torch::Tensor& block_table,
+    const double softcap, const torch::Tensor& scheduler_metadata,
+    const std::optional<torch::Tensor>& s_aux,
+    const std::optional<torch::Tensor>& dynamic_causal, const double k_scale,
+    const double v_scale, const std::string& kv_cache_dtype) {
+  auto [key_cache, value_cache] = split_kv_cache(kv_cache);
+  torch::Tensor output_view = output.narrow(0, 0, num_actual_tokens);
+  cpu_attention_with_kv_cache(query.narrow(0, 0, num_actual_tokens), key_cache,
+                              value_cache, output_view, query_start_loc,
+                              seq_lens, scale, causal, alibi_slopes,
+                              sliding_window, block_table, softcap,
+                              scheduler_metadata, s_aux, dynamic_causal,
+                              k_scale, v_scale, kv_cache_dtype);
+}
+
+// Writes `key`/`value` into the KV cache (when given) and runs attention for
+// one layer. All arguments are tensors, numbers or bools, so Inductor's C++
+// wrapper can call the op without going through Python. A step without
+// requests is a no-op.
+void cpu_attn_forward(
+    const torch::Tensor& query, const std::optional<torch::Tensor>& key,
+    const std::optional<torch::Tensor>& value, torch::Tensor& output,
+    torch::Tensor& kv_cache, const torch::Tensor& query_start_loc,
+    const torch::Tensor& seq_lens, const torch::Tensor& block_table,
+    const torch::Tensor& scheduler_metadata, const torch::Tensor& slot_mapping,
+    const std::optional<torch::Tensor>& alibi_slopes,
+    const std::optional<torch::Tensor>& s_aux, const double scale,
+    const bool causal, const int64_t sliding_window, const double softcap,
+    const torch::Tensor& kv_cache_dtype, const double k_scale,
+    const double v_scale) {
+  if (query_start_loc.numel() < 2 || query.size(0) == 0) {
+    return;
+  }
+  // The KV cache dtype name arrives as a uint8 tensor of its characters,
+  // since a string argument would make Inductor call the op through Python.
+  TORCH_CHECK(kv_cache_dtype.scalar_type() == at::kByte &&
+                  kv_cache_dtype.is_contiguous(),
+              "kv_cache_dtype must be a contiguous uint8 tensor");
+  const std::string kv_dtype(
+      reinterpret_cast<const char*>(kv_cache_dtype.data_ptr<uint8_t>()),
+      kv_cache_dtype.numel());
+  // The scheduler metadata records the ISA it was built for.
+  const auto* metadata = reinterpret_cast<const cpu_attention::AttentionMetadata*>(
+      scheduler_metadata.data_ptr());
+  std::string isa;
+  switch (metadata->isa) {
+    case cpu_attention::ISA::AMX: isa = "amx"; break;
+    case cpu_attention::ISA::AMX_FP8: isa = "amx_fp8"; break;
+    case cpu_attention::ISA::VEC: isa = "vec"; break;
+    case cpu_attention::ISA::VEC16: isa = "vec16"; break;
+    case cpu_attention::ISA::NEON: isa = "neon"; break;
+    case cpu_attention::ISA::VXE: isa = "vxe"; break;
+    case cpu_attention::ISA::RVV: isa = "rvv"; break;
+    case cpu_attention::ISA::VSX: isa = "vsx"; break;
+  }
+  if (key.has_value() && value.has_value()) {
+    cpu_attn_reshape_and_cache_kv_cache(*key, *value, kv_cache, slot_mapping,
+                                        isa, k_scale, v_scale, kv_dtype);
+  }
+  cpu_attention_with_kv_cache_kv_cache(
+      query, kv_cache, output, query.size(0), query_start_loc, seq_lens, scale,
+      causal, alibi_slopes, sliding_window, block_table, softcap,
+      scheduler_metadata, s_aux, std::nullopt, k_scale, v_scale, kv_dtype);
+}

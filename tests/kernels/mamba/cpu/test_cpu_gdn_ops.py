@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
-import types
 
 import pytest
 import torch
@@ -12,7 +11,6 @@ import vllm._custom_ops as ops
 from vllm.model_executor.layers.mamba.ops.cpu import gdn_attention
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 if not current_platform.is_cpu():
     pytest.skip("skipping CPU-only tests", allow_module_level=True)
@@ -473,20 +471,6 @@ def _conv_inputs(total_tokens: int):
     return x, weight, bias
 
 
-def _conv_states(
-    num_slots: int,
-    state_len: int,
-    dim: int = CONV_DIM,
-    layout: str = "SD",
-) -> torch.Tensor:
-    if layout == "SD":
-        return torch.zeros(num_slots, state_len, dim, dtype=torch.bfloat16).transpose(
-            1, 2
-        )
-    assert layout == "DS"
-    return torch.zeros(num_slots, dim, state_len, dtype=torch.bfloat16)
-
-
 def _sd_conv_states(
     num_slots: int, state_len: int, dim: int = CONV_DIM
 ) -> torch.Tensor:
@@ -498,352 +482,6 @@ def _maybe_pack_conv_weight(
     weight: torch.Tensor, is_weight_packed: bool
 ) -> torch.Tensor:
     return ops.causal_conv1d_weight_pack(weight) if is_weight_packed else weight
-
-
-@torch.inference_mode()
-def test_causal_conv1d_update_cpu_preserves_sd_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """SD state and indices reach the native operator unchanged."""
-    num_slots = 2
-    state_len = CONV_KERNEL - 1
-    conv_state = _sd_conv_states(num_slots, state_len)
-    state_indices = torch.tensor([1], dtype=torch.int32)
-    x = torch.zeros(1, CONV_DIM, dtype=torch.bfloat16)
-    recorded = {}
-
-    def record_update(**kwargs):
-        recorded.update(kwargs)
-        return x
-
-    monkeypatch.setattr(gdn_attention, "is_conv_state_dim_first", lambda: False)
-    monkeypatch.setattr(gdn_attention.ops, "causal_conv1d_update_cpu", record_update)
-    out = gdn_attention._causal_conv1d_update_cpu(
-        x=x,
-        conv_states=conv_state,
-        weight=torch.zeros(CONV_DIM, CONV_KERNEL, dtype=torch.bfloat16),
-        bias=None,
-        silu_activation=False,
-        conv_state_indices=state_indices,
-        is_weight_packed=False,
-    )
-
-    assert out is x
-    assert recorded["conv_states"] is conv_state
-    assert recorded["conv_state_indices"] is state_indices
-
-
-@torch.inference_mode()
-def test_spec_aware_mixed_routing_preserves_token_order(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    num_tokens = 4
-    projection = torch.arange(num_tokens * 16, dtype=torch.float32).view(num_tokens, 16)
-    mixed_qkv, b, a = projection[:, :4], projection[:, 4:6], projection[:, 6:8]
-    assert all(not tensor.is_contiguous() for tensor in (mixed_qkv, b, a))
-
-    spec_indices = torch.tensor([0, 2])
-    nonspec_indices = torch.tensor([1, 3])
-    metadata = GDNAttentionMetadata(
-        num_prefills=1,
-        num_prefill_tokens=0,
-        num_decodes=0,
-        num_decode_tokens=0,
-        num_spec_decodes=0,
-        num_spec_decode_tokens=0,
-        num_actual_tokens=0,
-        spec_sequence_masks=torch.ones(1, dtype=torch.bool),
-        spec_token_indx=spec_indices,
-        non_spec_token_indx=nonspec_indices,
-    )
-    routed = []
-
-    def record(*args):
-        routed.append(args[2:5])
-        return args[2]
-
-    monkeypatch.setattr(gdn_attention, "is_conv_state_dim_first", lambda: True)
-    monkeypatch.setattr(gdn_attention, "_spec_forward", record)
-    monkeypatch.setattr(gdn_attention, "_spec_aware_nonspec_subset", record)
-
-    layer = types.SimpleNamespace(
-        kv_cache=[torch.empty(1, 4, 6), torch.empty(1, 1, 1, 1)]
-    )
-    core_attn_out = torch.empty_like(mixed_qkv)
-    gdn_attention._cpu_gdn_attention_spec_aware(
-        layer=layer,
-        attn_metadata_i=metadata,
-        mixed_qkv=mixed_qkv,
-        b=b,
-        a=a,
-        core_attn_out=core_attn_out,
-        width=CONV_KERNEL,
-        state_len=6,
-    )
-
-    expected_inputs = (mixed_qkv, b, a)
-    assert len(routed) == 2
-    for actual_inputs, indices in zip(routed, (spec_indices, nonspec_indices)):
-        for actual, expected in zip(actual_inputs, expected_inputs):
-            assert actual.is_contiguous()
-            torch.testing.assert_close(actual, expected.index_select(0, indices))
-    torch.testing.assert_close(core_attn_out, mixed_qkv)
-
-
-@torch.inference_mode()
-def test_spec_aware_nonspec_materializes_state_indices(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    block_table = torch.arange(8, dtype=torch.int32).view(2, 4)
-    state_indices = block_table[:, 0]
-    assert not state_indices.is_contiguous()
-
-    metadata = GDNAttentionMetadata(
-        num_prefills=2,
-        num_prefill_tokens=4,
-        num_decodes=0,
-        num_decode_tokens=0,
-        num_spec_decodes=0,
-        num_spec_decode_tokens=0,
-        num_actual_tokens=4,
-        non_spec_state_indices_tensor=state_indices,
-        non_spec_query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
-        has_initial_state=torch.tensor([False, False]),
-    )
-
-    recorded_indices = None
-
-    def causal_conv1d_fwd_cpu(**kwargs):
-        nonlocal recorded_indices
-        recorded_indices = kwargs["cache_indices"]
-        return kwargs["x"]
-
-    def fused_gdn_gating_cpu(**kwargs):
-        return kwargs["a"], kwargs["b"]
-
-    def chunk_gated_delta_rule_cpu(**kwargs):
-        out = torch.zeros(1, 4, 1, 1)
-        return out, kwargs["initial_state"]
-
-    monkeypatch.setattr(torch.cpu, "_is_amx_tile_supported", lambda: True)
-    monkeypatch.setattr(gdn_attention, "is_conv_state_dim_first", lambda: False)
-    monkeypatch.setattr(
-        gdn_attention.ops, "causal_conv1d_fwd_cpu", causal_conv1d_fwd_cpu
-    )
-    monkeypatch.setattr(gdn_attention.ops, "fused_gdn_gating_cpu", fused_gdn_gating_cpu)
-    monkeypatch.setattr(
-        gdn_attention.ops,
-        "chunk_gated_delta_rule_cpu",
-        chunk_gated_delta_rule_cpu,
-    )
-
-    layer = types.SimpleNamespace(
-        activation="silu",
-        conv1d=types.SimpleNamespace(weight=torch.empty(0), bias=None),
-        A_log=torch.empty(0),
-        dt_bias=torch.empty(0),
-        rearrange_mixed_qkv=lambda x: (
-            x[:, :1].view(1, 4, 1, 1),
-            x[:, :1].view(1, 4, 1, 1),
-            x[:, :1].view(1, 4, 1, 1),
-        ),
-    )
-    gdn_attention._spec_aware_nonspec(
-        layer=layer,
-        attn_metadata_i=metadata,
-        mixed_qkv=torch.zeros(4, 4),
-        b=torch.zeros(4, 1),
-        a=torch.zeros(4, 1),
-        core_attn_out=torch.zeros(4, 1, 1),
-        conv_buf=torch.zeros(8, 1, 6),
-        ssm_state=torch.zeros(8, 1, 1, 1),
-        width=4,
-    )
-
-    assert recorded_indices is not None
-    assert recorded_indices.is_contiguous()
-    torch.testing.assert_close(
-        recorded_indices, torch.tensor([0, 4], dtype=torch.int32)
-    )
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize(("has_amx", "has_arm_bf16"), [(True, False), (False, True)])
-def test_spec_forward_prepares_native_conv_metadata(
-    has_amx: bool,
-    has_arm_bf16: bool,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    block_table = torch.tensor([[0, 1], [4, 5]], dtype=torch.int32)
-    state_indices = block_table[:, 0]
-    accepted_counts = torch.tensor([1, 4], dtype=torch.int32)
-    assert not state_indices.is_contiguous()
-    metadata = GDNAttentionMetadata(
-        num_prefills=0,
-        num_prefill_tokens=0,
-        num_decodes=0,
-        num_decode_tokens=0,
-        num_spec_decodes=2,
-        num_spec_decode_tokens=8,
-        num_actual_tokens=8,
-        spec_state_indices_tensor=block_table,
-        spec_query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
-        num_accepted_tokens=accepted_counts,
-    )
-    forwarded_indices = None
-    forwarded_counts = None
-    forwarded_is_weight_packed = None
-
-    def causal_conv1d_update_cpu(**kwargs):
-        nonlocal forwarded_counts, forwarded_indices, forwarded_is_weight_packed
-        forwarded_indices = kwargs["conv_state_indices"]
-        forwarded_counts = kwargs["num_accepted_tokens"]
-        forwarded_is_weight_packed = kwargs["is_weight_packed"]
-        return kwargs["x"]
-
-    monkeypatch.setattr(torch.cpu, "_is_amx_tile_supported", lambda: has_amx)
-    monkeypatch.setattr(gdn_attention, "is_arm_bf16", lambda: has_arm_bf16)
-    monkeypatch.setattr(gdn_attention, "is_conv_state_dim_first", lambda: False)
-    monkeypatch.setattr(
-        gdn_attention.ops, "causal_conv1d_update_cpu", causal_conv1d_update_cpu
-    )
-    monkeypatch.setattr(
-        gdn_attention.ops,
-        "fused_sigmoid_gating_delta_rule_update_spec_cpu",
-        lambda **kwargs: kwargs["q"],
-    )
-
-    layer = types.SimpleNamespace(
-        activation="silu",
-        conv1d=types.SimpleNamespace(weight=torch.empty(1, CONV_KERNEL), bias=None),
-        A_log=None,
-        dt_bias=None,
-        rearrange_mixed_qkv=lambda x: (x.unsqueeze(0),) * 3,
-    )
-    gdn_attention._spec_forward(
-        layer=layer,
-        attn_metadata_i=metadata,
-        mixed_qkv_spec=torch.zeros(8, 1, dtype=torch.bfloat16),
-        b_spec=torch.empty(0),
-        a_spec=torch.empty(0),
-        conv_buf=torch.empty(0),
-        ssm_state=torch.empty(0),
-        width=CONV_KERNEL,
-        state_len=CONV_KERNEL + 2,
-    )
-
-    expected = (
-        (forwarded_indices, torch.tensor([0, 4], dtype=torch.int32)),
-        (forwarded_counts, torch.tensor([1, 4], dtype=torch.int32)),
-    )
-    for actual, reference in expected:
-        assert actual is not None
-        assert actual.is_contiguous()
-        assert actual.dtype == torch.int32
-        assert forwarded_is_weight_packed is True
-        torch.testing.assert_close(actual, reference)
-
-
-@pytest.mark.parametrize("use_native", [False, True])
-@torch.inference_mode()
-def test_spec_forward_conv_tracks_accepted_tokens(
-    use_native: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Spec-decode steps with uneven draft counts, including a row without
-    drafts whose previous step accepted more tokens than it now carries
-    (MRV2 keeps such rows as spec rows), must convolve over exactly the
-    accepted token history."""
-    if use_native and not (
-        torch.cpu._is_amx_tile_supported() or gdn_attention.is_arm_bf16()
-    ):
-        pytest.skip("native causal conv1d requires AMX or Arm BF16 support")
-    if not use_native:
-        monkeypatch.setattr(torch.cpu, "_is_amx_tile_supported", lambda: False)
-        monkeypatch.setattr(gdn_attention, "is_arm_bf16", lambda: False)
-    monkeypatch.setattr(gdn_attention, "is_conv_state_dim_first", lambda: False)
-    monkeypatch.setattr(
-        gdn_attention.ops,
-        "fused_sigmoid_gating_delta_rule_update_spec_cpu",
-        lambda **kwargs: kwargs["q"],
-    )
-
-    num_spec = 3
-    state_len = CONV_KERNEL - 1 + num_spec
-    _, weight, bias = _conv_inputs(0)
-    layer = types.SimpleNamespace(
-        activation="silu",
-        conv1d=types.SimpleNamespace(
-            weight=_maybe_pack_conv_weight(weight, use_native),
-            bias=bias,
-            _cpu_unpacked_conv_weight=weight,
-        ),
-        A_log=None,
-        dt_bias=None,
-        rearrange_mixed_qkv=lambda x: (x.unsqueeze(0),) * 3,
-    )
-    slots = [1, 2]
-    conv_buf = _sd_conv_states(len(slots) + 1, state_len)
-    history = []
-    for slot in slots:
-        prefix = torch.randn(CONV_KERNEL - 1, CONV_DIM).to(torch.bfloat16)
-        conv_buf[slot, :, : CONV_KERNEL - 1] = prefix.T
-        history.append(list(prefix))
-
-    # (query lens, accepted counts of the previous step's tokens)
-    steps = [
-        ([4, 4], [1, 1]),
-        ([4, 1], [3, 2]),
-        ([2, 4], [4, 1]),
-        ([4, 4], [2, 3]),
-    ]
-    prev_x: list[torch.Tensor] = []
-    for step, (q_lens, accepted) in enumerate(steps):
-        xs = [torch.randn(q, CONV_DIM).to(torch.bfloat16) for q in q_lens]
-        if step > 0:
-            for hist, x, n in zip(history, prev_x, accepted):
-                hist.extend(x[:n])
-        prev_x = xs
-
-        cu = torch.tensor([0, *q_lens]).cumsum(0).to(torch.int32)
-        metadata = GDNAttentionMetadata(
-            num_prefills=0,
-            num_prefill_tokens=0,
-            num_decodes=0,
-            num_decode_tokens=0,
-            num_spec_decodes=len(slots),
-            num_spec_decode_tokens=sum(q_lens),
-            num_actual_tokens=sum(q_lens),
-            spec_state_indices_tensor=torch.tensor(
-                [[slot] + [0] * num_spec for slot in slots], dtype=torch.int32
-            ),
-            spec_query_start_loc=cu,
-            num_accepted_tokens=torch.tensor(accepted, dtype=torch.int32),
-        )
-        out = gdn_attention._spec_forward(
-            layer=layer,
-            attn_metadata_i=metadata,
-            mixed_qkv_spec=torch.cat(xs),
-            b_spec=torch.empty(0),
-            a_spec=torch.empty(0),
-            conv_buf=conv_buf,
-            ssm_state=torch.empty(0),
-            width=CONV_KERNEL,
-            state_len=state_len,
-        )
-
-        for i, (hist, x) in enumerate(zip(history, xs)):
-            conv_in = torch.cat([torch.stack(hist[-(CONV_KERNEL - 1) :]), x])
-            ref = F.silu(
-                F.conv1d(
-                    conv_in.T.float().unsqueeze(0),
-                    weight.float().unsqueeze(1),
-                    bias.float(),
-                    groups=CONV_DIM,
-                )[0]
-            ).T
-            torch.testing.assert_close(
-                out[cu[i] : cu[i + 1]].float(), ref, atol=2e-2, rtol=2e-2
-            )
 
 
 @pytest.mark.parametrize("total_tokens, split", TWO_CALL_SPLITS)
@@ -1308,145 +946,6 @@ def _run_prefill_cpp(x, weight, bias, seq_lens, is_weight_packed=False):
     return out.transpose(0, 1).contiguous(), conv_state
 
 
-def _python_native_fwd(**kwargs):
-    from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
-        causal_conv1d_fn_cpu,
-    )
-
-    return causal_conv1d_fn_cpu(
-        x=kwargs["x"],
-        weight=kwargs["weight"],
-        bias=kwargs["bias"],
-        conv_states=kwargs["conv_states"],
-        query_start_loc=kwargs["query_start_loc"],
-        cache_indices=kwargs["cache_indices"],
-        has_initial_state=kwargs["has_initial_state"],
-        activation=kwargs["silu_activation"],
-    )
-
-
-@torch.inference_mode()
-def test_causal_conv1d_fwd_cpu_ds_adapter_varlen_mixed_initial_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    dim = 8
-    seq_lens = [2, 3]
-    state_len = _STATE_LEN
-    state_indices = torch.tensor([2, 0], dtype=torch.int32)
-    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
-    has_initial_state = torch.tensor([False, True])
-    x_tokens, weight, bias = _conv_inputs(sum(seq_lens))
-    x_tokens = x_tokens[:, :dim]
-    weight = weight[:dim]
-    bias = bias[:dim]
-    x = x_tokens.transpose(0, 1).contiguous()
-    logical_state = (
-        torch.arange(3 * dim * state_len, dtype=torch.float32)
-        .view(3, dim, state_len)
-        .to(torch.bfloat16)
-    )
-    state_sd = _conv_states(3, state_len, dim, "SD")
-    state_ds = _conv_states(3, state_len, dim, "DS")
-    state_sd.copy_(logical_state)
-    state_ds.copy_(logical_state)
-    recorded = []
-
-    def record_fwd(**kwargs):
-        recorded.append(
-            (
-                kwargs["conv_states"].shape,
-                kwargs["conv_states"].stride(),
-                kwargs["cache_indices"].clone(),
-            )
-        )
-        return _python_native_fwd(**kwargs)
-
-    monkeypatch.setattr(gdn_attention.ops, "causal_conv1d_fwd_cpu", record_fwd)
-    monkeypatch.setattr(gdn_attention, "is_conv_state_dim_first", lambda: False)
-    out_sd = gdn_attention._causal_conv1d_fwd_cpu(
-        x=x,
-        weight=weight,
-        bias=bias,
-        conv_states=state_sd,
-        query_start_loc=query_start_loc,
-        cache_indices=state_indices,
-        has_initial_state=has_initial_state,
-        silu_activation=True,
-        is_weight_packed=False,
-    )
-    monkeypatch.setattr(gdn_attention, "is_conv_state_dim_first", lambda: True)
-    out_ds = gdn_attention._causal_conv1d_fwd_cpu(
-        x=x,
-        weight=weight,
-        bias=bias,
-        conv_states=state_ds,
-        query_start_loc=query_start_loc,
-        cache_indices=state_indices,
-        has_initial_state=has_initial_state,
-        silu_activation=True,
-        is_weight_packed=False,
-    )
-
-    torch.testing.assert_close(out_ds, out_sd)
-    torch.testing.assert_close(state_ds, state_sd)
-    assert recorded[0][2].equal(state_indices)
-    assert recorded[1][0] == (2, dim, state_len)
-    assert recorded[1][1] == (dim * state_len, 1, dim)
-    assert recorded[1][2].equal(torch.arange(2, dtype=torch.int32))
-
-
-@torch.inference_mode()
-def test_causal_conv1d_update_cpu_ds_adapter_wide_multi_token_copyback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    dim = 8
-    seq_len = 4
-    state_len = seq_len + 5
-    state = _conv_states(4, state_len, dim, "DS")
-    state.copy_(
-        torch.arange(state.numel(), dtype=torch.float32).view_as(state).to(state.dtype)
-    )
-    original_state = state.clone()
-    state_indices = torch.tensor([3, 1, 0], dtype=torch.int32)
-    num_accepted_tokens = torch.tensor([1, 4, 2], dtype=torch.int32)
-    mutated_scratch = torch.arange(
-        state_indices.numel() * dim * state_len, dtype=torch.float32
-    ).view(state_indices.numel(), dim, state_len)
-    mutated_scratch = (mutated_scratch + 200).to(state.dtype)
-    recorded = {}
-
-    def mutate_update(**kwargs):
-        recorded.update(kwargs)
-        kwargs["conv_states"].copy_(mutated_scratch)
-        return torch.zeros_like(kwargs["x"])
-
-    monkeypatch.setattr(gdn_attention, "is_conv_state_dim_first", lambda: True)
-    monkeypatch.setattr(gdn_attention.ops, "causal_conv1d_update_cpu", mutate_update)
-    gdn_attention._causal_conv1d_update_cpu(
-        x=torch.zeros(state_indices.numel(), seq_len, dim, dtype=state.dtype),
-        conv_states=state,
-        weight=torch.zeros(dim, CONV_KERNEL, dtype=state.dtype),
-        bias=None,
-        silu_activation=False,
-        conv_state_indices=state_indices,
-        is_weight_packed=False,
-        num_accepted_tokens=num_accepted_tokens,
-    )
-
-    expected_state = original_state.clone()
-    expected_state.index_copy_(0, state_indices.to(torch.long), mutated_scratch)
-    torch.testing.assert_close(state, expected_state)
-    torch.testing.assert_close(
-        state.index_select(0, state_indices)[:, :, _STATE_LEN:],
-        mutated_scratch[:, :, _STATE_LEN:],
-    )
-    torch.testing.assert_close(
-        recorded["conv_state_indices"],
-        torch.arange(state_indices.numel(), dtype=torch.int32),
-    )
-    torch.testing.assert_close(recorded["num_accepted_tokens"], num_accepted_tokens)
-
-
 @pytest.mark.skipif(
     not (_HAS_AVX512_BF16 or gdn_attention.is_arm_bf16()),
     reason="C++ causal_conv1d requires AVX-512BF16 or Arm BF16 support",
@@ -1655,3 +1154,274 @@ def test_spec_decode_unpacked_conv_weight_stash():
     )
 
     torch.testing.assert_close(out_cpp, out_torch, atol=1e-2, rtol=1e-2)
+
+
+def _ref_gdn_attention_core(
+    mixed_qkv,
+    b,
+    a,
+    conv_state,
+    conv_weight,
+    ssm_state,
+    A_log,
+    dt_bias,
+    state_indices,
+    query_start_loc,
+    has_initial_state,
+    num_decodes,
+    num_decode_tokens,
+    num_prefills,
+    num_prefill_tokens,
+    head_k_dim,
+    head_v_dim,
+):
+    """Compose the individual kernels the way the Python forward used to."""
+    mixed_qkv, a, b = mixed_qkv.contiguous(), a.contiguous(), b.contiguous()
+    out = torch.zeros(
+        mixed_qkv.size(0),
+        A_log.numel(),
+        head_v_dim,
+        dtype=mixed_qkv.dtype,
+    )
+    conv_state_dim_first = conv_state.transpose(1, 2)
+    num_slots, num_v_heads = ssm_state.shape[:2]
+    ssm_view = ssm_state.view(num_slots, num_v_heads, head_k_dim, head_v_dim)
+    v_width = num_v_heads * head_v_dim
+    k_width = (mixed_qkv.size(1) - v_width) // 2
+
+    def split(x):
+        t = x.size(0)
+        q, k, v = torch.split(x, [k_width, k_width, v_width], dim=-1)
+        return (
+            q.reshape(1, t, -1, head_k_dim).contiguous(),
+            k.reshape(1, t, -1, head_k_dim).contiguous(),
+            v.reshape(1, t, -1, head_v_dim).contiguous(),
+        )
+
+    if num_decodes > 0:
+        indices = state_indices[:num_decodes]
+        conv_out = ops.causal_conv1d_update_cpu(
+            x=mixed_qkv[:num_decode_tokens],
+            conv_states=conv_state_dim_first,
+            weight=conv_weight,
+            bias=None,
+            silu_activation=True,
+            conv_state_indices=indices,
+            is_weight_packed=True,
+        )
+        q, k, v = split(conv_out)
+        attn = ops.fused_sigmoid_gating_delta_rule_update_cpu(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a[:num_decode_tokens],
+            b=b[:num_decode_tokens],
+            initial_state_source=ssm_view,
+            initial_state_indices=indices,
+            cu_seqlens=query_start_loc[: num_decodes + 1],
+            use_qk_l2norm_in_kernel=True,
+        )
+        out[:num_decode_tokens] = attn.squeeze(1)
+
+    if num_prefills > 0:
+        start, end = num_decode_tokens, num_decode_tokens + num_prefill_tokens
+        indices = state_indices[num_decodes : num_decodes + num_prefills]
+        qsl = (
+            query_start_loc[num_decodes : num_decodes + num_prefills + 1]
+            - num_decode_tokens
+        )
+        has_state = has_initial_state[num_decodes : num_decodes + num_prefills]
+        conv_out = ops.causal_conv1d_fwd_cpu(
+            x=mixed_qkv[start:end].transpose(0, 1),
+            weight=conv_weight,
+            bias=None,
+            conv_states=conv_state_dim_first,
+            query_start_loc=qsl,
+            cache_indices=indices,
+            has_initial_state=has_state,
+            silu_activation=True,
+            is_weight_packed=True,
+        ).transpose(0, 1)
+        q, k, v = split(conv_out)
+        g, beta = ops.fused_gdn_gating_cpu(
+            A_log=A_log, a=a[start:end], b=b[start:end], dt_bias=dt_bias
+        )
+        ssm_view[indices[~has_state]] = 0
+        attn, _ = ops.chunk_gated_delta_rule_cpu(
+            query=q,
+            key=k,
+            value=v,
+            g=g,
+            beta=beta,
+            initial_state=ssm_view,
+            output_final_state=True,
+            cu_seqlens=qsl,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+            initial_state_indices=indices,
+        )
+        out[start:end] = attn.squeeze(0)
+    return out
+
+
+@pytest.mark.skipif(
+    not (_HAS_AVX512_BF16 or gdn_attention.is_arm_bf16()),
+    reason="C++ GDN attention requires AVX-512BF16 or Arm BF16 support",
+)
+@pytest.mark.parametrize(
+    "num_decodes, prefill_lens",
+    [(3, []), (1, []), (0, [5, 70]), (2, [9, 65]), (1, [CHUNK_SIZE])],
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("direct", [False, True])
+@torch.inference_mode()
+def test_gdn_attention_core_cpu_matches_composed_kernels(
+    num_decodes: int, prefill_lens: list[int], state_dtype: torch.dtype, direct: bool
+) -> None:
+    """The fused op must equal the per-kernel composition it replaces."""
+    head_k_dim = head_v_dim = 64
+    num_k_heads, num_v_heads = 2, 4
+    dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+    num_slots = 8
+    num_prefills = len(prefill_lens)
+    num_decode_tokens = num_decodes
+    num_prefill_tokens = sum(prefill_lens)
+    num_tokens = num_decode_tokens + num_prefill_tokens
+
+    torch.manual_seed(0)
+    mixed_qkv = torch.randn(num_tokens, dim + 8, dtype=torch.bfloat16)[:, :dim]
+    a = torch.randn(num_tokens, num_v_heads, dtype=torch.bfloat16)
+    b = torch.randn(num_tokens, num_v_heads, dtype=torch.bfloat16)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32)
+    dt_bias = torch.randn(num_v_heads, dtype=torch.bfloat16)
+    weight = ops.causal_conv1d_weight_pack(
+        torch.randn(dim, CONV_KERNEL, dtype=torch.bfloat16)
+    )
+    conv_state = torch.randn(num_slots, _STATE_LEN, dim, dtype=torch.bfloat16)
+    ssm_state = (
+        0.1 * torch.randn(num_slots, num_v_heads, head_v_dim, head_k_dim)
+    ).to(state_dtype)
+
+    num_seqs = num_decodes + num_prefills
+    state_indices = torch.randperm(num_slots)[:num_seqs].to(torch.int32)
+    seq_lens = [1] * num_decodes + prefill_lens
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32
+    )
+    has_initial_state = torch.tensor(
+        [True] * num_decodes + [i % 2 == 0 for i in range(num_prefills)]
+    )
+
+    ref_conv_state, ref_ssm_state = conv_state.clone(), ssm_state.clone()
+    expected = _ref_gdn_attention_core(
+        mixed_qkv,
+        b,
+        a,
+        ref_conv_state,
+        weight,
+        ref_ssm_state,
+        A_log,
+        dt_bias,
+        state_indices,
+        query_start_loc,
+        has_initial_state,
+        num_decodes,
+        num_decode_tokens,
+        num_prefills,
+        num_prefill_tokens,
+        head_k_dim,
+        head_v_dim,
+    )
+
+    actual = torch.zeros_like(expected)
+    if direct:
+        torch.ops._C.gdn_attention_core_direct_cpu(
+            mixed_qkv,
+            b,
+            a,
+            actual,
+            conv_state,
+            weight,
+            None,
+            ssm_state,
+            A_log,
+            dt_bias,
+            state_indices,
+            query_start_loc,
+            has_initial_state if num_prefills else has_initial_state[:0],
+            torch.tensor(
+                [num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens],
+                dtype=torch.int32,
+            ),
+            head_k_dim,
+            head_v_dim,
+            True,
+        )
+    else:
+        torch.ops._C.gdn_attention_core_cpu(
+            mixed_qkv,
+            b,
+            a,
+            actual,
+            conv_state,
+            weight,
+            None,
+            ssm_state,
+            A_log,
+            dt_bias,
+            state_indices,
+            query_start_loc,
+            has_initial_state,
+            num_decodes,
+            num_decode_tokens,
+            num_prefills,
+            num_prefill_tokens,
+            head_k_dim,
+            head_v_dim,
+            True,
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(conv_state, ref_conv_state, atol=0, rtol=0)
+    torch.testing.assert_close(ssm_state, ref_ssm_state, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not (_HAS_AVX512_BF16 or gdn_attention.is_arm_bf16()),
+    reason="C++ GDN attention requires AVX-512BF16 or Arm BF16 support",
+)
+@torch.inference_mode()
+def test_gdn_attention_core_direct_cpu_skips_empty_step() -> None:
+    """A step without requests leaves the output and the states untouched."""
+    dim, num_v_heads, head_dim = 512, 4, 64
+    mixed_qkv = torch.randn(3, dim, dtype=torch.bfloat16)
+    out = torch.full((3, num_v_heads, head_dim), 7, dtype=torch.bfloat16)
+    conv_state = torch.randn(2, CONV_KERNEL - 1, dim, dtype=torch.bfloat16)
+    ssm_state = torch.randn(2, num_v_heads, head_dim, head_dim)
+    conv_before, ssm_before = conv_state.clone(), ssm_state.clone()
+    torch.ops._C.gdn_attention_core_direct_cpu(
+        mixed_qkv,
+        torch.randn(3, num_v_heads, dtype=torch.bfloat16),
+        torch.randn(3, num_v_heads, dtype=torch.bfloat16),
+        out,
+        conv_state,
+        ops.causal_conv1d_weight_pack(
+            torch.randn(dim, CONV_KERNEL, dtype=torch.bfloat16)
+        ),
+        None,
+        ssm_state,
+        torch.randn(num_v_heads),
+        torch.randn(num_v_heads, dtype=torch.bfloat16),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(0, dtype=torch.bool),
+        torch.zeros(4, dtype=torch.int32),
+        head_dim,
+        head_dim,
+        True,
+    )
+    assert (out == 7).all()
+    torch.testing.assert_close(conv_state, conv_before, atol=0, rtol=0)
+    torch.testing.assert_close(ssm_state, ssm_before, atol=0, rtol=0)

@@ -170,6 +170,17 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             self.kv_cache_dtype,
         )
         self._set_isa_to_layers(layer_names)
+        self._has_direct_layers = False
+        # Layers called directly from compiled code share one metadata
+        # instance that is refreshed in place at every build.
+        self._direct_metadata = _placeholder_metadata()
+        for layer in get_layers_from_vllm_config(
+            vllm_config, Attention, layer_names
+        ).values():
+            if getattr(layer.impl, "use_direct_forward", False):
+                layer.cpu_attn_metadata = self._direct_metadata
+                self._has_direct_layers = True
+        self.enable_kv_split = envs.VLLM_CPU_ATTN_SPLIT_KV
         self.is_cross_attention = isinstance(kv_cache_spec, CrossAttentionSpec)
         self.is_encoder_only_attention = isinstance(
             kv_cache_spec, EncoderOnlyAttentionSpec
@@ -270,7 +281,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             causal=causal,
             sliding_window_size=self.window_size,
             isa=self.isa,
-            enable_kv_split=envs.VLLM_CPU_ATTN_SPLIT_KV,
+            enable_kv_split=self.enable_kv_split,
             dynamic_causal=dynamic_casual,
             kv_cache_dtype=self.kv_cache_dtype,
         )
@@ -289,7 +300,36 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             dynamic_causal=dynamic_casual,
         )
 
+        if self._has_direct_layers:
+            assert dynamic_casual is None and causal
+            direct = self._direct_metadata
+            direct.query_start_loc = query_start_loc
+            direct.seq_lens = seq_lens
+            direct.block_table = block_table_tensor
+            direct.slot_mapping = slot_mapping
+            direct.scheduler_metadata = scheduler_metadata
+
         return attn_metadata
+
+
+def init_direct_forward_layers(layers) -> None:
+    for layer in layers:
+        if getattr(getattr(layer, "impl", None), "use_direct_forward", False):
+            layer.cpu_attn_metadata = _placeholder_metadata()
+
+
+def _placeholder_metadata() -> CPUAttentionMetadata:
+    """Metadata of a step without requests; the direct forward skips it."""
+    return CPUAttentionMetadata(
+        num_actual_tokens=0,
+        max_query_len=0,
+        query_start_loc=torch.zeros(1, dtype=torch.int32),
+        max_seq_len=0,
+        seq_lens=torch.zeros(1, dtype=torch.int32),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        slot_mapping=torch.zeros(1, dtype=torch.int64),
+        scheduler_metadata=torch.zeros(8, dtype=torch.uint8),
+    )
 
 
 class CPUAttentionBackendImpl(AttentionImpl):
@@ -336,6 +376,13 @@ class CPUAttentionBackendImpl(AttentionImpl):
 
         self.is_fp8_kv_cache = is_quantized_kv_cache(kv_cache_dtype)
         self.attn_type = attn_type
+
+        self.use_direct_forward = (
+            envs.VLLM_CPU_ATTN_DIRECT
+            and attn_type == AttentionType.DECODER
+            and kv_sharing_target_layer_name is None
+        )
+        self.kv_cache_dtype_tensor = ops.str_to_tensor(kv_cache_dtype)
 
         self.sinks = sinks
         if self.sinks is not None:
@@ -418,18 +465,12 @@ class CPUAttentionBackendImpl(AttentionImpl):
             kv_cache = attn_metadata.encoder_cache
 
         # KV cache size are [num_blocks, num_kv_heads, block_size,
-        # 2 * head_size]. Make a view [num_blocks, num_kv_heads,
-        # block_size * 2, head_size]. Then slice KV at dim 2
-        num_blocks, num_kv_heads, block_size, _ = kv_cache.size()
-        kv_cache = kv_cache.view((num_blocks, num_kv_heads, block_size * 2, -1))
-        key_cache, value_cache = kv_cache.chunk(2, dim=2)
-
+        # 2 * head_size]; the ops split it into key and value caches.
         if is_encoder_attention:
-            ops.cpu_attn_reshape_and_cache(
+            ops.cpu_attn_reshape_and_cache_kv_cache(
                 key,
                 value,
-                key_cache,
-                value_cache,
+                kv_cache,
                 attn_metadata.slot_mapping,
                 layer.isa,  # type: ignore
                 k_scale=layer._k_scale_float,
@@ -446,11 +487,11 @@ class CPUAttentionBackendImpl(AttentionImpl):
             torch.float32,
         ]:
             self.sinks = self.sinks.to(torch.float32)
-        ops.cpu_attention_with_kv_cache(
-            query=query[:num_actual_tokens],
-            key_cache=key_cache,
-            value_cache=value_cache,
-            output=output[:num_actual_tokens],  # type: ignore
+        ops.cpu_attention_with_kv_cache_kv_cache(
+            query=query,
+            kv_cache=kv_cache,
+            output=output,
+            num_actual_tokens=num_actual_tokens,
             query_start_loc=attn_metadata.query_start_loc,
             seq_lens=attn_metadata.seq_lens,
             scale=self.scale,
@@ -469,6 +510,39 @@ class CPUAttentionBackendImpl(AttentionImpl):
 
         return output
 
+    def forward_direct(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Attention for compiled code: reads the step metadata and the KV
+        cache from the layer instead of the forward context."""
+        metadata = layer.cpu_attn_metadata  # type: ignore
+        ops.cpu_attn_forward(
+            query,
+            key,
+            value,
+            output,
+            layer.kv_cache,
+            metadata.query_start_loc,
+            metadata.seq_lens,
+            metadata.block_table,
+            metadata.scheduler_metadata,
+            metadata.slot_mapping,
+            self.alibi_slopes,
+            self.sinks,
+            self.scale,
+            True,
+            self.sliding_window,
+            self.logits_soft_cap,
+            self.kv_cache_dtype_tensor,
+            layer._k_scale_float,
+            layer._v_scale_float,
+        )
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -480,14 +554,10 @@ class CPUAttentionBackendImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
 
-        num_blocks, num_kv_heads, block_size, _ = kv_cache.size()
-        kv_cache = kv_cache.view((num_blocks, num_kv_heads, block_size * 2, -1))
-        key_cache, value_cache = kv_cache.chunk(2, dim=2)
-        ops.cpu_attn_reshape_and_cache(
+        ops.cpu_attn_reshape_and_cache_kv_cache(
             key,
             value,
-            key_cache,
-            value_cache,
+            kv_cache,
             slot_mapping,
             layer.isa,  # type: ignore
             k_scale=layer._k_scale_float,

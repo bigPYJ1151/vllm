@@ -291,6 +291,26 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices, int64_t pad_slot_id,
     bool is_weight_packed);
 
+void gdn_attention_core_cpu(
+    const at::Tensor& mixed_qkv, const at::Tensor& b, const at::Tensor& a,
+    at::Tensor& core_attn_out, at::Tensor& conv_state,
+    const at::Tensor& conv_weight, const std::optional<at::Tensor>& conv_bias,
+    at::Tensor& ssm_state, const at::Tensor& A_log, const at::Tensor& dt_bias,
+    const at::Tensor& state_indices, const at::Tensor& query_start_loc,
+    const std::optional<at::Tensor>& has_initial_state, int64_t num_decodes,
+    int64_t num_decode_tokens, int64_t num_prefills,
+    int64_t num_prefill_tokens, int64_t head_k_dim, int64_t head_v_dim,
+    bool silu);
+
+void gdn_attention_core_direct_cpu(
+    const at::Tensor& mixed_qkv, const at::Tensor& b, const at::Tensor& a,
+    at::Tensor& core_attn_out, at::Tensor& conv_state,
+    const at::Tensor& conv_weight, const std::optional<at::Tensor>& conv_bias,
+    at::Tensor& ssm_state, const at::Tensor& A_log, const at::Tensor& dt_bias,
+    const at::Tensor& state_indices, const at::Tensor& query_start_loc,
+    const at::Tensor& has_initial_state, const at::Tensor& counts,
+    int64_t head_k_dim, int64_t head_v_dim, bool silu);
+
 void activation_lut_bf16(torch::Tensor& out, torch::Tensor& input,
                          const std::string& activation);
 
@@ -327,6 +347,36 @@ void cpu_attention_with_kv_cache(
     const std::optional<torch::Tensor>& s_aux,
     const std::optional<torch::Tensor>& dynamic_causal, const double k_scale,
     const double v_scale, const std::string& kv_cache_dtype);
+
+void cpu_attn_reshape_and_cache_kv_cache(
+    const torch::Tensor& key, const torch::Tensor& value,
+    const torch::Tensor& kv_cache, const torch::Tensor& slot_mapping,
+    const std::string& isa, const double k_scale, const double v_scale,
+    const std::string& kv_cache_dtype);
+
+void cpu_attention_with_kv_cache_kv_cache(
+    const torch::Tensor& query, const torch::Tensor& kv_cache,
+    torch::Tensor& output, const int64_t num_actual_tokens,
+    const torch::Tensor& query_start_loc, const torch::Tensor& seq_lens,
+    const double scale, const bool causal,
+    const std::optional<torch::Tensor>& alibi_slopes,
+    const int64_t sliding_window_left, const torch::Tensor& block_table,
+    const double softcap, const torch::Tensor& scheduler_metadata,
+    const std::optional<torch::Tensor>& s_aux,
+    const std::optional<torch::Tensor>& dynamic_causal, const double k_scale,
+    const double v_scale, const std::string& kv_cache_dtype);
+
+void cpu_attn_forward(
+    const torch::Tensor& query, const std::optional<torch::Tensor>& key,
+    const std::optional<torch::Tensor>& value, torch::Tensor& output,
+    torch::Tensor& kv_cache, const torch::Tensor& query_start_loc,
+    const torch::Tensor& seq_lens, const torch::Tensor& block_table,
+    const torch::Tensor& scheduler_metadata, const torch::Tensor& slot_mapping,
+    const std::optional<torch::Tensor>& alibi_slopes,
+    const std::optional<torch::Tensor>& s_aux, const double scale,
+    const bool causal, const int64_t sliding_window, const double softcap,
+    const torch::Tensor& kv_cache_dtype, const double k_scale,
+    const double v_scale);
 
 // Note: just for avoiding importing errors
 void placeholder_op() { TORCH_CHECK(false, "Unimplemented"); }
@@ -550,6 +600,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "pad_slot_id, "
       "bool is_weight_packed) -> Tensor");
   ops.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+
+  ops.def(
+      "gdn_attention_core_cpu(Tensor mixed_qkv, Tensor b, Tensor a, "
+      "Tensor(a!) core_attn_out, Tensor(b!) conv_state, Tensor conv_weight, "
+      "Tensor? conv_bias, Tensor(c!) ssm_state, Tensor A_log, Tensor dt_bias, "
+      "Tensor state_indices, Tensor query_start_loc, Tensor? "
+      "has_initial_state, int num_decodes, int num_decode_tokens, int "
+      "num_prefills, int num_prefill_tokens, int head_k_dim, int head_v_dim, "
+      "bool silu) -> ()");
+  ops.impl("gdn_attention_core_cpu", torch::kCPU, &gdn_attention_core_cpu);
+
+  ops.def(
+      "gdn_attention_core_direct_cpu(Tensor mixed_qkv, Tensor b, Tensor a, "
+      "Tensor(a!) core_attn_out, Tensor(b!) conv_state, Tensor conv_weight, "
+      "Tensor? conv_bias, Tensor(c!) ssm_state, Tensor A_log, Tensor dt_bias, "
+      "Tensor state_indices, Tensor query_start_loc, Tensor "
+      "has_initial_state, Tensor counts, int head_k_dim, int head_v_dim, "
+      "bool silu) -> ()");
+  ops.impl("gdn_attention_core_direct_cpu", torch::kCPU,
+           &gdn_attention_core_direct_cpu);
 #endif
 
   // Layernorm
@@ -912,6 +982,31 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float k_scale=1.0, float v_scale=1.0, str kv_cache_dtype=\"auto\") -> "
       "()",
       &cpu_attention_with_kv_cache);
+  // Same kernels, taking the whole [num_blocks, num_kv_heads, block_size,
+  // 2 * head_size] cache tensor instead of pre-split key/value views.
+  ops.def(
+      "cpu_attn_reshape_and_cache_kv_cache(Tensor key, Tensor value, "
+      "Tensor(a2!) kv_cache, Tensor slot_mapping, str isa, "
+      "float k_scale=1.0, float v_scale=1.0, str kv_cache_dtype=\"auto\") -> "
+      "()",
+      &cpu_attn_reshape_and_cache_kv_cache);
+  ops.def(
+      "cpu_attention_with_kv_cache_kv_cache(Tensor query, Tensor kv_cache, "
+      "Tensor(a2!) output, int num_actual_tokens, Tensor query_start_loc, "
+      "Tensor seq_lens, float scale, bool causal, Tensor? alibi_slopes, "
+      "SymInt sliding_window_size, Tensor block_table, float softcap, "
+      "Tensor scheduler_metadata, Tensor? s_aux, Tensor? dynamic_causal, "
+      "float k_scale=1.0, float v_scale=1.0, str kv_cache_dtype=\"auto\") -> "
+      "()",
+      &cpu_attention_with_kv_cache_kv_cache);
+  ops.def(
+      "cpu_attn_forward(Tensor query, Tensor? key, Tensor? value, "
+      "Tensor(a2!) output, Tensor(a3!) kv_cache, Tensor query_start_loc, "
+      "Tensor seq_lens, Tensor block_table, Tensor scheduler_metadata, "
+      "Tensor slot_mapping, Tensor? alibi_slopes, Tensor? s_aux, "
+      "float scale, bool causal, int sliding_window_size, float softcap, "
+      "Tensor kv_cache_dtype, float k_scale, float v_scale) -> ()");
+  ops.impl("cpu_attn_forward", torch::kCPU, &cpu_attn_forward);
 
   // placeholders
   ops.def(

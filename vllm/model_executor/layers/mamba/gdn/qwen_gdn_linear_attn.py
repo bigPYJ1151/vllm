@@ -587,6 +587,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             register_cpu_gdn_attention_ops()
             self._forward_method = self.forward_cpu
+            self.cpu_direct = envs.VLLM_CPU_ATTN_DIRECT
+            if self.cpu_direct:
+                self._init_cpu_direct(vllm_config)
         elif current_platform.is_rocm():
             self._forward_method = self.forward_hip
         else:
@@ -1262,6 +1265,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         return self._output_projection(core_attn_out, z)
 
+    def _init_cpu_direct(self, vllm_config: VllmConfig) -> None:
+        """Set up calling the C++ op straight from compiled code."""
+        from vllm.v1.attention.backends.cpu_gdn_attn import placeholder_gdn_metadata
+
+        assert vllm_config.model_config.dtype == torch.bfloat16, (
+            "CPU GDN attention requires BF16."
+        )
+        assert torch.cpu._is_avx512_bf16_supported(), (
+            "CPU GDN attention requires AVX512-BF16."
+        )
+        assert not is_conv_state_dim_first(), (
+            "CPU GDN attention requires the SD conv state layout."
+        )
+        assert self.num_spec == 0, (
+            "speculative decoding is not supported by CPU GDN attention."
+        )
+        # Present while the model is traced, before the state is allocated.
+        self.kv_cache = (torch.empty(0), torch.empty(0))
+        self.cpu_gdn_metadata = placeholder_gdn_metadata()
+
     def forward_cpu(
         self,
         hidden_states: torch.Tensor,
@@ -1289,19 +1312,43 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b, a = ba.chunk(2, dim=-1)
 
         num_tokens = hidden_states.size(0)
-        core_attn_out = torch.zeros(
+        # The direct op writes every row, so it needs no zero-fill.
+        new_core_attn_out = torch.empty if self.cpu_direct else torch.zeros
+        core_attn_out = new_core_attn_out(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
 
-        torch.ops.vllm.cpu_gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
-            core_attn_out,
-            _encode_layer_name(self.prefix),
-        )
+        if self.cpu_direct:
+            metadata = self.cpu_gdn_metadata
+            torch.ops._C.gdn_attention_core_direct_cpu(
+                mixed_qkv,
+                b,
+                a,
+                core_attn_out,
+                self.kv_cache[0],
+                self.conv1d.weight,
+                self.conv1d.bias,
+                self.kv_cache[1],
+                self.A_log,
+                self.dt_bias,
+                metadata.state_indices,
+                metadata.query_start_loc,
+                metadata.has_initial_state,
+                metadata.counts,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.activation == "silu",
+            )
+        else:
+            torch.ops.vllm.cpu_gdn_attention_core(
+                mixed_qkv,
+                b,
+                a,
+                core_attn_out,
+                _encode_layer_name(self.prefix),
+            )
 
         return self._output_projection(core_attn_out, z)
 

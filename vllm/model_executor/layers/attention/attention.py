@@ -539,7 +539,11 @@ class Attention(nn.Module, AttentionLayerBase):
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
         kv_cache_dummy_dep = None
-        if self.use_direct_call:
+        if getattr(self.impl, "use_direct_forward", False):
+            # The backend reads its metadata from the layer, so it can be
+            # traced by torch.compile without an opaque custom op.
+            self.impl.forward_direct(self, query, key, value, output)  # type: ignore[attr-defined]
+        elif self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
                 not self.attn_backend.forward_includes_kv_cache_update

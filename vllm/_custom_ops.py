@@ -4124,6 +4124,167 @@ def cpu_attention_with_kv_cache(
     )
 
 
+def cpu_attn_reshape_and_cache_kv_cache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    isa: str,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    kv_cache_dtype: str = "auto",
+) -> None:
+    torch.ops._C.cpu_attn_reshape_and_cache_kv_cache(
+        key, value, kv_cache, slot_mapping, isa, k_scale, v_scale, kv_cache_dtype
+    )
+
+
+def cpu_attention_with_kv_cache_kv_cache(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    output: torch.Tensor,
+    num_actual_tokens: int,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scale: float,
+    causal: bool,
+    alibi_slopes: torch.Tensor | None,
+    sliding_window: int,
+    block_table: torch.Tensor,
+    softcap: float,
+    scheduler_metadata: torch.Tensor,
+    s_aux: torch.Tensor | None,
+    dynamic_causal: torch.Tensor | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    kv_cache_dtype: str = "auto",
+) -> None:
+    torch.ops._C.cpu_attention_with_kv_cache_kv_cache(
+        query,
+        kv_cache,
+        output,
+        num_actual_tokens,
+        query_start_loc,
+        seq_lens,
+        scale,
+        causal,
+        alibi_slopes,
+        sliding_window,
+        block_table,
+        softcap,
+        scheduler_metadata,
+        s_aux,
+        dynamic_causal,
+        k_scale,
+        v_scale,
+        kv_cache_dtype,
+    )
+
+
+def str_to_tensor(value: str) -> torch.Tensor:
+    """A string as a uint8 tensor of its characters, for ops that must not take
+    a ``str`` argument so Inductor's C++ wrapper can call them directly."""
+    return torch.tensor(list(value.encode()), dtype=torch.uint8)
+
+
+def cpu_attn_forward(
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
+    output: torch.Tensor,
+    kv_cache: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    scheduler_metadata: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    alibi_slopes: torch.Tensor | None,
+    s_aux: torch.Tensor | None,
+    scale: float,
+    causal: bool,
+    sliding_window: int,
+    softcap: float,
+    kv_cache_dtype: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
+) -> None:
+    """``kv_cache_dtype`` is the dtype name as a uint8 tensor of its characters
+    (see ``str_to_tensor``)."""
+    torch.ops._C.cpu_attn_forward(
+        query,
+        key,
+        value,
+        output,
+        kv_cache,
+        query_start_loc,
+        seq_lens,
+        block_table,
+        scheduler_metadata,
+        slot_mapping,
+        alibi_slopes,
+        s_aux,
+        scale,
+        causal,
+        sliding_window,
+        softcap,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+
+if hasattr(torch.ops._C, "gdn_attention_core_direct_cpu"):
+
+    @register_fake("_C::gdn_attention_core_direct_cpu")
+    def gdn_attention_core_direct_cpu_fake(
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        ssm_state: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        counts: torch.Tensor,
+        head_k_dim: int,
+        head_v_dim: int,
+        silu: bool,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "cpu_attn_forward"):
+
+    @register_fake("_C::cpu_attn_forward")
+    def cpu_attn_forward_fake(
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        output: torch.Tensor,
+        kv_cache: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        scheduler_metadata: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        alibi_slopes: torch.Tensor | None,
+        s_aux: torch.Tensor | None,
+        scale: float,
+        causal: bool,
+        sliding_window: int,
+        softcap: float,
+        kv_cache_dtype: torch.Tensor,
+        k_scale: float,
+        v_scale: float,
+    ) -> None:
+        return None
+
+
 def cpu_mla_decode(
     query: torch.Tensor,
     k_buffer: torch.Tensor,

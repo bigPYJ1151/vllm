@@ -392,6 +392,10 @@ class CpuPlatform(Platform):
                 }
             )
             compilation_config.ir_enable_torch_wrap = False
+            if envs.VLLM_CPU_ATTN_DIRECT:
+                # Attention and GDN take no opaque arguments in this mode, so
+                # Inductor can call the whole graph from C++.
+                compilation_config.inductor_compile_config["cpp_wrapper"] = True
 
         if vllm_config.lora_config is not None:
             compilation_config.mode = CompilationMode.NONE

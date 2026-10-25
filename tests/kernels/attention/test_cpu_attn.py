@@ -25,8 +25,12 @@ if not current_platform.is_cpu():
 
 from vllm._custom_ops import (
     cpu_attention_with_kv_cache,
+    cpu_attention_with_kv_cache_kv_cache,
+    cpu_attn_forward,
     cpu_attn_get_scheduler_metadata,
     cpu_attn_reshape_and_cache,
+    cpu_attn_reshape_and_cache_kv_cache,
+    str_to_tensor,
 )
 
 # Enable AMX tile data registers so isolated runs (e.g. -k fp8_amx) don't rely
@@ -1626,3 +1630,215 @@ def test_cpu_mla_rejects_quantized_kv_cache() -> None:
     assert "MLA" in _select_attn_backend("auto", use_mla=True)
     with pytest.raises(ValueError, match="fp8"):
         _select_attn_backend("fp8", use_mla=True)
+
+
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_cpu_attn_kv_cache_ops_match_split_cache_ops(
+    num_heads: tuple[int, int], dtype: torch.dtype
+) -> None:
+    """The ops taking the whole KV cache equal the split key/value cache ops."""
+    set_random_seed(0)
+    head_size, block_size = 128, 64
+    num_query_heads, num_kv_heads = num_heads
+    seq_lens = [5, 70]
+    num_tokens = sum(seq_lens)
+    num_padded_tokens = num_tokens + 3
+    isa = get_attn_isa(block_size, dtype)
+    scale = head_size**-0.5
+
+    num_blocks_per_seq = [math.ceil(n / block_size) for n in seq_lens]
+    num_blocks = sum(num_blocks_per_seq)
+    block_table = torch.zeros(len(seq_lens), max(num_blocks_per_seq), dtype=torch.int32)
+    slot_mapping = []
+    next_block = 0
+    for i, n in enumerate(seq_lens):
+        blocks = torch.arange(next_block, next_block + num_blocks_per_seq[i])
+        block_table[i, : len(blocks)] = blocks.to(torch.int32)
+        slot_mapping.append(blocks[0] * block_size + torch.arange(n))
+        next_block += num_blocks_per_seq[i]
+    slot_mapping = torch.cat(slot_mapping)
+
+    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype)
+    query = torch.randn(num_padded_tokens, num_query_heads, head_size, dtype=dtype)
+
+    kv_cache = torch.zeros(
+        num_blocks, num_kv_heads, block_size, 2 * head_size, dtype=dtype
+    )
+    split_kv_cache = kv_cache.clone()
+    key_cache, value_cache = split_kv_cache.view(
+        num_blocks, num_kv_heads, block_size * 2, -1
+    ).chunk(2, dim=2)
+    cpu_attn_reshape_and_cache(
+        key, value, key_cache, value_cache, slot_mapping, isa=isa
+    )
+    cpu_attn_reshape_and_cache_kv_cache(key, value, kv_cache, slot_mapping, isa=isa)
+    torch.testing.assert_close(kv_cache, split_kv_cache, atol=0, rtol=0)
+
+    query_start_loc = torch.tensor([0, *torch.tensor(seq_lens).cumsum(0).tolist()])
+    query_start_loc = query_start_loc.to(torch.int32)
+    kv_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    metadata = cpu_attn_get_scheduler_metadata(
+        num_reqs=len(seq_lens),
+        num_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_size,
+        seq_lens=kv_lens,
+        dtype=dtype,
+        query_start_loc=query_start_loc,
+        causal=True,
+        sliding_window_size=-1,
+        isa=isa,
+        enable_kv_split=False,
+    )
+    common = dict(
+        query_start_loc=query_start_loc,
+        seq_lens=kv_lens,
+        scale=scale,
+        causal=True,
+        alibi_slopes=None,
+        sliding_window=-1,
+        block_table=block_table,
+        softcap=0,
+        scheduler_metadata=metadata,
+        s_aux=None,
+    )
+    expected = torch.full_like(query, 7)
+    cpu_attention_with_kv_cache(
+        query=query[:num_tokens],
+        key_cache=key_cache,
+        value_cache=value_cache,
+        output=expected[:num_tokens],
+        **common,
+    )
+    actual = torch.full_like(query, 7)
+    cpu_attention_with_kv_cache_kv_cache(
+        query=query,
+        kv_cache=kv_cache,
+        output=actual,
+        num_actual_tokens=num_tokens,
+        **common,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (actual[num_tokens:] == 7).all()
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_e4m3"])
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@torch.inference_mode()
+def test_cpu_attn_forward_matches_split_cache_ops(
+    num_heads: tuple[int, int], kv_cache_dtype: str
+) -> None:
+    """The fused KV update + attention op equals the split cache ops."""
+    is_fp8 = kv_cache_dtype != "auto"
+    if is_fp8 and current_platform.get_cpu_architecture() != CpuArchEnum.X86:
+        pytest.skip("FP8 KV cache is only supported on x86")
+    set_random_seed(0)
+    dtype = torch.bfloat16
+    head_size, block_size = 128, 64
+    num_query_heads, num_kv_heads = num_heads
+    seq_lens = [5, 70]
+    num_tokens = sum(seq_lens)
+    isa = "vec" if is_fp8 else get_attn_isa(block_size, dtype)
+    k_scale, v_scale = (0.5, 0.25) if is_fp8 else (1.0, 1.0)
+
+    num_blocks_per_seq = [math.ceil(n / block_size) for n in seq_lens]
+    num_blocks = sum(num_blocks_per_seq)
+    block_table = torch.zeros(len(seq_lens), max(num_blocks_per_seq), dtype=torch.int32)
+    slot_mapping = []
+    next_block = 0
+    for i, n in enumerate(seq_lens):
+        blocks = torch.arange(next_block, next_block + num_blocks_per_seq[i])
+        block_table[i, : len(blocks)] = blocks.to(torch.int32)
+        slot_mapping.append(blocks[0] * block_size + torch.arange(n))
+        next_block += num_blocks_per_seq[i]
+    slot_mapping = torch.cat(slot_mapping)
+
+    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype)
+    query = torch.randn(num_tokens, num_query_heads, head_size, dtype=dtype)
+    cache_dtype = torch.uint8 if is_fp8 else dtype
+    kv_cache = torch.zeros(
+        num_blocks, num_kv_heads, block_size, 2 * head_size, dtype=cache_dtype
+    )
+    expected_cache = kv_cache.clone()
+    key_cache, value_cache = expected_cache.view(
+        num_blocks, num_kv_heads, block_size * 2, -1
+    ).chunk(2, dim=2)
+
+    query_start_loc = torch.tensor([0, *torch.tensor(seq_lens).cumsum(0).tolist()])
+    query_start_loc = query_start_loc.to(torch.int32)
+    kv_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    metadata = cpu_attn_get_scheduler_metadata(
+        num_reqs=len(seq_lens),
+        num_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_size,
+        seq_lens=kv_lens,
+        dtype=dtype,
+        query_start_loc=query_start_loc,
+        causal=True,
+        sliding_window_size=-1,
+        isa=isa,
+        enable_kv_split=False,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    scale = head_size**-0.5
+    cpu_attn_reshape_and_cache(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        isa=isa,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    expected = torch.empty_like(query)
+    cpu_attention_with_kv_cache(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        output=expected,
+        query_start_loc=query_start_loc,
+        seq_lens=kv_lens,
+        scale=scale,
+        causal=True,
+        alibi_slopes=None,
+        sliding_window=-1,
+        block_table=block_table,
+        softcap=0,
+        scheduler_metadata=metadata,
+        s_aux=None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+
+    actual = torch.empty_like(query)
+    cpu_attn_forward(
+        query,
+        key,
+        value,
+        actual,
+        kv_cache,
+        query_start_loc,
+        kv_lens,
+        block_table,
+        metadata,
+        slot_mapping,
+        None,
+        None,
+        scale,
+        True,
+        -1,
+        0.0,
+        str_to_tensor(kv_cache_dtype),
+        k_scale,
+        v_scale,
+    )
+    torch.testing.assert_close(kv_cache, expected_cache, atol=0, rtol=0)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
