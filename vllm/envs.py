@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
+    VLLM_MQ_BUSY_LOOP_SECONDS: float = 1.0
     VLLM_CPU_BIND_GRANULARITY: Literal["numa", "cbb"] = "numa"
     VLLM_CPU_CI_ENV: bool = False
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
@@ -901,6 +902,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (CPU backend only) CPU core ids bound by OpenMP threads, e.g., "0-31",
     # "0,1,2", "0-31,33". CPU cores of different ranks are separated by '|'.
     "VLLM_CPU_OMP_THREADS_BIND": lambda: os.getenv("VLLM_CPU_OMP_THREADS_BIND", "auto"),
+    # Seconds the executor keeps polling the worker response queue after its
+    # last read before sleeping on a socket. 0 frees the polling core while
+    # waiting for workers, at the cost of a wake-up per step.
+    "VLLM_MQ_BUSY_LOOP_SECONDS": lambda: float(
+        os.getenv("VLLM_MQ_BUSY_LOOP_SECONDS", "1.0")
+    ),
     # (CPU backend only) CPU cores not used by OMP threads .
     # Those CPU cores will not be used by OMP threads of a rank.
     "VLLM_CPU_NUM_OF_RESERVED_CPU": lambda: (

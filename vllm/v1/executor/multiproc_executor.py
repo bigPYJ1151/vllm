@@ -870,6 +870,9 @@ class WorkerProc:
         worker_response_mq: MessageQueue | None = None
         if len(response_handle.local_reader_ranks) > 0:
             worker_response_mq = MessageQueue.create_from_handle(response_handle, 0)
+            worker_response_mq._spin_condition.busy_loop_s = (
+                envs.VLLM_MQ_BUSY_LOOP_SECONDS
+            )
         peer_response_handles = handles["peer_response_handles"]
         peer_worker_response_mqs = [
             MessageQueue.create_from_handle(handle, -1)
