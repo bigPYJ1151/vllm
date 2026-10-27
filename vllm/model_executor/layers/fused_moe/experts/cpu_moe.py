@@ -378,6 +378,111 @@ class X86CPUUnquantizedExperts(CPUUnquantizedExperts):
         return cpu_cls._supports_grouped_gemm(moe_config)
 
 
+class X86CPUPackedUnquantizedExperts(X86CPUUnquantizedExperts):
+    """x86 bf16 MoE experts on the VNNI-packed `fused_experts_cpu` kernel.
+
+    The kernel uses AVX512-BF16 micro-gemms when few tokens reach each expert
+    (decode) and AMX BRGEMM otherwise, which beats the always-AMX kernel of
+    X86CPUUnquantizedExperts at small batch sizes.
+    """
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return (
+            X86CPUUnquantizedExperts._supports_current_device()
+            and torch.cpu._is_avx512_bf16_supported()
+            and hasattr(torch.ops._C, "fused_experts_cpu")
+        )
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        supported, reason = X86CPUUnquantizedExperts.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+        if not supported:
+            return supported, reason
+        if moe_config.has_bias:
+            return False, "expert bias is not supported"
+        return True, None
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation in (
+            MoEActivation.SILU,
+            MoEActivation.GELU,
+            MoEActivation.GELU_TANH,
+        )
+
+    def supports_expert_map(self) -> bool:
+        return False
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._pad_moe_intermediate(layer)
+        replace_parameter(
+            layer,
+            "w13_weight",
+            torch.ops._C.convert_weight_packed(layer.w13_weight),
+        )
+        replace_parameter(
+            layer,
+            "w2_weight",
+            torch.ops._C.convert_weight_packed(layer.w2_weight),
+        )
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        if apply_router_weight_on_input:
+            # The kernel always weights the expert outputs when combining, so
+            # a pre-weighted input would be weighted twice.
+            raise NotImplementedError(
+                "X86CPUPackedUnquantizedExperts does not support "
+                "apply_router_weight_on_input=True."
+            )
+        fused_experts_cpu(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            CPUQuantMethod.UNQUANT,
+            None,  # w1_scale
+            None,  # w2_scale
+            None,  # w1_zero
+            None,  # w2_zero
+            None,  # block_size
+            None,  # w1_bias
+            None,  # w2_bias
+            None,  # alpha
+            None,  # limit
+            True,  # is_vnni
+            None,  # a1_scale
+            _CPU_ACT_METHODS[activation],
+        )
+
+
 class ArmCPUUnquantizedExperts(CPUUnquantizedExperts):
     """Arm NEON grouped-gemm unquantized MoE experts."""
 

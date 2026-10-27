@@ -36,7 +36,7 @@ def test_x86_cpu_unquantized_kernel_selection(
 ):
     from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
         CPUUnquantizedExperts,
-        X86CPUUnquantizedExperts,
+        X86CPUPackedUnquantizedExperts,
     )
 
     with (
@@ -47,6 +47,8 @@ def test_x86_cpu_unquantized_kernel_selection(
             return_value=CpuArchEnum.X86,
         ),
         patch("torch.cpu._is_amx_tile_supported", return_value=amx_supported),
+        patch("torch.cpu._is_avx512_bf16_supported", return_value=True),
+        patch.object(torch.ops._C, "fused_experts_cpu", create=True),
     ):
         moe_config = make_dummy_moe_config(
             hidden_dim=128,
@@ -66,7 +68,7 @@ def test_x86_cpu_unquantized_kernel_selection(
         )
 
     expected_kernel_cls = (
-        X86CPUUnquantizedExperts if expect_amx_kernel else CPUUnquantizedExperts
+        X86CPUPackedUnquantizedExperts if expect_amx_kernel else CPUUnquantizedExperts
     )
     assert kernel_cls is expected_kernel_cls
 

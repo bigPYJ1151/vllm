@@ -440,7 +440,11 @@ void fused_experts_kernel_impl(
   const int64_t stride_n = K;
 
   int64_t avg_M = std::max(int64_t(1), M * topk / E);
-  const bool use_brgemm = can_use_brgemm<scalar_t>(avg_M);
+  // BRGEMM matches the vector micro-gemm from a few tokens on and is faster
+  // beyond that, even when each expert only gets about one token.
+  constexpr int64_t kBrgemmMinPairs = 32;
+  const bool use_brgemm =
+      can_use_brgemm<scalar_t>(avg_M) || M * topk >= kBrgemmMinPairs;
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
@@ -554,6 +558,11 @@ void fused_experts_kernel_impl(
       } else if (act_func == CPUActMethod::gelu_and_mul) {
         for (int64_t m = 0; m < m_size; ++m) {
           gelu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
+        }
+      } else if (act_func == CPUActMethod::gelu_tanh_and_mul) {
+        for (int64_t m = 0; m < m_size; ++m) {
+          gelu_tanh_and_mul_stub(
+              ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
         }
       } else if (act_func == CPUActMethod::swiglu) {
         for (int64_t m = 0; m < m_size; ++m) {

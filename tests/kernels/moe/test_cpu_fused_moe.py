@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
     CPUExpertsInt8,
     CPUUnquantizedExperts,
     PowerCPUUnquantizedExperts,
+    X86CPUPackedUnquantizedExperts,
     X86CPUUnquantizedExperts,
 )
 from vllm.model_executor.layers.fused_moe.router.cpu_router import _softmax_topk
@@ -612,6 +613,103 @@ def test_cpu_fused_moe_unaligned_intermediate_size(
 
     atol, rtol = get_default_atol(output), get_default_rtol(output)
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+
+
+requires_packed_experts = pytest.mark.skipif(
+    not X86CPUPackedUnquantizedExperts._supports_current_device(),
+    reason="X86CPUPackedUnquantizedExperts requires AMX, AVX512-BF16 and "
+    "fused_experts_cpu",
+)
+
+
+@requires_packed_experts
+@pytest.mark.parametrize("batch_size", [1, 4, 64, 200])
+@pytest.mark.parametrize("intermediate_size", [128, UNALIGNED_INTERMEDIATE_DIM])
+@pytest.mark.parametrize(
+    "act",
+    [MoEActivation.SILU, MoEActivation.GELU, MoEActivation.GELU_TANH],
+)
+def test_cpu_packed_experts(
+    default_vllm_config,
+    batch_size: int,
+    intermediate_size: int,
+    act: MoEActivation,
+):
+    """The packed kernel matches the reference both for a few tokens per
+    expert (vector micro-gemm) and for many (AMX BRGEMM)."""
+    set_random_seed(0)
+    dtype = torch.bfloat16
+    expert_num, hidden_size, topk_num = 8, 128, 4
+
+    input = torch.randn((batch_size, hidden_size), dtype=dtype) / (
+        0.5 * hidden_size**0.5
+    )
+    w13 = torch.randn(
+        (expert_num, 2 * intermediate_size, hidden_size), dtype=dtype
+    ) / (0.5 * hidden_size**0.5)
+    w2 = torch.randn((expert_num, hidden_size, intermediate_size), dtype=dtype) / (
+        0.5 * intermediate_size**0.5
+    )
+    router_logits = torch.randn((batch_size, expert_num), dtype=dtype)
+    topk_weight, topk_ids = _softmax_topk(router_logits, topk_num, False)
+    ref_output = ref_fused_moe(input, w13, w2, None, None, topk_weight, topk_ids, act)
+
+    layer = _StubMoELayer(w13.clone(), w2.clone(), act, None, None)
+    moe_config = _make_moe_config(
+        expert_num, hidden_size, intermediate_size, topk_num, dtype, act
+    )
+    supported, reason = X86CPUPackedUnquantizedExperts.is_supported_config(
+        X86CPUPackedUnquantizedExperts,
+        moe_config,
+        None,
+        None,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+    assert supported, reason
+    experts = X86CPUPackedUnquantizedExperts(moe_config, FusedMoEQuantConfig.make())
+    experts.process_weights_after_loading(layer)
+
+    output = torch.empty_like(input)
+    experts.apply(
+        output=output,
+        hidden_states=input,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        topk_weights=topk_weight,
+        topk_ids=topk_ids,
+        activation=act,
+        global_num_experts=expert_num,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=torch.empty(0),
+        workspace2=torch.empty(0),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+    atol, rtol = get_default_atol(output), get_default_rtol(output)
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+
+
+@requires_packed_experts
+@pytest.mark.parametrize(
+    ("act", "has_bias"),
+    [
+        (MoEActivation.SWIGLUOAI, False),
+        (MoEActivation.SILU, True),
+    ],
+)
+def test_cpu_packed_experts_unsupported_config(act: MoEActivation, has_bias: bool):
+    """Biased and SwiGLU-OAI layers fall back to the AMX experts."""
+    moe_config = _make_moe_config(8, 128, 128, 4, torch.bfloat16, act, has_bias)
+    supported, _ = X86CPUPackedUnquantizedExperts.is_supported_config(
+        X86CPUPackedUnquantizedExperts,
+        moe_config,
+        None,
+        None,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+    assert not supported
 
 
 @pytest.mark.skipif(

@@ -162,11 +162,13 @@ def backend_to_kernel_cls(
             ArmCPUUnquantizedExperts,
             CPUUnquantizedExperts,
             PowerCPUUnquantizedExperts,
+            X86CPUPackedUnquantizedExperts,
             X86CPUUnquantizedExperts,
         )
 
         # Prefer architecture-specific kernels before the portable vector path.
         return [
+            X86CPUPackedUnquantizedExperts,
             X86CPUUnquantizedExperts,
             ArmCPUUnquantizedExperts,
             PowerCPUUnquantizedExperts,
