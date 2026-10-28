@@ -1,5 +1,7 @@
 #include "cpu_attn_dispatch_generated.h"
 
+#include <array>
+
 // Runtime check for AMX-FP8, implemented in cpu_isa.cpp.
 extern bool runtime_has_amx_fp8();
 
@@ -287,12 +289,20 @@ namespace {
 // head_size] views.
 std::pair<torch::Tensor, torch::Tensor> split_kv_cache(
     const torch::Tensor& kv_cache) {
-  const int64_t num_blocks = kv_cache.size(0);
-  const int64_t num_kv_heads = kv_cache.size(1);
+  TORCH_CHECK_EQ(kv_cache.dim(), 4);
   const int64_t block_size = kv_cache.size(2);
-  const auto kv = kv_cache.view({num_blocks, num_kv_heads, block_size * 2, -1});
-  const auto kv_pair = kv.chunk(2, 2);
-  return {kv_pair[0], kv_pair[1]};
+  const int64_t head_size = kv_cache.size(3) / 2;
+  TORCH_CHECK(kv_cache.stride(3) == 1 && kv_cache.stride(2) == 2 * head_size,
+              "kv_cache must be contiguous in its last two dimensions");
+  // Two as_strided views instead of view + chunk: a block holds all of its
+  // keys followed by all of its values, and this runs once per layer per step.
+  const std::array<int64_t, 4> sizes{kv_cache.size(0), kv_cache.size(1),
+                                     block_size, head_size};
+  const std::array<int64_t, 4> strides{kv_cache.stride(0), kv_cache.stride(1),
+                                       head_size, 1};
+  const int64_t offset = kv_cache.storage_offset();
+  return {kv_cache.as_strided(sizes, strides, offset),
+          kv_cache.as_strided(sizes, strides, offset + block_size * head_size)};
 }
 
 }  // namespace
@@ -320,12 +330,11 @@ void cpu_attention_with_kv_cache_kv_cache(
     const double v_scale, const std::string& kv_cache_dtype) {
   auto [key_cache, value_cache] = split_kv_cache(kv_cache);
   torch::Tensor output_view = output.narrow(0, 0, num_actual_tokens);
-  cpu_attention_with_kv_cache(query.narrow(0, 0, num_actual_tokens), key_cache,
-                              value_cache, output_view, query_start_loc,
-                              seq_lens, scale, causal, alibi_slopes,
-                              sliding_window, block_table, softcap,
-                              scheduler_metadata, s_aux, dynamic_causal,
-                              k_scale, v_scale, kv_cache_dtype);
+  cpu_attention_with_kv_cache(
+      query.narrow(0, 0, num_actual_tokens), key_cache, value_cache,
+      output_view, query_start_loc, seq_lens, scale, causal, alibi_slopes,
+      sliding_window, block_table, softcap, scheduler_metadata, s_aux,
+      dynamic_causal, k_scale, v_scale, kv_cache_dtype);
 }
 
 // Writes `key`/`value` into the KV cache (when given) and runs attention for
@@ -355,25 +364,43 @@ void cpu_attn_forward(
       reinterpret_cast<const char*>(kv_cache_dtype.data_ptr<uint8_t>()),
       kv_cache_dtype.numel());
   // The scheduler metadata records the ISA it was built for.
-  const auto* metadata = reinterpret_cast<const cpu_attention::AttentionMetadata*>(
-      scheduler_metadata.data_ptr());
+  const auto* metadata =
+      reinterpret_cast<const cpu_attention::AttentionMetadata*>(
+          scheduler_metadata.data_ptr());
   std::string isa;
   switch (metadata->isa) {
-    case cpu_attention::ISA::AMX: isa = "amx"; break;
-    case cpu_attention::ISA::AMX_FP8: isa = "amx_fp8"; break;
-    case cpu_attention::ISA::VEC: isa = "vec"; break;
-    case cpu_attention::ISA::VEC16: isa = "vec16"; break;
-    case cpu_attention::ISA::NEON: isa = "neon"; break;
-    case cpu_attention::ISA::VXE: isa = "vxe"; break;
-    case cpu_attention::ISA::RVV: isa = "rvv"; break;
-    case cpu_attention::ISA::VSX: isa = "vsx"; break;
+    case cpu_attention::ISA::AMX:
+      isa = "amx";
+      break;
+    case cpu_attention::ISA::AMX_FP8:
+      isa = "amx_fp8";
+      break;
+    case cpu_attention::ISA::VEC:
+      isa = "vec";
+      break;
+    case cpu_attention::ISA::VEC16:
+      isa = "vec16";
+      break;
+    case cpu_attention::ISA::NEON:
+      isa = "neon";
+      break;
+    case cpu_attention::ISA::VXE:
+      isa = "vxe";
+      break;
+    case cpu_attention::ISA::RVV:
+      isa = "rvv";
+      break;
+    case cpu_attention::ISA::VSX:
+      isa = "vsx";
+      break;
   }
+  auto [key_cache, value_cache] = split_kv_cache(kv_cache);
   if (key.has_value() && value.has_value()) {
-    cpu_attn_reshape_and_cache_kv_cache(*key, *value, kv_cache, slot_mapping,
-                                        isa, k_scale, v_scale, kv_dtype);
+    cpu_attn_reshape_and_cache(*key, *value, key_cache, value_cache,
+                               slot_mapping, isa, k_scale, v_scale, kv_dtype);
   }
-  cpu_attention_with_kv_cache_kv_cache(
-      query, kv_cache, output, query.size(0), query_start_loc, seq_lens, scale,
+  cpu_attention_with_kv_cache(
+      query, key_cache, value_cache, output, query_start_loc, seq_lens, scale,
       causal, alibi_slopes, sliding_window, block_table, softcap,
       scheduler_metadata, s_aux, std::nullopt, k_scale, v_scale, kv_dtype);
 }
