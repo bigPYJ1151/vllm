@@ -3714,6 +3714,24 @@ if hasattr(torch.ops._C, "fp8_scaled_mm_with_quant"):
         return torch.empty((M, N), dtype=output_dtype, device=act.device)
 
 
+if hasattr(torch.ops._C, "quantize_fp8e4m3_vec"):
+
+    @register_fake("_C::quantize_fp8e4m3_vec")
+    def quantize_fp8e4m3_vec_fake(
+        input: torch.Tensor,
+        channelwise: bool,
+        scale_opt: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        quant = torch.empty_like(
+            input, dtype=torch.float8_e4m3fn, memory_format=torch.contiguous_format
+        )
+        if channelwise or scale_opt is None:
+            scales = input.new_empty((input.size(0),), dtype=torch.float32)
+        else:
+            scales = torch.empty_like(scale_opt, dtype=torch.float32)
+        return quant, scales
+
+
 def fp8_scaled_mm_with_quant(
     act: torch.Tensor,
     act_scales: torch.Tensor | None,
