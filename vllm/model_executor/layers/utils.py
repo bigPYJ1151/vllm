@@ -484,17 +484,6 @@ def warmup_rocm_skinny_gemm_workspaces(device: torch.device) -> None:
         logger.debug("wvSplitKrc workspace warmup failed", exc_info=True)
 
 
-# Above this weight size, oneDNN's onednn_mm consistently matches or beats
-# the SGL AMX kernel once M grows past decode-sized batches, and is within
-# noise of it at decode-sized M -- so larger weights default to oneDNN
-# rather than SGL. 1 MiB comfortably covers MoE router/gate weights (e.g.
-# (2048, 128) .. (2880, 32) bf16/fp16, 180-720 KiB) while staying well below
-# any dense qkv/o_proj/gate_up/down/lm_head projection in practice. This
-# threshold is derived from bf16/fp16 unquantized dense-GEMM benchmarks only,
-# so it does not apply to the int8 scaled_mm path below.
-_CPU_SGL_GEMM_MAX_WEIGHT_BYTES = 1 * 1024 * 1024
-
-
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     if not torch.cpu._is_amx_tile_supported() or dtype not in (
         torch.bfloat16,
@@ -515,8 +504,6 @@ def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
         # returns a float32 tensor instead (gemm.cpp), which would trip
         # that check, so N must be a full TILE_N tile here.
         return k % 32 == 0 and n % 16 == 0
-    if n * k * dtype.itemsize > _CPU_SGL_GEMM_MAX_WEIGHT_BYTES:
-        return False
     if n < 16:
         # convert_weight_packed transposes to fp32 instead of VNNI-packing
         # when N < TILE_N (gemm.cpp), and weight_packed_linear detects that
@@ -609,13 +596,9 @@ def dispatch_cpu_unquantized_gemm(
         )
         return
 
-    # Small weights (e.g. MoE router/gate projections, where N is the expert
-    # count rather than a hidden-size-scaled dimension) never reach oneDNN's
-    # compute-bound regime, no matter how large the batch gets: SGL's lower
-    # per-call dispatch overhead wins consistently across the full measured
-    # M range. Larger dense projections (qkv/o_proj/gate_up/down/lm_head)
-    # cross over to favoring oneDNN once batch size grows past decode-sized
-    # M, so they keep using oneDNN below.
+    # The SGL AMX packed kernel also wins over oneDNN on the large dense
+    # projections when all dies run at once (DMR prefill), so use it whenever
+    # the shape allows.
     if check_cpu_sgl_kernel(N, K, dtype):
         # For small size GEMM, packed_weight might be float32
         packed_weight = torch.ops._C.convert_weight_packed(layer.weight)
