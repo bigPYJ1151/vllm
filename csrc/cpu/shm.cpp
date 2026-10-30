@@ -543,25 +543,139 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data,
 
   return;
 }
+// Reduce-scatter + all-gather variant of all_reduce_sum_impl. Every thread
+// still owns one contiguous range of the tensor, but inside the range rank r
+// only reduces the r-th slice and the other ranks copy the reduced slice back,
+// so each rank reads about 3x (instead of 5x) the range from memory and the
+// reduction is not repeated on every rank. Two barriers per iteration.
+template <typename scalar_t, int RANKS>
+void all_reduce_sum_rs_impl(ThreadSHMContext* ctx, scalar_t* data,
+                            size_t elem_num) {
+  CPU_KERNEL_GUARD_IN(all_reduce_sum_rs_impl)
+  using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
+  constexpr int64_t vec_elem_num = vec_t::get_elem_num();
+  constexpr int64_t slice_align = 64 / sizeof(scalar_t);
+
+  shm_cc_ops::shm_cc_loop<scalar_t>(
+      ctx, elem_num,
+      [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
+          int64_t data_elem_num, bool fast_mode) {
+        const int rank = thread_ctx->rank;
+        scalar_t* thread_shm_ptr =
+            thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
+        scalar_t* thread_data_ptr = data + data_offset;
+
+        int remote_ranks[RANKS - 1];
+        scalar_t* remote_data_ptrs[RANKS - 1];
+        vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+          remote_ranks[idx] = thread_ctx->get_swizzled_rank(idx + 1);
+          remote_data_ptrs[idx] =
+              thread_ctx->get_thread_shm_ptr<scalar_t>(remote_ranks[idx]);
+        });
+
+        const int64_t slice_elem_num =
+            (((data_elem_num + RANKS - 1) / RANKS + slice_align - 1) /
+             slice_align) *
+            slice_align;
+        auto slice_begin = [&](int r) {
+          return std::min<int64_t>(static_cast<int64_t>(r) * slice_elem_num,
+                                   data_elem_num);
+        };
+
+        if (!fast_mode) {
+          thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+        }
+
+        // Barrier 1: every rank has published its range.
+        shm_cc_ops::memcpy_to_shm(thread_shm_ptr, thread_data_ptr,
+                                  data_elem_num * sizeof(scalar_t));
+        thread_ctx->commit_ready_stamp();
+        thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+        thread_ctx->next_stamp();
+
+        // Reduce this rank's slice and publish it in the shm buffer.
+        const int64_t begin = slice_begin(rank);
+        const int64_t end = slice_begin(rank + 1);
+        const int64_t aligned_end =
+            begin + ((end - begin) / vec_elem_num) * vec_elem_num;
+        int64_t i = begin;
+#pragma GCC unroll 4
+        for (; i < aligned_end; i += vec_elem_num) {
+          vec_t local_data(thread_data_ptr + i);  // load from cache
+          vec_op::FP32Vec16 local_data_fp32(local_data);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            vec_t remote_data(true, remote_data_ptrs[idx] + i);  // stream load
+            vec_op::FP32Vec16 remote_data_fp32(remote_data);
+            local_data_fp32 = local_data_fp32 + remote_data_fp32;
+          });
+          vec_t reduced_data(local_data_fp32);
+          reduced_data.save(thread_data_ptr + i);
+          reduced_data.save(thread_shm_ptr + i);
+        }
+        if (i < end) {
+          vec_t local_data(thread_data_ptr + i);
+          vec_op::FP32Vec16 local_data_fp32(local_data);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            vec_t remote_data(true, remote_data_ptrs[idx] + i);
+            vec_op::FP32Vec16 remote_data_fp32(remote_data);
+            local_data_fp32 = local_data_fp32 + remote_data_fp32;
+          });
+          vec_t reduced_data(local_data_fp32);
+          reduced_data.save(thread_data_ptr + i, end - i);
+          reduced_data.save(thread_shm_ptr + i, end - i);
+        }
+
+        // Barrier 2: every rank has published its reduced slice.
+        thread_ctx->commit_ready_stamp();
+        thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+
+        // All-gather: copy the other ranks' reduced slices.
+        vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+          const int64_t slice_start = slice_begin(remote_ranks[idx]);
+          const int64_t slice_end = slice_begin(remote_ranks[idx] + 1);
+          if (slice_end > slice_start) {
+            shm_cc_ops::memcpy_from_shm(
+                thread_data_ptr + slice_start,
+                remote_data_ptrs[idx] + slice_start,
+                (slice_end - slice_start) * sizeof(scalar_t));
+          }
+        });
+      });
+}
 };  // namespace shm_cc_ops
 
 std::vector<std::unique_ptr<SHMManager>> SHMManager::SingletonInstances = {};
 std::mutex SHMManager::SingletonInstancesLock = {};
 
+// Below this size the single-barrier all-reduce is faster: the reduce-scatter
+// variant pays a second barrier.
+constexpr size_t kRSAllReduceMinBytes = 1 << 20;
+
+template <typename scalar_t, int RANKS>
+void shm_allreduce_sum_ranks(ThreadSHMContext* ctx, scalar_t* data,
+                             size_t elem_num, bool use_rs) {
+  if (use_rs) {
+    shm_cc_ops::all_reduce_sum_rs_impl<scalar_t, RANKS>(ctx, data, elem_num);
+  } else {
+    shm_cc_ops::all_reduce_sum_impl<scalar_t, RANKS>(ctx, data, elem_num);
+  }
+}
+
 template <typename scalar_t>
 void shm_allreduce_sum(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num) {
+  const bool use_rs = elem_num * sizeof(scalar_t) >= kRSAllReduceMinBytes;
   switch (ctx->group_size) {
     case 2:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 2>(ctx, data, elem_num);
+      shm_allreduce_sum_ranks<scalar_t, 2>(ctx, data, elem_num, use_rs);
       break;
     case 3:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 3>(ctx, data, elem_num);
+      shm_allreduce_sum_ranks<scalar_t, 3>(ctx, data, elem_num, use_rs);
       break;
     case 4:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 4>(ctx, data, elem_num);
+      shm_allreduce_sum_ranks<scalar_t, 4>(ctx, data, elem_num, use_rs);
       break;
     case 8:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 8>(ctx, data, elem_num);
+      shm_allreduce_sum_ranks<scalar_t, 8>(ctx, data, elem_num, use_rs);
       break;
     default:
       TORCH_CHECK(false,
