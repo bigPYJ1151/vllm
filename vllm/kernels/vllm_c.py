@@ -12,21 +12,27 @@ CUDA_ALIKE = current_platform.is_cuda_alike()
 """Most kernels in this file are supported on all CUDA-alike platforms."""
 IS_ROCM = current_platform.is_rocm()
 """ROCm needs shape normalization before calling some vLLM C kernels."""
+IS_CPU = current_platform.is_cpu()
+"""The CPU norm kernels need a contiguous input and a 32-multiple hidden size."""
 GPGPU_DEVICE = CUDA_ALIKE or current_platform.is_xpu()
 
 rms_no_var_size = lambda x, weight, epsilon, variance_size=None: (
-    variance_size is None and (weight is None or weight.dtype == x.dtype)
+    variance_size is None
+    and (weight is None or weight.dtype == x.dtype)
+    and (not IS_CPU or x.shape[-1] % 32 == 0)
 )
 """vLLM kernel requires no variance_size override and matching input/weight dtype."""
 
 
 @ir.ops.rms_norm.register_impl(
-    "vllm_c", supports_args=rms_no_var_size, supported=GPGPU_DEVICE
+    "vllm_c", supports_args=rms_no_var_size, supported=GPGPU_DEVICE or IS_CPU
 )
 def rms_norm(
     x: Tensor, weight: Tensor | None, epsilon: float, variance_size: int | None = None
 ) -> Tensor:
     assert variance_size is None
+    if IS_CPU and not x.is_contiguous():
+        x = x.contiguous()
     # ROCm's vLLM C RMSNorm kernel operates on contiguous 2D tensors.
     # Higher-rank callers still normalize over the last dimension, so flatten
     # all leading dims. reshape handles strided views from q/k/v splits.
@@ -45,7 +51,9 @@ def rms_norm(
 
 
 rms_add_no_var_size = lambda x, x_residual, weight, epsilon, variance_size=None: (
-    variance_size is None and (weight is None or weight.dtype == x.dtype)
+    variance_size is None
+    and (weight is None or weight.dtype == x.dtype)
+    and (not IS_CPU or x.shape[-1] % 32 == 0)
 )
 """vLLM Kernel does not support variance_size parameter and requires
 matching input/weight dtype."""
@@ -54,7 +62,7 @@ matching input/weight dtype."""
 @ir.ops.fused_add_rms_norm.register_impl(
     "vllm_c",
     supports_args=rms_add_no_var_size,
-    supported=GPGPU_DEVICE,
+    supported=GPGPU_DEVICE or IS_CPU,
     inplace=True,
 )
 def fused_add_rms_norm(
@@ -65,7 +73,9 @@ def fused_add_rms_norm(
     variance_size: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     assert variance_size is None
-    if IS_ROCM and (not x.is_contiguous() or not x_residual.is_contiguous()):
+    if (IS_ROCM or IS_CPU) and (
+        not x.is_contiguous() or not x_residual.is_contiguous()
+    ):
         output, residual = ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
             x, x_residual, weight, epsilon
         )

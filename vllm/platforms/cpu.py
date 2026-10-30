@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.v1.attention.backends.mla.prefill.base import (
         MLAPrefillBackend,
     )
@@ -143,6 +144,22 @@ class CpuPlatform(Platform):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "cpu"
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        # The C++ norm kernels beat Inductor's generated code on x86 (large-batch
+        # prefill, where the unfused norms dominate the non-GEMM time).
+        if cls.get_cpu_architecture() == CpuArchEnum.X86:
+            return IrOpPriorityConfig.with_default(
+                ["native"],
+                rms_norm=["vllm_c", "native"],
+                fused_add_rms_norm=["vllm_c", "native"],
+            )
+        return IrOpPriorityConfig.with_default(["native"])
 
     @classmethod
     def get_attn_backend_cls(
