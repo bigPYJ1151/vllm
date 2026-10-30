@@ -23,6 +23,10 @@ steps:
   - tests/test_zentorch_version_pin.py
   - vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
   - tests/kernels/test_onednn.py
+  - tests/kernels/core/test_cpu_layernorm.py
+  - vllm/kernels/vllm_c.py
+  - tests/distributed/test_cpu_shm_allreduce.py
+  - vllm/distributed/device_communicators/cpu_communicator.py
   - tests/kernels/test_cpu_fused_sampling.py
   - tests/kernels/test_awq_int4_to_int8.py
   - tests/kernels/quantization/test_cpu_fp8_scaled_mm.py
@@ -52,6 +56,8 @@ steps:
       tests/test_zentorch_version_pin.py \
       tests/kernels/mamba/test_cpu_short_conv.py \
       tests/kernels/test_onednn.py \
+      tests/kernels/core/test_cpu_layernorm.py \
+      tests/distributed/test_cpu_shm_allreduce.py \
       tests/kernels/test_cpu_fused_sampling.py \
       tests/kernels/test_awq_int4_to_int8.py \
       tests/kernels/quantization/test_cpu_fp8_scaled_mm.py \
