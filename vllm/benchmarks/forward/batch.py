@@ -74,6 +74,8 @@ def build_batch(
     vocab_size: int,
     rng: np.random.Generator,
     dcp_size: int = 1,
+    reserve_len: int = 0,
+    sampling_params: SamplingParams | None = None,
 ) -> BenchBatch:
     """Allocate disjoint blocks and build `NewRequestData` for every request.
 
@@ -92,6 +94,9 @@ def build_batch(
     R = min(window, P) tokens on models with SWA bounded replay (window 0
     otherwise), like the scheduler: it schedules R + Q tokens from
     replay_start = num_computed_tokens = P - R.
+
+    `reserve_len` allocates blocks for at least that many KV tokens per request,
+    for steps that grow the request after this batch.
     """
     replay_window = max(
         (group.kv_cache_spec.prefix_replay_tokens for group in kv_cache_groups),
@@ -110,7 +115,7 @@ def build_batch(
         block_ids = []
         for group, ranges in zip(kv_cache_groups, group_block_ranges):
             skipped, live = _num_blocks(
-                group.kv_cache_spec, computed, req.kv_len, dcp_size
+                group.kv_cache_spec, computed, max(req.kv_len, reserve_len), dcp_size
             )
             block_ids.append([0] * skipped + list(range(cursor, cursor + live)))
             ranges.append((cursor, cursor + live))
@@ -125,7 +130,8 @@ def build_batch(
                 prompt_token_ids=prompt.tolist(),
                 prefill_token_ids=prompt.tolist(),
                 mm_features=[],
-                sampling_params=SamplingParams(max_tokens=16, temperature=0.0),
+                sampling_params=sampling_params
+                or SamplingParams(max_tokens=16, temperature=0.0),
                 pooling_params=None,
                 block_ids=tuple(block_ids),
                 num_computed_tokens=computed,

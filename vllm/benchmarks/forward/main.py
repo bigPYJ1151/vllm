@@ -16,7 +16,6 @@ forward ...`, one process per GPU.
 import argparse
 import json
 import os
-import socket
 from dataclasses import asdict
 from typing import Any
 
@@ -29,6 +28,7 @@ from vllm.benchmarks.forward.shapes import (
     load_cases,
     parse_case,
 )
+from vllm.benchmarks.lib.direct_runner import get_model_runner, init_rank_env
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -90,18 +90,7 @@ def _setup_env() -> None:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     # Each case's eager pass compiles exactly the shapes it needs.
     os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
-    if "RANK" in os.environ:
-        return  # Launched by torchrun.
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    os.environ.update(
-        RANK="0",
-        LOCAL_RANK="0",
-        WORLD_SIZE="1",
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(port),
-    )
+    init_rank_env()
 
 
 def _make_engine_args(args: argparse.Namespace, cases: list[BenchCase]):
@@ -205,7 +194,7 @@ def main(args: argparse.Namespace) -> None:
     from vllm.distributed.parallel_state import get_world_group
 
     llm = LLM.from_engine_args(_make_engine_args(args, cases))
-    runner = llm.llm_engine.model_executor.driver_worker.worker.model_runner
+    runner = get_model_runner(llm)
     # Same draw on every rank: shapes are balanced across DP ranks.
     max_kv_len = runner.model_config.max_model_len
     cases = [

@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark a single static batch step by step, without a server.
+"""Benchmark a single static batch step by step, without a server or scheduler.
 
-All requests are prefilled in one engine step, then decoded one engine step at
-a time until they finish. Each step is timed, so prefill latency and per-step
-decode latency are reported separately. One warmup run precedes the measured
-run.
+Like `vllm bench forward`, the batch is built by hand and fed to the model
+runner's `execute_model` and `sample_tokens`. The whole batch is prefilled in one
+step, then decoded one step at a time. Each step is timed, so prefill latency
+and per-step decode latency are reported separately. One warmup run precedes
+the measured run.
 
-The headline numbers time only the model executor: the worker-side input
-preparation, model forward, and sampling. The scheduler, output processing,
-API server, detokenization and streaming are excluded. The full engine step
-time, which includes the scheduler and output processing, is reported
-alongside as `engine_*`.
+Only the model runner is timed: input preparation, model forward and sampling.
+The scheduler, output processing, API server, detokenization and streaming are
+not involved.
+
+One process per rank: `torchrun --nproc-per-node=N -m vllm.entrypoints.cli.main
+bench one-batch --tensor-parallel-size N ...` for multiple ranks. On CPU, each
+rank's OpenMP threads and memory node are bound like a spawned CPU worker
+(`VLLM_CPU_OMP_THREADS_BIND`, `VLLM_CPU_BIND_GRANULARITY`).
 """
 
 import argparse
@@ -21,10 +25,18 @@ import time
 from typing import Any
 
 import numpy as np
+import torch
 
+from vllm.benchmarks.forward.batch import BenchBatch, build_batch
+from vllm.benchmarks.forward.shapes import BenchCase, BenchRequest
+from vllm.benchmarks.lib.direct_runner import (
+    bind_cpu_threads,
+    get_model_runner,
+    init_rank_env,
+)
 from vllm.engine.arg_utils import EngineArgs
-from vllm.inputs import TokensPrompt
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
 
 def add_cli_args(parser: FlexibleArgumentParser):
@@ -55,187 +67,113 @@ def add_cli_args(parser: FlexibleArgumentParser):
     parser.set_defaults(enable_prefix_caching=False)
 
 
-class ModelStepTimer:
-    """Times the model executor part of each engine step.
-
-    A step spans from the start of `execute_model` to the end of
-    `sample_tokens`, excluding the scheduler and output processing.
-    """
-
-    def __init__(self, llm):
-        core = getattr(llm.llm_engine.engine_core, "engine_core", None)
-        if core is None:
-            raise RuntimeError(
-                "Timing the model executor needs the in-process engine core; "
-                "run with VLLM_ENABLE_V1_MULTIPROCESSING=0"
-            )
-        self.start: float | None = None
-        self.elapsed: float | None = None
-        executor = core.model_executor
-        execute_model, sample_tokens = executor.execute_model, executor.sample_tokens
-
-        def timed_execute_model(*args, **kwargs):
-            self.start = time.perf_counter()
-            return execute_model(*args, **kwargs)
-
-        def timed_sample_tokens(*args, **kwargs):
-            output = sample_tokens(*args, **kwargs)
-            assert self.start is not None
-            self.elapsed = time.perf_counter() - self.start
-            return output
-
-        executor.execute_model = timed_execute_model
-        executor.sample_tokens = timed_sample_tokens
-
-    def take(self) -> float:
-        assert self.elapsed is not None, "no model step was timed"
-        elapsed, self.elapsed = self.elapsed, None
-        return elapsed
+def decode_step(batch: BenchBatch, input_len: int, step: int) -> SchedulerOutput:
+    """The step after `step` decodes: one token per request."""
+    req_ids = batch.req_ids
+    num_reqs = len(req_ids)
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=req_ids,
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None] * num_reqs,
+        num_computed_tokens=[input_len + step] * num_reqs,
+        num_output_tokens=[step + 1] * num_reqs,
+    )
+    output.num_scheduled_tokens = dict.fromkeys(req_ids, 1)
+    output.total_num_scheduled_tokens = num_reqs
+    return output
 
 
-def timed_step(engine, timer: ModelStepTimer):
+def timed_step(runner, scheduler_output: SchedulerOutput) -> float:
+    """Time input preparation, forward and sampling of one step."""
+    torch.accelerator.synchronize()
     tic = time.perf_counter()
-    outputs = engine.step()
-    engine_latency = time.perf_counter() - tic
-    return outputs, timer.take(), engine_latency
+    runner.execute_model(scheduler_output)
+    runner.sample_tokens(None)
+    torch.accelerator.synchronize()
+    return time.perf_counter() - tic
 
 
-def summarize(
-    prefix: str,
-    prefill: float,
-    decodes: list[float],
-    batch_size: int,
-    output_len: int,
-) -> dict[str, float]:
-    total = prefill + sum(decodes)
-    result = {
-        f"{prefix}prefill_latency": prefill,
-        f"{prefix}total_latency": total,
-        f"{prefix}overall_throughput": output_len * batch_size / total,
-    }
-    if decodes:
-        med = float(np.median(decodes))
-        result[f"{prefix}median_decode_latency"] = med
-        result[f"{prefix}median_decode_throughput"] = batch_size / med
-    return result
+def reduce_max(latencies: list[float]) -> list[float]:
+    """Slowest rank per step: collectives make ranks wait for each other."""
+    from vllm.distributed.parallel_state import get_world_group
+
+    world = get_world_group()
+    if world.world_size == 1:
+        return latencies
+    values = torch.tensor(latencies, dtype=torch.float64)
+    torch.distributed.all_reduce(
+        values, op=torch.distributed.ReduceOp.MAX, group=world.cpu_group
+    )
+    return values.tolist()
 
 
 def run_once(
-    llm,
-    timer: ModelStepTimer,
-    prompts: list[TokensPrompt],
+    runner,
+    batch: BenchBatch,
+    input_len: int,
     output_len: int,
-    temperature: float,
-    log_decode_steps: int,
-    verbose: bool,
 ) -> dict[str, Any]:
-    from vllm import SamplingParams
-
-    engine = llm.llm_engine
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        top_p=1.0,
-        ignore_eos=True,
-        max_tokens=output_len,
-        detokenize=False,
-    )
-    batch_size = len(prompts)
-    for i, prompt in enumerate(prompts):
-        engine.add_request(str(i), prompt, sampling_params)
-
-    outputs, prefill_latency, engine_prefill_latency = timed_step(engine, timer)
-    # Every request must have produced its first token in this step.
-    assert len(outputs) == batch_size, (
-        f"prefill did not complete in one step ({len(outputs)}/{batch_size} "
-        "requests emitted a token); raise --max-num-batched-tokens/--max-num-seqs "
-        "or reduce the batch"
-    )
-    if verbose:
-        print(
-            f"Prefill. latency: {prefill_latency:6.5f} s, "
-            f"throughput: {batch_size / prefill_latency:9.2f} token/s"
-        )
-
-    decode_latencies: list[float] = []
-    engine_decode_latencies: list[float] = []
-    while engine.has_unfinished_requests():
-        _, latency, engine_latency = timed_step(engine, timer)
-        decode_latencies.append(latency)
-        engine_decode_latencies.append(engine_latency)
-        i = len(decode_latencies) - 1
-        if verbose and i < log_decode_steps:
-            print(
-                f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, "
-                f"throughput: {batch_size / latency:9.2f} token/s"
-            )
-
-    result: dict[str, Any] = {"batch_size": batch_size, "output_len": output_len}
-    result.update(
-        summarize("", prefill_latency, decode_latencies, batch_size, output_len)
-    )
-    result.update(
-        summarize(
-            "engine_",
-            engine_prefill_latency,
-            engine_decode_latencies,
-            batch_size,
-            output_len,
-        )
-    )
-    if verbose:
-        if decode_latencies:
-            print(
-                f"Decode.  median latency: {result['median_decode_latency']:6.5f} s, "
-                f"median throughput: {result['median_decode_throughput']:9.2f} token/s"
-            )
-        print(
-            f"Total. latency: {result['total_latency']:6.3f} s, "
-            f"throughput: {result['overall_throughput']:9.2f} token/s"
-        )
-        print(
-            "Engine step (incl. scheduler and output processing). "
-            f"prefill: {result['engine_prefill_latency']:6.5f} s, "
-            f"decode median: {result.get('engine_median_decode_latency', 0):6.5f} s"
-        )
+    """Prefill, then `output_len - 1` decode steps; finish the requests."""
+    batch_size = len(batch.req_ids)
+    try:
+        latencies = [timed_step(runner, batch.scheduler_output)]
+        for step in range(output_len - 1):
+            latencies.append(timed_step(runner, decode_step(batch, input_len, step)))
+    finally:
+        runner.execute_model(batch.finish())
+    latencies = reduce_max(latencies)
+    prefill, decodes = latencies[0], latencies[1:]
+    total = sum(latencies)
+    result: dict[str, Any] = {
+        "batch_size": batch_size,
+        "input_len": input_len,
+        "output_len": output_len,
+        "prefill_latency": prefill,
+        "total_latency": total,
+        "overall_throughput": output_len * batch_size / total,
+        "decode_latencies": decodes,
+    }
+    if decodes:
+        med = float(np.median(decodes))
+        result["median_decode_latency"] = med
+        result["median_decode_throughput"] = batch_size / med
     return result
 
 
-def check_kv_cache_capacity(llm, batch_size: int) -> None:
-    """Fail before running if the KV cache cannot hold the whole batch.
-
-    The concurrency is computed for requests of `max_model_len` tokens, which
-    defaults to `input_len + output_len`.
-    """
-    from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
-
-    engine = llm.llm_engine
-    core = getattr(engine.engine_core, "engine_core", None)
-    if core is None:
-        raise RuntimeError(
-            "KV cache check needs the in-process engine core; "
-            "run with VLLM_ENABLE_V1_MULTIPROCESSING=0"
-        )
-    max_concurrency = get_max_concurrency_for_kv_cache_config(
-        engine.vllm_config, core.scheduler.kv_cache_config
-    )
+def print_result(result: dict[str, Any], log_decode_steps: int) -> None:
+    batch_size = result["batch_size"]
+    prefill = result["prefill_latency"]
     print(
-        f"KV cache holds {max_concurrency:.1f} concurrent requests of "
-        f"{engine.model_config.max_model_len} tokens."
+        f"Prefill. latency: {prefill:6.5f} s, "
+        f"throughput: {batch_size / prefill:9.2f} token/s"
     )
-    if max_concurrency < batch_size:
-        raise RuntimeError(
-            f"KV cache holds only {max_concurrency:.1f} requests of "
-            f"{engine.model_config.max_model_len} tokens, less than batch size "
-            f"{batch_size}; reduce --batch-size or increase the KV cache size"
+    for i, latency in enumerate(result["decode_latencies"][:log_decode_steps]):
+        print(
+            f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, "
+            f"throughput: {batch_size / latency:9.2f} token/s"
         )
+    if "median_decode_latency" in result:
+        print(
+            f"Decode.  median latency: {result['median_decode_latency']:6.5f} s, "
+            f"median throughput: {result['median_decode_throughput']:9.2f} token/s"
+        )
+    print(
+        f"Total. latency: {result['total_latency']:6.3f} s, "
+        f"throughput: {result['overall_throughput']:9.2f} token/s"
+    )
 
 
 def main(args: argparse.Namespace):
-    # Run the engine core in-process so a step does not include IPC to it.
-    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # Model Runner V2 is the runner CPU and GPU share; the runner is driven
+    # in-process, so no engine core process sits between the bench and it.
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    init_rank_env()
 
-    # A step must map to one scheduling round, and the whole batch must fit in
-    # one prefill step.
+    # A step is one runner call, and the whole batch fits in one prefill step.
     if args.async_scheduling is None:
         args.async_scheduling = False
     if args.max_num_batched_tokens is None:
@@ -246,42 +184,60 @@ def main(args: argparse.Namespace):
         args.max_model_len = args.input_len + args.output_len
 
     engine_args = EngineArgs.from_cli_args(args)
+    engine_args.distributed_executor_backend = "external_launcher"
 
-    from vllm import LLM
+    bind_cpu_threads(engine_args)
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.parallel_state import get_world_group
 
     llm = LLM.from_engine_args(engine_args)
-    assert llm.llm_engine.model_config.max_model_len >= (
-        args.input_len + args.output_len
-    ), "max_model_len must be at least input_len + output_len"
-    check_kv_cache_capacity(llm, args.batch_size)
-    timer = ModelStepTimer(llm)
-
-    rng = np.random.default_rng(0)
-    token_ids = rng.integers(10000, size=(args.batch_size, args.input_len))
-    prompts = [TokensPrompt(prompt_token_ids=ids) for ids in token_ids.tolist()]
-
-    print("Warmup ...")
-    run_once(
-        llm,
-        timer,
-        prompts,
-        min(args.warmup_output_len, args.output_len),
-        args.temperature,
-        args.log_decode_steps,
-        verbose=True,
+    runner = get_model_runner(llm)
+    assert runner.model_config.max_model_len >= args.input_len + args.output_len, (
+        "max_model_len must be at least input_len + output_len"
     )
-    print("Benchmark ...")
-    result = run_once(
-        llm,
-        timer,
-        prompts,
-        args.output_len,
-        args.temperature,
-        args.log_decode_steps,
-        verbose=True,
+    rank = get_world_group().rank
+    case = BenchCase(
+        "one-batch",
+        (BenchRequest(query_len=args.input_len, kv_len=args.input_len),)
+        * args.batch_size,
     )
-    result["input_len"] = args.input_len
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        top_p=1.0,
+        ignore_eos=True,
+        max_tokens=args.output_len,
+    )
 
+    def new_batch() -> BenchBatch:
+        kv_config = runner.kv_cache_config
+        return build_batch(
+            case,
+            kv_config.kv_cache_groups,
+            kv_config.num_blocks,
+            runner.model_config.get_vocab_size(),
+            np.random.default_rng(args.seed),
+            runner.parallel_config.decode_context_parallel_size,
+            reserve_len=args.input_len + args.output_len,
+            sampling_params=sampling_params,
+        )
+
+    with torch.inference_mode():
+        if rank == 0:
+            print("Warmup ...")
+        run_once(
+            runner,
+            new_batch(),
+            args.input_len,
+            min(args.warmup_output_len, args.output_len),
+        )
+        if rank == 0:
+            print("Benchmark ...")
+        result = run_once(runner, new_batch(), args.input_len, args.output_len)
+
+    if rank != 0:
+        return
+    print_result(result, args.log_decode_steps)
     if args.output_json:
+        result.pop("decode_latencies")
         with open(args.output_json, "w") as f:
             json.dump(result, f, indent=4)
