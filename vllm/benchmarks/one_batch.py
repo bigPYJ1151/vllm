@@ -5,8 +5,8 @@
 Like `vllm bench forward`, the batch is built by hand and fed to the model
 runner's `execute_model` and `sample_tokens`. The whole batch is prefilled in one
 step, then decoded one step at a time. Each step is timed, so prefill latency
-and per-step decode latency are reported separately. One warmup run precedes
-the measured run.
+and per-step decode latency are reported separately. Warmup runs precede the
+measured run.
 
 Only the model runner is timed: input preparation, model forward and sampling.
 The scheduler, output processing, API server, detokenization and streaming are
@@ -48,7 +48,15 @@ def add_cli_args(parser: FlexibleArgumentParser):
         "--warmup-output-len",
         type=int,
         default=32,
-        help="Output length of the warmup run (capped by --output-len).",
+        help="Output length of the warmup runs (capped by --output-len).",
+    )
+    parser.add_argument(
+        "--num-warmup-runs",
+        type=int,
+        default=2,
+        help="Warmup runs before the measured one. The runner's Triton input "
+        "kernels specialize on argument values such as the request slot, so "
+        "the second run can still compile a variant.",
     )
     parser.add_argument(
         "--log-decode-steps",
@@ -224,12 +232,13 @@ def main(args: argparse.Namespace):
     with torch.inference_mode():
         if rank == 0:
             print("Warmup ...")
-        run_once(
-            runner,
-            new_batch(),
-            args.input_len,
-            min(args.warmup_output_len, args.output_len),
-        )
+        for _ in range(args.num_warmup_runs):
+            run_once(
+                runner,
+                new_batch(),
+                args.input_len,
+                min(args.warmup_output_len, args.output_len),
+            )
         if rank == 0:
             print("Benchmark ...")
         result = run_once(runner, new_batch(), args.input_len, args.output_len)
