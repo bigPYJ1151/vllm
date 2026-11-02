@@ -81,7 +81,12 @@ def async_tensor_h2d(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if isinstance(data, np.ndarray):
+        # Copy into torch-allocated (64-byte aligned) memory: a tiny numpy array
+        # is only 8-byte aligned, and Triton specializes kernels on 16-byte
+        # pointer alignment, so a borrowed buffer compiles a new variant.
         data = torch.from_numpy(data)
+        if out is None:
+            return data.to(dtype=dtype, copy=True)
     if not isinstance(data, torch.Tensor):
         data = torch.tensor(data, dtype=dtype, device="cpu")
     elif out is None:
