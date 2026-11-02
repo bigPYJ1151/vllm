@@ -1,0 +1,153 @@
+# CPU model benchmarks
+
+One-line latency, throughput and accuracy tests for the models validated on the
+vLLM CPU backend (Intel Xeon with AMX). Each model has its own script:
+
+| Script | Model | Precisions |
+|---|---|---|
+| `llama3.1-8b.sh` | Llama-3.1-8B-Instruct | `bf16` (default), `fp16`, `int8` (W8A8), `fp8` (Intel) |
+| `qwen3.5-9b.sh` | Qwen3.5-9B | `bf16` |
+| `qwen3.5-35b-a3b.sh` | Qwen3.5-35B-A3B | `bf16` (default), `fp8` |
+| `gemma4-26b-a4b.sh` | gemma-4-26B-A4B | `bf16` |
+
+```bash
+bash <model>.sh <latency|throughput|acc> [precision]
+
+bash qwen3.5-9b.sh latency
+bash llama3.1-8b.sh throughput fp8
+bash qwen3.5-35b-a3b.sh acc fp8
+```
+
+## What each mode runs
+
+| Mode | Command | Reports |
+|---|---|---|
+| `latency` | `vllm bench one-batch`, batch size 1 | prefill latency, median decode step latency, total latency |
+| `throughput` | `vllm bench one-batch`, batch size 30 (Llama) or 25 (others) | the same, plus decode and overall tokens/s |
+| `acc` | `vllm serve` + MMLU 5-shot client | average accuracy |
+
+`vllm bench one-batch` builds one static batch (1024 input and 1024 output
+tokens by default), prefills it in one step and decodes it step by step. It
+drives the model runner directly, so only input preparation, the forward pass
+and sampling are timed. One process runs per tensor-parallel rank (`torchrun`).
+Two warmup runs precede the measured one.
+
+`acc` starts a server, waits until it is ready, runs the MMLU client on 40
+questions per subject (2280 questions, same prompts as the usual 5-shot
+benchmark) and stops the server. The first start of a model compiles for
+several minutes; later starts reuse the compile cache. The MMLU data is
+downloaded on first use.
+
+## Topology
+
+The scripts bind one tensor-parallel rank to each CBB (die) when the host has
+more dies than NUMA nodes (e.g. Diamond Rapids), and to each NUMA node
+otherwise (e.g. Granite Rapids). TP is the largest power of two that fits the
+instance count, so that it divides the head counts. The engine core sleeps
+between requests with die binding and spins with NUMA binding. Everything below
+can be overridden through the environment.
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OUTPUT_DIR` | `./cpu_inference_results` | Logs and JSON results |
+| `INPUT_TOKEN` / `OUTPUT_TOKEN` | 1024 / 1024 | Prompt and generation length (latency, throughput) |
+| `BATCH_SIZE` | 1 (latency), 30 or 25 (throughput) | Batch size |
+| `TP` | detected | Tensor-parallel size |
+| `BIND_GRANULARITY` | detected (`cbb` or `numa`) | Thread binding granularity |
+| `ACC_PER_SUBJECT` | 40 | MMLU questions per subject, 0 for all |
+| `ACC_CONCURRENCY` | 64 | Concurrent MMLU requests |
+| `MMLU_DATA_DIR` | `$OUTPUT_DIR/mmlu_data` | MMLU data (downloaded if missing) |
+| `PORT` | 8000 | Server port for `acc` |
+| `DRY_RUN` | 0 | `1` prints the commands without running them |
+
+Results are written to `$OUTPUT_DIR/<model>_<precision>_bs<N>_in<I>_out<O>.{json,log}`
+for `latency`/`throughput` and `$OUTPUT_DIR/<model>_<precision>_mmlu.{json,log}`
+(plus `_server.log`) for `acc`.
+
+## Reproducing the TP4 results
+
+All reference numbers use TP=4, 1024 input and 1024 output tokens, greedy
+sampling and 0 reserved cores. Pass `TP=4` explicitly to make that independent
+of the topology detection. Run from this folder; results go to `$OUTPUT_DIR`.
+
+```bash
+export TP=4 OUTPUT_DIR=$PWD/results_tp4
+
+# Latency (BS=1)
+bash llama3.1-8b.sh latency bf16
+bash llama3.1-8b.sh latency fp16
+bash llama3.1-8b.sh latency int8
+bash llama3.1-8b.sh latency fp8
+bash qwen3.5-9b.sh latency
+bash qwen3.5-35b-a3b.sh latency bf16
+bash qwen3.5-35b-a3b.sh latency fp8
+bash gemma4-26b-a4b.sh latency
+
+# Throughput (BS=30 for Llama, BS=25 for the others)
+bash llama3.1-8b.sh throughput bf16
+bash llama3.1-8b.sh throughput fp16
+bash llama3.1-8b.sh throughput int8
+bash llama3.1-8b.sh throughput fp8
+bash qwen3.5-9b.sh throughput
+bash qwen3.5-35b-a3b.sh throughput bf16
+bash qwen3.5-35b-a3b.sh throughput fp8
+bash gemma4-26b-a4b.sh throughput
+
+# MMLU 5-shot (40 questions per subject, 2280 questions)
+bash llama3.1-8b.sh acc bf16
+bash llama3.1-8b.sh acc fp16
+bash llama3.1-8b.sh acc int8
+bash llama3.1-8b.sh acc fp8
+bash qwen3.5-9b.sh acc
+bash qwen3.5-35b-a3b.sh acc bf16
+bash qwen3.5-35b-a3b.sh acc fp8
+bash gemma4-26b-a4b.sh acc
+```
+
+Or all of them in a loop:
+
+```bash
+export TP=4 OUTPUT_DIR=$PWD/results_tp4
+for mode in latency throughput acc; do
+  for cfg in "llama3.1-8b bf16" "llama3.1-8b fp16" "llama3.1-8b int8" \
+             "llama3.1-8b fp8" "qwen3.5-9b bf16" \
+             "qwen3.5-35b-a3b bf16" "qwen3.5-35b-a3b fp8" "gemma4-26b-a4b bf16"; do
+    set -- $cfg
+    bash "$1.sh" "$mode" "$2"
+  done
+done
+```
+
+Per host, the scripts pick the binding that the reference runs used:
+
+| Host | Detected binding | Equivalent explicit setting |
+|---|---|---|
+| Diamond Rapids (256 cores, 4 dies) | one rank per die (`cbb`), engine core sleeps | `TP=4 BIND_GRANULARITY=cbb VLLM_MQ_BUSY_LOOP_SECONDS=0` |
+| Granite Rapids (384 cores, 6 NUMA nodes) | one rank per NUMA node (`numa`), engine core spins, 4 of the 6 nodes used | `TP=4 BIND_GRANULARITY=numa VLLM_MQ_BUSY_LOOP_SECONDS=1.0` |
+
+Reference numbers from these commands (vLLM; median decode step at BS=1, and
+decode throughput at the throughput batch size):
+
+| Model | DMR decode ms | DMR tok/s | GNR decode ms | GNR tok/s |
+|---|---|---|---|---|
+| Llama-3.1-8B BF16 | 19.7 | 1038 | 25.8 | 835 |
+| Llama-3.1-8B FP16 | 19.5 | 997 | 25.3 | 744 |
+| Llama-3.1-8B INT8 | 11.9 | 1422 | 15.6 | 1127 |
+| Llama-3.1-8B FP8 (Intel) | 12.9 | 1398 | not run | not run |
+| Qwen3.5-9B | 21.9 | 855 | 28.6 | 662 |
+| Qwen3.5-35B-A3B BF16 | 14.6 | 617 | 19.4 | 464 |
+| Qwen3.5-35B-A3B FP8 | 14.8 | 633 | 20.6 | 497 |
+| gemma-4-26B-A4B | 17.2 | 472 | 22.7 | 397 |
+
+Expected MMLU (2280-question subset): about 0.68–0.69 for every Llama variant,
+0.59–0.60 for Qwen3.5-9B, 0.81–0.85 for Qwen3.5-35B-A3B and 0.78 for
+gemma-4-26B-A4B. Run-to-run spread of latency and throughput is 1–4%.
+
+## Prerequisites
+
+A vLLM CPU build (see the CPU installation guide), the model weights
+reachable from the Hugging Face cache or hub, `torchrun`, `curl` and `wget`.
+The accuracy client needs `aiohttp` and `tiktoken`. Setting `LD_PRELOAD` to
+tcmalloc and Intel OpenMP, as in the CPU Docker image, is recommended.
