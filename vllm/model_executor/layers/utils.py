@@ -599,13 +599,19 @@ def dispatch_cpu_unquantized_gemm(
     # The SGL AMX packed kernel also wins over oneDNN on the large dense
     # projections when all dies run at once (DMR prefill), so use it whenever
     # the shape allows.
-    if check_cpu_sgl_kernel(N, K, dtype):
+    # A K that is not a multiple of the AMX tile (e.g. a TP-sharded 2112 -> 528
+    # down_proj) is zero-padded in the weight and in the activation.
+    pad_k = -K % 32 if dtype in (torch.bfloat16, torch.float16) and N >= 16 else 0
+    if check_cpu_sgl_kernel(N, K + pad_k, dtype):
+        weight = layer.weight
+        if pad_k:
+            weight = torch.nn.functional.pad(weight, (0, pad_k))
         # For small size GEMM, packed_weight might be float32
-        packed_weight = torch.ops._C.convert_weight_packed(layer.weight)
+        packed_weight = torch.ops._C.convert_weight_packed(weight)
         if getattr(layer, "bias", None) is not None:
             layer.bias.data = layer.bias.to(torch.float32)
         layer.cpu_linear = lambda x, weight, bias: ops.weight_packed_linear_cpu(
-            x,
+            torch.nn.functional.pad(x, (0, pad_k)) if pad_k else x,
             packed_weight,
             N,
             bias,
