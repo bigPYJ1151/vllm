@@ -23,6 +23,12 @@ class CPUModelRunner(GPUModelRunner):
             )
         super().__init__(*args, **kwargs)
 
+    def add_requests(self, scheduler_output) -> None:
+        # Without new requests the base method only re-applies unchanged
+        # sampler state.
+        if scheduler_output.scheduled_new_reqs:
+            super().add_requests(scheduler_output)
+
     # TBD: Whether need to move this to Worker?
     def warming_up_model(self) -> None:
         logger.info("Warming up model for the compilation...")
