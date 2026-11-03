@@ -45,6 +45,7 @@ from typing import ClassVar
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonImpl,
@@ -55,10 +56,16 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_and_maybe_dequant_weights,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backend import AttentionLayer, AttentionType, MultipleOf
 
-_MIN_WORK_PER_SPLIT = 512
-_SPLIT_OCCUPANCY_MULTIPLIER = 2
+_MIN_WORK_PER_SPLIT = 32
+_SPLIT_OCCUPANCY_MULTIPLIER = 8
+_MAX_KV_SPLITS = 64
 
 
 def _block_quant_to_tensor_quant(
@@ -99,14 +106,18 @@ def _block_quant_to_tensor_quant(
     return x_fp8, dequant_scale
 
 
-def _compute_num_kv_splits(max_seq_len: int, num_threads: int) -> int:
-    """Mirrors TritonMLAImpl's _compute_num_kv_splits, using the CPU thread
-    count in place of SM count."""
-    ideal_splits = 1
-    while ideal_splits < max(1, max_seq_len // _MIN_WORK_PER_SPLIT):
-        ideal_splits *= 2
-    max_splits = num_threads * _SPLIT_OCCUPANCY_MULTIPLIER
-    return min(ideal_splits, max_splits)
+def _compute_num_kv_splits(
+    num_reqs: int, num_heads: int, max_seq_len: int, num_threads: int
+) -> int:
+    """Split the KV length until (request, head, split) work items occupy the
+    CPU threads; long sequences cap the split count at one per
+    ``_MIN_WORK_PER_SPLIT`` tokens."""
+    target = num_threads * _SPLIT_OCCUPANCY_MULTIPLIER
+    wanted = -(-target // max(1, num_reqs * num_heads))
+    splits = 1
+    while splits < min(wanted, _MAX_KV_SPLITS):
+        splits *= 2
+    return max(1, min(splits, max_seq_len // _MIN_WORK_PER_SPLIT))
 
 
 def _expand_block_table(block_table: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -172,7 +183,10 @@ class AMXMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
                 device=decode.block_table.device,
             )
             decode.num_kv_splits = _compute_num_kv_splits(  # type: ignore[attr-defined]
-                attn_metadata.max_seq_len, current_platform.num_compute_units()
+                decode.block_table.size(0),
+                self.num_heads,
+                attn_metadata.max_seq_len,
+                current_platform.num_compute_units(),
             )
         if attn_metadata.prefill is not None:
             # cpu_seq_lens: total per-request context length (prefix + new
@@ -338,6 +352,54 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # left for this impl to do beyond invoking the decode kernel.
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
+        return self._decode_kernel(q, kv_c_and_k_pe_cache, attn_metadata), None
+
+    def forward_decode_amx(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        output: torch.Tensor,
+    ) -> None:
+        """MQA decode fused into one call: Q absorption, the decode kernel and
+        V de-absorption, without the generic path's intermediate copies.
+
+        Args:
+            q: [B, N, qk_nope + qk_rope] query of the decode tokens.
+            kv_c_and_k_pe_cache: The layer's KV cache.
+            attn_metadata: Attention metadata with the decode fields set.
+            output: [B, N * v_head_dim] slice of the layer output.
+
+        """
+        num_tokens, num_heads, _ = q.shape
+        nope = self.qk_nope_head_dim
+        rank = self.kv_lora_rank
+        mqa_q = q.new_empty(num_tokens, num_heads, rank + self.qk_rope_head_dim)
+        # bmm_cpu: out[n] = mat1[n] @ mat2[n]^T with (N, B, .) views of the
+        # token-major tensors.
+        ops.bmm_cpu(
+            mqa_q[..., :rank].transpose(0, 1),
+            q[..., :nope].transpose(0, 1),
+            self._w_uk_packed,  # type: ignore[arg-type]
+            True,
+            self._w_scale,
+        )
+        mqa_q[..., rank:].copy_(q[..., nope:])
+        attn_out = self._decode_kernel(mqa_q, kv_c_and_k_pe_cache, attn_metadata)
+        ops.bmm_cpu(
+            output.view(num_tokens, num_heads, self.v_head_dim).transpose(0, 1),
+            attn_out.transpose(0, 1),
+            self._w_uv_packed,  # type: ignore[arg-type]
+            True,
+            self._w_scale,
+        )
+
+    def _decode_kernel(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+    ) -> torch.Tensor:
         assert attn_metadata.decode is not None
 
         num_tokens = q.shape[0]
@@ -349,14 +411,15 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
         req_pool_indices = attn_metadata.decode.req_pool_indices  # type: ignore[attr-defined]
 
         num_kv_splits = attn_metadata.decode.num_kv_splits  # type: ignore[attr-defined]
-        o = torch.zeros(
+        # The kernel writes every element of both buffers before reading it.
+        o = torch.empty(
             num_tokens,
             self.num_heads,
             self.kv_lora_rank,
             dtype=q.dtype,
             device=q.device,
         )
-        attn_logits = torch.zeros(
+        attn_logits = torch.empty(
             num_tokens,
             self.num_heads,
             num_kv_splits,
@@ -385,7 +448,7 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
             None,
             None,
         )
-        return o, None
+        return o
 
     def forward_mha(
         self,
@@ -475,3 +538,130 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
             0, 1
         )
         ops.bmm_cpu(output_view, attn_out_t, self._w_uv_packed, True, self._w_scale)
+
+
+class AMXMLAFusedDecode:
+    """Decode-only MLA front end to back end in one native op.
+
+    Replaces the qkv projections, the layernorms, rope, the KV-cache write, the
+    decode kernel and the W_UV de-absorption of a pure-decode batch by a single
+    call. Weights are the FP8 W8A16 copies that `_cpu_keep_w8a16` layers keep.
+    """
+
+    def __init__(self, wrapper) -> None:
+        impl = wrapper.mla_attn.impl
+        self.wrapper = wrapper
+        self.impl = impl
+        self.qkv_a_weight = wrapper.fused_qkv_a_proj.w8a16_weight
+        self.qkv_a_scale = wrapper.fused_qkv_a_proj.w8a16_scale
+        self.q_b_weight = wrapper.q_b_proj.w8a16_weight
+        self.q_b_scale = wrapper.q_b_proj.w8a16_scale
+        self.q_ln_weight = wrapper.q_a_layernorm.weight.data
+        self.kv_ln_weight = wrapper.kv_a_layernorm.weight.data
+        self.eps = wrapper.q_a_layernorm.variance_epsilon
+        self.cos_sin_cache = wrapper.rotary_emb.cos_sin_cache.to(
+            self.q_ln_weight.dtype
+        ).contiguous()
+        self.block_size = [128, 128]
+
+    @staticmethod
+    def create(wrapper) -> AMXMLAFusedDecode | None:
+        impl = wrapper.mla_attn.impl
+        if not isinstance(impl, AMXMLAImpl) or impl._w_uk_packed is None:
+            return None
+        if (
+            wrapper.q_lora_rank is None
+            or wrapper.rotary_emb is None
+            or wrapper.indexer is not None
+            or wrapper.g_proj is not None
+            or wrapper.dcp_q_replicate
+        ):
+            return None
+        for proj in (wrapper.fused_qkv_a_proj, wrapper.q_b_proj):
+            if getattr(proj, "w8a16_weight", None) is None:
+                return None
+        return AMXMLAFusedDecode(wrapper)
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+        attn_metadata: MLACommonMetadata | None,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor | None,
+    ) -> bool:
+        """Runs the fused op; returns False when the batch is not decode-only."""
+        if (
+            attn_metadata is None
+            or attn_metadata.decode is None
+            or attn_metadata.num_prefills > 0
+            or slot_mapping is None
+        ):
+            return False
+        num_tokens = hidden_states.shape[0]
+        if attn_metadata.num_decode_tokens != num_tokens:
+            return False
+        decode = attn_metadata.decode
+        impl = self.impl
+        ops.mla_decode_fused_cpu(
+            hidden_states,
+            self.qkv_a_weight,
+            self.q_b_weight,
+            impl._w_uk_packed,  # type: ignore[arg-type]
+            impl._w_uv_packed,  # type: ignore[arg-type]
+            self.q_ln_weight,
+            self.kv_ln_weight,
+            positions[:num_tokens],
+            self.cos_sin_cache,
+            self.eps,
+            self.qkv_a_scale,
+            self.q_b_scale,
+            impl._w_scale,
+            self.block_size,
+            self.wrapper.q_lora_rank,
+            impl.kv_lora_rank,
+            impl.qk_rope_head_dim,
+            kv_cache,
+            slot_mapping[:num_tokens],
+            decode.req_to_token,  # type: ignore[attr-defined]
+            decode.req_pool_indices,  # type: ignore[attr-defined]
+            decode.seq_lens_i64,  # type: ignore[attr-defined]
+            decode.num_kv_splits,  # type: ignore[attr-defined]
+            impl.scale,
+            out[:num_tokens],
+        )
+        return True
+
+
+def mla_cpu_fused_attention(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    layer_name = _resolve_layer_name(layer_name)
+    attn_metadata, mla_layer, kv_cache, slot_mapping = get_attention_context(layer_name)
+    wrapper = mla_layer._fused_owner
+    if not wrapper._cpu_fused(
+        hidden_states, positions, output, attn_metadata, kv_cache, slot_mapping
+    ):
+        output.copy_(wrapper.forward_attn(positions, hidden_states))
+
+
+def mla_cpu_fused_attention_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="mla_cpu_fused_attention",
+    op_func=mla_cpu_fused_attention,
+    mutates_args=["output"],
+    fake_impl=mla_cpu_fused_attention_fake,
+    dispatch_key=current_platform.dispatch_key,
+)

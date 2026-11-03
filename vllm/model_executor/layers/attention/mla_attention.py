@@ -1027,7 +1027,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 output_scale=mha_output_scale,
             )
 
-        if num_mqa_tokens > 0:
+        if (
+            num_mqa_tokens > 0
+            and self.is_amx_bmm_enabled
+            and q_dcp_replicated is None
+            and not fp8_attention
+            and self.impl.dcp_world_size <= 1
+        ):
+            self.impl.forward_decode_amx(  # type: ignore[attr-defined]
+                q[:num_mqa_tokens],
+                kv_cache,
+                attn_metadata,
+                output[:num_mqa_tokens],
+            )
+        elif num_mqa_tokens > 0:
             if q_dcp_replicated is not None:
                 mqa_q = q_dcp_replicated[:num_mqa_tokens]
                 qrep_decode = True
@@ -1250,6 +1263,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             replace_parameter(
                 self.kv_b_proj, "weight", self.kv_b_proj.weight.new_empty(0)
             )
+            owner = getattr(self, "_fused_owner", None)
+            if owner is not None:
+                owner.enable_cpu_fused_decode()
             return
 
         if self.dcp_q_replicate:

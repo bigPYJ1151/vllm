@@ -11,8 +11,10 @@ from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import _encode_layer_name
 
 if TYPE_CHECKING:
+    from vllm.v1.attention.backends.mla.amx_mla import AMXMLAFusedDecode
     from vllm.v1.attention.backends.mla.index_group import (
         SparseMLAIndexGroupBuilder,
     )
@@ -160,12 +162,54 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
         self.prefix = prefix
 
+        # CPU decode fast path, see `enable_cpu_fused_decode`
+        self._cpu_fused: AMXMLAFusedDecode | None = None
+        if current_platform.is_cpu():
+            for proj in (self.fused_qkv_a_proj, self.q_b_proj):
+                if proj is not None:
+                    proj._cpu_keep_w8a16 = True
+            object.__setattr__(self.mla_attn, "_fused_owner", self)
+
+    def enable_cpu_fused_decode(self) -> None:
+        """Called once the weights are loaded: use the fused native decode op
+        when this layer's weights and backend support it."""
+        from vllm.v1.attention.backends.mla.amx_mla import AMXMLAFusedDecode
+
+        self._cpu_fused = AMXMLAFusedDecode.create(self)
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._cpu_fused is not None and llama_4_scaling is None:
+            attn_out = torch.empty(
+                hidden_states.shape[0],
+                self.num_heads * self.v_head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            torch.ops.vllm.mla_cpu_fused_attention(
+                hidden_states,
+                positions,
+                attn_out,
+                _encode_layer_name(self.mla_attn.layer_name),
+            )
+            return self.o_proj(attn_out)[0]
+        attn_out = self.forward_attn(positions, hidden_states, llama_4_scaling)
+        if self.g_proj is not None:
+            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+
+        return self.o_proj(attn_out)[0]
+
+    def forward_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Everything up to the attention output, before g_proj and o_proj."""
         q_c = None
         kv_lora = None
 
@@ -248,8 +292,4 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             q_dcp_replicated=q_dcp_replicated,
         )
-
-        if self.g_proj is not None:
-            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
-
-        return self.o_proj(attn_out)[0]
+        return attn_out

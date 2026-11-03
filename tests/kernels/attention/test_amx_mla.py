@@ -298,13 +298,18 @@ class _FakePrefillMetadata:
 
 
 class _FakeDecodeMetadata:
-    def __init__(self, block_table, seq_lens, req_to_token, req_pool_indices):
+    def __init__(
+        self, block_table, seq_lens, req_to_token, req_pool_indices, num_heads=4
+    ):
         self.block_table = block_table
         self.seq_lens_i64 = seq_lens.to(torch.int64)
         self.req_to_token = req_to_token
         self.req_pool_indices = req_pool_indices
         self.num_kv_splits = _compute_num_kv_splits(
-            int(seq_lens.max().item()), current_platform.num_compute_units()
+            block_table.size(0),
+            num_heads,
+            int(seq_lens.max().item()),
+            current_platform.num_compute_units(),
         )
 
 
@@ -379,6 +384,214 @@ def test_amx_mla_impl_forward_mqa_matches_reference(default_vllm_config):
         v_real = torch.einsum("lp,pnv->nlv", k_nope_latent.float(), w_uv.float())
         ref = torch.einsum("nl,nlv->nv", probs, v_real)
         torch.testing.assert_close(out_real[i], ref, atol=_IMPL_ATOL, rtol=_IMPL_RTOL)
+
+
+def test_compute_num_kv_splits():
+    # A single short request still fills the threads; a full batch needs no
+    # split; the split count never exceeds one per _MIN_WORK_PER_SPLIT tokens.
+    assert _compute_num_kv_splits(1, 32, 2048, 64) == 16
+    assert _compute_num_kv_splits(64, 32, 2048, 64) == 1
+    assert _compute_num_kv_splits(1, 32, 64, 64) == 2
+    assert _compute_num_kv_splits(1, 32, 1, 64) == 1
+
+
+def test_amx_mla_impl_forward_decode_amx_matches_forward_mqa(default_vllm_config):
+    """The fused decode path (absorb, kernel, de-absorb) must agree with the
+    generic one that MLAAttention.forward_impl composes around forward_mqa."""
+    set_random_seed(2)
+    num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank = 4, 32, 32, 64
+    impl, kv_b_weight = _make_amx_mla_impl(
+        num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank
+    )
+    w_uk, w_uv = kv_b_weight.T.view(
+        kv_lora_rank, num_heads, qk_nope_head_dim + v_head_dim
+    ).split([qk_nope_head_dim, v_head_dim], dim=-1)
+
+    seq_lens = [1, 40, 5]
+    num_seqs = len(seq_lens)
+    block_size = 32
+    max_blocks = (max(seq_lens) + block_size - 1) // block_size
+    num_blocks = num_seqs * max_blocks
+    head_size = kv_lora_rank + QK_ROPE_HEAD_DIM
+    kv_cache = torch.randn(num_blocks, block_size, head_size, dtype=DTYPE)
+    block_table = torch.randperm(num_blocks).view(num_seqs, max_blocks).to(torch.int64)
+    attn_metadata = _FakeAttnMetadata(
+        decode=_FakeDecodeMetadata(
+            block_table=block_table,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int64),
+            req_to_token=_expand_block_table(block_table, block_size),
+            req_pool_indices=torch.arange(num_seqs, dtype=torch.int64),
+        ),
+        max_seq_len=max(seq_lens),
+    )
+
+    q = torch.randn(
+        num_seqs, num_heads, qk_nope_head_dim + QK_ROPE_HEAD_DIM, dtype=DTYPE
+    )
+    q_nope, q_pe = q.split([qk_nope_head_dim, QK_ROPE_HEAD_DIM], dim=-1)
+    ql_nope = torch.einsum("bnp,lnp->bnl", q_nope.float(), w_uk.float()).to(DTYPE)
+    o, _ = impl.forward_mqa((ql_nope, q_pe), kv_cache, attn_metadata, layer=None)
+    expected = torch.einsum("bnl,lnv->bnv", o.float(), w_uv.float())
+
+    out = torch.empty(num_seqs, num_heads * v_head_dim, dtype=DTYPE)
+    impl.forward_decode_amx(q, kv_cache, attn_metadata, out)
+    torch.testing.assert_close(
+        out.view(num_seqs, num_heads, v_head_dim).float(),
+        expected,
+        atol=_IMPL_ATOL,
+        rtol=_IMPL_RTOL,
+    )
+
+
+def _quantize_fp8_blocks(
+    w: torch.Tensor, block: int = 128
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[N, K] float -> block-scaled FP8 weight and its [ceil(N/b), ceil(K/b)]
+    scales, as in the DeepSeek checkpoints."""
+    n, k = w.shape
+    scales = torch.empty(-(-n // block), -(-k // block))
+    wq = torch.empty(n, k, dtype=torch.float8_e4m3fn)
+    for i in range(scales.size(0)):
+        for j in range(scales.size(1)):
+            rows = slice(i * block, (i + 1) * block)
+            cols = slice(j * block, (j + 1) * block)
+            scale = w[rows, cols].abs().max().clamp(min=1e-6) / 448
+            scales[i, j] = scale
+            wq[rows, cols] = (w[rows, cols] / scale).to(torch.float8_e4m3fn)
+    return wq, scales
+
+
+def _dequantize_fp8_blocks(
+    wq: torch.Tensor, scales: torch.Tensor, block: int = 128
+) -> torch.Tensor:
+    n, k = wq.shape
+    full = scales.repeat_interleave(block, 0)[:n].repeat_interleave(block, 1)[:, :k]
+    return wq.float() * full
+
+
+def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    x = x.float()
+    return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.float()).to(
+        DTYPE
+    )
+
+
+def test_mla_decode_fused_cpu_matches_reference():
+    """One fused op (qkv projections, layernorms, rope, W_UK absorption, KV
+    write, decode attention, W_UV de-absorption) against the same pipeline
+    written with plain torch ops on dequantized weights."""
+    set_random_seed(3)
+    hidden, q_lora, kv_lora, rope = 256, 128, 128, 64
+    num_heads, nope, v_head_dim = 4, 64, 64
+    qk_head_dim = nope + rope
+    kv_dim = kv_lora + rope
+    eps = 1e-6
+    block_size = 32
+    seq_lens = [1, 40, 77]
+    num_seqs = len(seq_lens)
+
+    x = torch.randn(num_seqs, hidden, dtype=DTYPE)
+    w_q_a, s_q_a = _quantize_fp8_blocks(torch.randn(q_lora, hidden) * 0.1)
+    w_kv_a, s_kv_a = _quantize_fp8_blocks(torch.randn(kv_dim, hidden) * 0.1)
+    w_q_b, s_q_b = _quantize_fp8_blocks(
+        torch.randn(num_heads * qk_head_dim, q_lora) * 0.1
+    )
+    qkv_a_packed = torch.ops._C.convert_weight_packed(torch.cat([w_q_a, w_kv_a]))
+    qkv_a_scale = torch.cat([s_q_a, s_kv_a])
+    q_b_packed = torch.ops._C.convert_weight_packed(w_q_b)
+    w_kc = torch.randn(num_heads, kv_lora, nope, dtype=DTYPE) * 0.1
+    w_vc = torch.randn(num_heads, v_head_dim, kv_lora, dtype=DTYPE) * 0.1
+    q_ln = torch.rand(q_lora, dtype=DTYPE) + 0.5
+    kv_ln = torch.rand(kv_lora, dtype=DTYPE) + 0.5
+    positions = torch.tensor([n - 1 for n in seq_lens], dtype=torch.int64)
+    cos_sin = (torch.rand(max(seq_lens), rope) * 2 - 1).to(DTYPE)
+
+    max_blocks = (max(seq_lens) + block_size - 1) // block_size
+    num_blocks = num_seqs * max_blocks
+    block_table = torch.randperm(num_blocks).view(num_seqs, max_blocks).to(torch.int64)
+    req_to_token = _expand_block_table(block_table, block_size)
+    slot_mapping = req_to_token[torch.arange(num_seqs), positions]
+    kv_cache = torch.randn(num_blocks, block_size, kv_dim, dtype=DTYPE)
+    ref_cache = _flatten_cache(kv_cache.clone())
+    sm_scale = qk_head_dim**-0.5
+
+    # reference
+    qa = (
+        x.float() @ _dequantize_fp8_blocks(torch.cat([w_q_a, w_kv_a]), qkv_a_scale).T
+    ).to(DTYPE)
+    q_c = _rms_norm(qa[:, :q_lora], q_ln, eps)
+    kv_c = _rms_norm(qa[:, q_lora : q_lora + kv_lora], kv_ln, eps)
+    k_pe = qa[:, q_lora + kv_lora :]
+    q = (q_c.float() @ _dequantize_fp8_blocks(w_q_b, s_q_b).T).to(DTYPE)
+    q = q.view(num_seqs, num_heads, qk_head_dim)
+
+    def apply_rope(v: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        cos, sin = cos_sin[pos].float().chunk(2, dim=-1)
+        v = v.float()
+        while cos.dim() < v.dim():
+            cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+        out = torch.empty_like(v)
+        out[..., 0::2] = v[..., 0::2] * cos - v[..., 1::2] * sin
+        out[..., 1::2] = v[..., 1::2] * cos + v[..., 0::2] * sin
+        return out.to(DTYPE)
+
+    q_pe = apply_rope(q[..., nope:], positions)
+    k_pe = apply_rope(k_pe, positions)
+    ql = torch.einsum("bhp,hlp->bhl", q[..., :nope].float(), w_kc.float()).to(DTYPE)
+    ref_cache[slot_mapping] = torch.cat([kv_c, k_pe], dim=-1)
+    expected = torch.empty(num_seqs, num_heads, v_head_dim)
+    for i, seq_len in enumerate(seq_lens):
+        keys = ref_cache[req_to_token[i, :seq_len]].float()
+        q_full = torch.cat([ql[i], q_pe[i]], dim=-1).float()
+        probs = torch.softmax(q_full @ keys.T * sm_scale, dim=-1)
+        o = probs @ keys[:, :kv_lora]
+        expected[i] = torch.einsum("hl,hvl->hv", o, w_vc.float())
+
+    out = torch.empty(num_seqs, num_heads * v_head_dim, dtype=DTYPE)
+    ops.mla_decode_fused_cpu(
+        x,
+        qkv_a_packed,
+        q_b_packed,
+        torch.ops._C.convert_weight_packed(w_kc),
+        torch.ops._C.convert_weight_packed(w_vc),
+        q_ln,
+        kv_ln,
+        positions,
+        cos_sin,
+        eps,
+        qkv_a_scale,
+        s_q_b,
+        None,
+        [128, 128],
+        q_lora,
+        kv_lora,
+        rope,
+        kv_cache,
+        slot_mapping,
+        req_to_token,
+        torch.arange(num_seqs, dtype=torch.int64),
+        torch.tensor(seq_lens, dtype=torch.int64),
+        _compute_num_kv_splits(
+            num_seqs,
+            num_heads,
+            max(seq_lens),
+            current_platform.num_compute_units(),
+        ),
+        sm_scale,
+        out,
+    )
+    torch.testing.assert_close(
+        _flatten_cache(kv_cache)[slot_mapping],
+        ref_cache[slot_mapping],
+        atol=ATOL,
+        rtol=RTOL,
+    )
+    torch.testing.assert_close(
+        out.view(num_seqs, num_heads, v_head_dim).float(),
+        expected,
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 def test_amx_mla_impl_forward_mha_matches_reference(default_vllm_config):

@@ -306,6 +306,9 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             scale_attr,
             torch.nn.Parameter(weight_scale.data.contiguous(), requires_grad=False),
         )
+        if getattr(layer, "_cpu_keep_w8a16", False):
+            layer.w8a16_weight = getattr(layer, params.WEIGHT)
+            layer.w8a16_scale = getattr(layer, scale_attr)
 
     def apply_weights(
         self,
@@ -589,6 +592,11 @@ class CPUFp8W8A8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         else:
             weight_scale_expanded = weight_scale.contiguous()
 
+        if getattr(layer, "_cpu_keep_w8a16", False):
+            # MLA's fused decode op reads these weights as W8A16 (bf16
+            # activation x block-scaled FP8 weight).
+            layer.w8a16_weight = torch.ops._C.convert_weight_packed(weight)
+            layer.w8a16_scale = weight_scale.to(torch.float32).clone()
         packed_weight, packed_scales = torch.ops._C.float8_linear_prepack_cpu(
             weight, weight_scale_expanded.to(torch.float32)
         )
