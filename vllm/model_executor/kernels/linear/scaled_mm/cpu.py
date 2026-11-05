@@ -29,6 +29,10 @@ from .ScaledMMLinearKernel import (
 # BLOCK_K in csrc/cpu/sgl-kernels/gemm.h — the AMX kernel's fixed K-block size.
 _BLOCK_SIZE_K = 128
 
+# Up to this many tokens the AVX512 W8A16 GEMM beats the W8A8 AMX one (matches
+# the `use_brgemm` threshold in gemm.h).
+W8A16_MAX_TOKENS = 4
+
 
 class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     @classmethod
@@ -595,8 +599,18 @@ class CPUFp8W8A8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         if getattr(layer, "_cpu_keep_w8a16", False):
             # MLA's fused decode op reads these weights as W8A16 (bf16
             # activation x block-scaled FP8 weight).
-            layer.w8a16_weight = torch.ops._C.convert_weight_packed(weight)
-            layer.w8a16_scale = weight_scale.to(torch.float32).clone()
+            layer.register_parameter(
+                "w8a16_weight",
+                torch.nn.Parameter(
+                    torch.ops._C.convert_weight_packed(weight), requires_grad=False
+                ),
+            )
+            layer.register_parameter(
+                "w8a16_scale",
+                torch.nn.Parameter(
+                    weight_scale.to(torch.float32).clone(), requires_grad=False
+                ),
+            )
         packed_weight, packed_scales = torch.ops._C.float8_linear_prepack_cpu(
             weight, weight_scale_expanded.to(torch.float32)
         )
@@ -648,6 +662,20 @@ class CPUFp8W8A8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             return out.reshape(x.shape[:-1] + (out.size(-1),)) if x.dim() > 2 else out
 
         # act_scales=None + channelwise=True → dynamic per-token activation quant
+        w8a16_weight = getattr(layer, "w8a16_weight", None)
+        if w8a16_weight is not None and bias is None:
+            # The op picks the AVX512 W8A16 GEMM for few tokens (no activation
+            # quant pass) and the AMX W8A8 one otherwise
+            out = ops.fp8_linear_small_m_cpu(
+                x_2d,
+                w8a16_weight,
+                layer.w8a16_scale,
+                params.weight,
+                weight_scale,
+                W8A16_MAX_TOKENS,
+            )
+            return out.reshape(x.shape[:-1] + (out.size(-1),)) if x.dim() > 2 else out
+
         out = ops.fp8_scaled_mm_with_quant(
             x_2d,
             None,

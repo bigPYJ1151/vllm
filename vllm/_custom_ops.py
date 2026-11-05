@@ -4343,6 +4343,79 @@ def cpu_mla_decode(
     )
 
 
+if hasattr(torch.ops._C, "fp8_linear_small_m_cpu"):
+
+    @register_fake("_C::fp8_linear_small_m_cpu")
+    def fp8_linear_small_m_cpu_fake(
+        x: torch.Tensor,
+        w_w8a16: torch.Tensor,
+        s_w8a16: torch.Tensor,
+        w_w8a8: torch.Tensor,
+        s_w8a8: torch.Tensor,
+        max_w8a16_tokens: int,
+    ) -> torch.Tensor:
+        return torch.empty((x.size(0), w_w8a16.size(0)), dtype=x.dtype, device=x.device)
+
+
+def fp8_linear_small_m_cpu(
+    x: torch.Tensor,
+    w_w8a16: torch.Tensor,
+    s_w8a16: torch.Tensor,
+    w_w8a8: torch.Tensor,
+    s_w8a8: torch.Tensor,
+    max_w8a16_tokens: int,
+) -> torch.Tensor:
+    return torch.ops._C.fp8_linear_small_m_cpu(
+        x, w_w8a16, s_w8a16, w_w8a8, s_w8a8, max_w8a16_tokens
+    )
+
+
+if hasattr(torch.ops._C, "mlp_fp8_fused_cpu"):
+
+    @register_fake("_C::mlp_fp8_fused_cpu")
+    def mlp_fp8_fused_cpu_fake(
+        x: torch.Tensor,
+        w1_w8a16: torch.Tensor,
+        s1_w8a16: torch.Tensor,
+        w2_w8a16: torch.Tensor,
+        s2_w8a16: torch.Tensor,
+        w1_w8a8: torch.Tensor,
+        s1_w8a8: torch.Tensor,
+        w2_w8a8: torch.Tensor,
+        s2_w8a8: torch.Tensor,
+        max_w8a16_tokens: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (x.size(0), w2_w8a16.size(0)), dtype=x.dtype, device=x.device
+        )
+
+
+def mlp_fp8_fused_cpu(
+    x: torch.Tensor,
+    w1_w8a16: torch.Tensor,
+    s1_w8a16: torch.Tensor,
+    w2_w8a16: torch.Tensor,
+    s2_w8a16: torch.Tensor,
+    w1_w8a8: torch.Tensor,
+    s1_w8a8: torch.Tensor,
+    w2_w8a8: torch.Tensor,
+    s2_w8a8: torch.Tensor,
+    max_w8a16_tokens: int,
+) -> torch.Tensor:
+    return torch.ops._C.mlp_fp8_fused_cpu(
+        x,
+        w1_w8a16,
+        s1_w8a16,
+        w2_w8a16,
+        s2_w8a16,
+        w1_w8a8,
+        s1_w8a8,
+        w2_w8a8,
+        s2_w8a8,
+        max_w8a16_tokens,
+    )
+
+
 def mla_decode_fused_cpu(
     hidden_states: torch.Tensor,
     qkv_a_proj_weight: torch.Tensor,

@@ -43,6 +43,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
@@ -280,8 +281,33 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        if current_platform.is_cpu():
+            for proj in (self.gate_up_proj, self.down_proj):
+                proj._cpu_keep_w8a16 = True
+
+    def _cpu_fused_weights(self) -> tuple[torch.Tensor, ...] | None:
+        """CPU FP8 block-quantized weights for `mlp_fp8_fused_cpu`, if usable."""
+        if not current_platform.is_cpu():
+            return None
+        weights = []
+        for proj in (self.gate_up_proj, self.down_proj):
+            w8a16 = getattr(proj, "w8a16_weight", None)
+            scale = getattr(proj, "weight_scale_inv", None)
+            if w8a16 is None or scale is None or proj.weight.dim() != 4:
+                return None
+            weights += [w8a16, proj.w8a16_scale, proj.weight, scale]
+        return tuple(weights)
 
     def forward(self, x):
+        weights = self._cpu_fused_weights()
+        if weights is not None and x.dim() == 2:
+            w1_16, s1_16, w1_8, s1_8, w2_16, s2_16, w2_8, s2_8 = weights
+            out = ops.mlp_fp8_fused_cpu(
+                x, w1_16, s1_16, w2_16, s2_16, w1_8, s1_8, w2_8, s2_8, 4
+            )
+            if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+                out = tensor_model_parallel_all_reduce(out)
+            return out
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

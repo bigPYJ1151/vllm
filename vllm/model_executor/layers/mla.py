@@ -165,7 +165,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # CPU decode fast path, see `enable_cpu_fused_decode`
         self._cpu_fused: AMXMLAFusedDecode | None = None
         if current_platform.is_cpu():
-            for proj in (self.fused_qkv_a_proj, self.q_b_proj):
+            for proj in (self.fused_qkv_a_proj, self.q_b_proj, self.o_proj):
                 if proj is not None:
                     proj._cpu_keep_w8a16 = True
             object.__setattr__(self.mla_attn, "_fused_owner", self)

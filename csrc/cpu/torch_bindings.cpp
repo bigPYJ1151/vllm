@@ -147,6 +147,16 @@ qkv_proj_with_rope_fused_weight(
 
 // vLLM-native: the fused front end plus KV-cache write, decode attention and
 // W_UV de-absorption in one op.
+at::Tensor fp8_linear_small_m_cpu(at::Tensor& x, at::Tensor& w_w8a16,
+                                  at::Tensor& s_w8a16, at::Tensor& w_w8a8,
+                                  at::Tensor& s_w8a8, int64_t max_w8a16_tokens);
+
+at::Tensor mlp_fp8_fused_cpu(at::Tensor& x, at::Tensor& w1_w8a16,
+                             at::Tensor& s1_w8a16, at::Tensor& w2_w8a16,
+                             at::Tensor& s2_w8a16, at::Tensor& w1_w8a8,
+                             at::Tensor& s1_w8a8, at::Tensor& w2_w8a8,
+                             at::Tensor& s2_w8a8, int64_t max_w8a16_tokens);
+
 void mla_decode_fused_cpu(
     at::Tensor& hidden_states, at::Tensor& qkv_a_proj_weight,
     at::Tensor& q_b_proj_weight, at::Tensor& w_kc, at::Tensor& w_vc,
@@ -842,6 +852,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "slot_mapping, Tensor req_to_token, Tensor req_pool_indices, Tensor "
       "seq_lens, int num_kv_splits, float sm_scale, Tensor(b!) out) -> ()");
   ops.impl("mla_decode_fused_cpu", torch::kCPU, &mla_decode_fused_cpu);
+
+  ops.def(
+      "mlp_fp8_fused_cpu(Tensor x, Tensor w1_w8a16, Tensor s1_w8a16, Tensor "
+      "w2_w8a16, Tensor s2_w8a16, Tensor w1_w8a8, Tensor s1_w8a8, Tensor "
+      "w2_w8a8, Tensor s2_w8a8, int max_w8a16_tokens) -> Tensor");
+  ops.impl("mlp_fp8_fused_cpu", torch::kCPU, &mlp_fp8_fused_cpu);
+
+  ops.def(
+      "fp8_linear_small_m_cpu(Tensor x, Tensor w_w8a16, Tensor s_w8a16, Tensor "
+      "w_w8a8, Tensor s_w8a8, int max_w8a16_tokens) -> Tensor");
+  ops.impl("fp8_linear_small_m_cpu", torch::kCPU, &fp8_linear_small_m_cpu);
 
   ops.def(
       "concat_and_cache_mla_cpu(Tensor kv_c_normed, Tensor k_pe, "
