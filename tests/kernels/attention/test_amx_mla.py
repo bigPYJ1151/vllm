@@ -594,6 +594,190 @@ def test_mla_decode_fused_cpu_matches_reference():
     )
 
 
+@pytest.mark.parametrize(
+    "decode_lens, prefills, w8a8",
+    [
+        pytest.param([1, 40, 77], [], False, id="decode-only"),
+        pytest.param([33], [], False, id="decode-single"),
+        pytest.param([], [(0, 50), (20, 30)], True, id="prefill-only"),
+        pytest.param([40, 77, 100], [(0, 64), (16, 24)], True, id="mixed"),
+    ],
+)
+def test_mla_layer_cpu_matches_reference(decode_lens, prefills, w8a8):
+    """The whole-layer op on decode tokens, prefill tokens (fresh and continuing
+    a cached prefix) and both together, against plain torch ops on dequantized
+    weights. Per-request metadata sits in fixed-capacity buffers, as in the
+    backend's direct mode. Batches of more than four tokens run the W8A8 GEMMs,
+    whose per-token FP8 activation quantization (3 mantissa bits) adds noise the
+    reference does not model; those cases bound the RMS error relative to the
+    output RMS instead of every element (measured: about 3% and 5%)."""
+    set_random_seed(5)
+    hidden, q_lora, kv_lora, rope = 256, 128, 128, 64
+    num_heads, nope, v_head_dim = 4, 64, 64
+    qk_head_dim = nope + rope
+    kv_dim = kv_lora + rope
+    eps = 1e-6
+    block_size = 32
+    sm_scale = qk_head_dim**-0.5
+
+    # (tokens already in the cache, new tokens) per request, decode requests first
+    reqs = [(n - 1, 1) for n in decode_lens] + list(prefills)
+    num_decode = len(decode_lens)
+    num_prefill_reqs = len(prefills)
+    num_tokens = sum(q_len for _, q_len in reqs)
+    num_prefill_tokens = num_tokens - num_decode
+    max_total = max(ctx + q_len for ctx, q_len in reqs)
+    max_blocks = -(-max_total // block_size)
+    capacity = len(reqs) + 3
+    max_context = max_blocks * block_size
+
+    w_q_a, s_q_a = _quantize_fp8_blocks(torch.randn(q_lora, hidden) * 0.1)
+    w_kv_a, s_kv_a = _quantize_fp8_blocks(torch.randn(kv_dim, hidden) * 0.1)
+    w_q_b, s_q_b = _quantize_fp8_blocks(
+        torch.randn(num_heads * qk_head_dim, q_lora) * 0.1
+    )
+    w_qkv_a = torch.cat([w_q_a, w_kv_a])
+    s_qkv_a = torch.cat([s_q_a, s_kv_a])
+    w_kc = torch.randn(num_heads, kv_lora, nope, dtype=DTYPE) * 0.1
+    w_vc = torch.randn(num_heads, v_head_dim, kv_lora, dtype=DTYPE) * 0.1
+    q_ln = torch.rand(q_lora, dtype=DTYPE) + 0.5
+    kv_ln = torch.rand(kv_lora, dtype=DTYPE) + 0.5
+    cos_sin = (torch.rand(max_total, rope) * 2 - 1).to(DTYPE)
+
+    def prepack_w8a8(w: torch.Tensor, scales: torch.Tensor):
+        scale_rows = scales.repeat_interleave(128, 0)[: w.size(0)].contiguous()
+        return torch.ops._C.float8_linear_prepack_cpu(w, scale_rows)
+
+    qkv_a_w8a8, qkv_a_s8a8 = prepack_w8a8(w_qkv_a, s_qkv_a)
+    q_b_w8a8, q_b_s8a8 = prepack_w8a8(w_q_b, s_q_b)
+
+    x = torch.randn(num_tokens, hidden, dtype=DTYPE)
+    positions = torch.cat([torch.arange(ctx, ctx + q_len) for ctx, q_len in reqs]).to(
+        torch.int64
+    )
+
+    num_blocks = len(reqs) * max_blocks
+    block_table = torch.randperm(num_blocks).view(len(reqs), max_blocks)
+    req_to_token = _expand_block_table(block_table, block_size)
+    kv_cache = torch.randn(num_blocks, block_size, kv_dim, dtype=DTYPE)
+    ref_cache = _flatten_cache(kv_cache.clone())
+    token_req = torch.cat(
+        [torch.full((q_len,), r) for r, (_, q_len) in enumerate(reqs)]
+    )
+    slot_mapping = req_to_token[token_req, positions]
+
+    # reference
+    qa = (x.float() @ _dequantize_fp8_blocks(w_qkv_a, s_qkv_a).T).to(DTYPE)
+    q_c = _rms_norm(qa[:, :q_lora], q_ln, eps)
+    kv_c = _rms_norm(qa[:, q_lora : q_lora + kv_lora], kv_ln, eps)
+    q = (q_c.float() @ _dequantize_fp8_blocks(w_q_b, s_q_b).T).to(DTYPE)
+    q = q.view(num_tokens, num_heads, qk_head_dim)
+
+    def apply_rope(v: torch.Tensor) -> torch.Tensor:
+        cos, sin = cos_sin[positions].float().chunk(2, dim=-1)
+        v = v.float()
+        while cos.dim() < v.dim():
+            cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+        out = torch.empty_like(v)
+        out[..., 0::2] = v[..., 0::2] * cos - v[..., 1::2] * sin
+        out[..., 1::2] = v[..., 1::2] * cos + v[..., 0::2] * sin
+        return out.to(DTYPE)
+
+    q_pe = apply_rope(q[..., nope:])
+    k_pe = apply_rope(qa[:, q_lora + kv_lora :])
+    ql = torch.einsum("bhp,hlp->bhl", q[..., :nope].float(), w_kc.float()).to(DTYPE)
+    ref_cache[slot_mapping] = torch.cat([kv_c, k_pe], dim=-1)
+    expected = torch.empty(num_tokens, num_heads, v_head_dim)
+    for t in range(num_tokens):
+        keys = ref_cache[req_to_token[token_req[t], : positions[t] + 1]].float()
+        q_full = torch.cat([ql[t], q_pe[t]], dim=-1).float()
+        probs = torch.softmax(q_full @ keys.T * sm_scale, dim=-1)
+        expected[t] = torch.einsum(
+            "hl,hvl->hv", probs @ keys[:, :kv_lora], w_vc.float()
+        )
+
+    # fixed-capacity metadata buffers, first rows valid
+    def padded(values, dtype, fill=0):
+        buf = torch.full((capacity,), fill, dtype=dtype)
+        buf[: len(values)] = torch.tensor(values, dtype=dtype)
+        return buf
+
+    rt_buf = torch.zeros(capacity, max_context + block_size, dtype=torch.int32)
+    rt_buf[: len(reqs), : req_to_token.size(1)] = req_to_token.to(torch.int32)
+    extend_lens = [q_len for _, q_len in prefills]
+    scalars = torch.tensor(
+        [
+            num_decode,
+            num_prefill_tokens,
+            num_prefill_reqs,
+            _compute_num_kv_splits(
+                max(num_decode, 1),
+                num_heads,
+                max(decode_lens, default=1),
+                current_platform.num_compute_units(),
+            ),
+        ],
+        dtype=torch.int64,
+    )
+    slots = torch.full((num_tokens + 5,), -1, dtype=torch.int64)
+    slots[:num_tokens] = slot_mapping
+
+    out = torch.empty(num_tokens, num_heads * v_head_dim, dtype=DTYPE)
+    ops.mla_layer_cpu(
+        x,
+        torch.cat([positions, torch.zeros(5, dtype=torch.int64)]),
+        out,
+        kv_cache,
+        torch.ops._C.convert_weight_packed(w_qkv_a),
+        s_qkv_a,
+        torch.ops._C.convert_weight_packed(w_q_b),
+        s_q_b,
+        qkv_a_w8a8,
+        qkv_a_s8a8,
+        q_b_w8a8,
+        q_b_s8a8,
+        torch.ops._C.convert_weight_packed(w_kc),
+        torch.ops._C.convert_weight_packed(w_vc),
+        q_ln,
+        kv_ln,
+        cos_sin,
+        None,
+        scalars,
+        slots,
+        rt_buf,
+        torch.arange(capacity, dtype=torch.int64),
+        padded([n for n in decode_lens], torch.int64),
+        rt_buf,
+        padded(
+            [num_decode + r for r in range(num_prefill_reqs)],
+            torch.int64,
+        ),
+        padded([ctx + q_len for ctx, q_len in prefills], torch.int64),
+        padded(extend_lens, torch.int32),
+        padded(
+            [sum(extend_lens[:r]) for r in range(num_prefill_reqs)],
+            torch.int32,
+        ),
+        eps,
+        q_lora,
+        kv_lora,
+        rope,
+        sm_scale,
+        4,
+    )
+    actual_rows = _flatten_cache(kv_cache)[slot_mapping]
+    actual_out = out.view(num_tokens, num_heads, v_head_dim).float()
+    for actual, want in (
+        (actual_rows.float(), ref_cache[slot_mapping].float()),
+        (actual_out, expected),
+    ):
+        if w8a8:
+            rel_rms = (actual - want).pow(2).mean().sqrt() / want.pow(2).mean().sqrt()
+            assert rel_rms < 0.08, rel_rms
+        else:
+            torch.testing.assert_close(actual, want, atol=5e-2, rtol=5e-2)
+
+
 def test_amx_mla_impl_forward_mha_matches_reference(default_vllm_config):
     """forward_mha receives raw unabsorbed Q and must attend correctly for a
     prefill batch with a mix of fresh and continued (cached-prefix)

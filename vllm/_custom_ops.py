@@ -4416,6 +4416,87 @@ def mlp_fp8_fused_cpu(
     )
 
 
+if hasattr(torch.ops._C, "mla_layer_cpu"):
+
+    @register_fake("_C::mla_layer_cpu")
+    def mla_layer_cpu_fake(*args, **kwargs) -> None:
+        return None
+
+
+def mla_layer_cpu(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    kv_cache: torch.Tensor,
+    qkv_a_w8a16: torch.Tensor,
+    qkv_a_s8a16: torch.Tensor,
+    q_b_w8a16: torch.Tensor,
+    q_b_s8a16: torch.Tensor,
+    qkv_a_w8a8: torch.Tensor,
+    qkv_a_s8a8: torch.Tensor,
+    q_b_w8a8: torch.Tensor,
+    q_b_s8a8: torch.Tensor,
+    w_kc: torch.Tensor,
+    w_vc: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    w_scale: torch.Tensor | None,
+    scalars: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    dec_req_to_token: torch.Tensor,
+    dec_req_pool_indices: torch.Tensor,
+    dec_seq_lens: torch.Tensor,
+    pre_req_to_token: torch.Tensor,
+    pre_req_pool_indices: torch.Tensor,
+    pre_seq_lens: torch.Tensor,
+    pre_extend_seq_lens: torch.Tensor,
+    pre_extend_start_loc: torch.Tensor,
+    eps: float,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sm_scale: float,
+    max_w8a16_tokens: int,
+) -> None:
+    torch.ops._C.mla_layer_cpu(
+        hidden_states,
+        positions,
+        out,
+        kv_cache,
+        qkv_a_w8a16,
+        qkv_a_s8a16,
+        q_b_w8a16,
+        q_b_s8a16,
+        qkv_a_w8a8,
+        qkv_a_s8a8,
+        q_b_w8a8,
+        q_b_s8a8,
+        w_kc,
+        w_vc,
+        q_a_layernorm_weight,
+        kv_a_layernorm_weight,
+        cos_sin_cache,
+        w_scale,
+        scalars,
+        slot_mapping,
+        dec_req_to_token,
+        dec_req_pool_indices,
+        dec_seq_lens,
+        pre_req_to_token,
+        pre_req_pool_indices,
+        pre_seq_lens,
+        pre_extend_seq_lens,
+        pre_extend_start_loc,
+        eps,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        sm_scale,
+        max_w8a16_tokens,
+    )
+
+
 def mla_decode_fused_cpu(
     hidden_states: torch.Tensor,
     qkv_a_proj_weight: torch.Tensor,

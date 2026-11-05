@@ -157,6 +157,22 @@ at::Tensor mlp_fp8_fused_cpu(at::Tensor& x, at::Tensor& w1_w8a16,
                              at::Tensor& s1_w8a8, at::Tensor& w2_w8a8,
                              at::Tensor& s2_w8a8, int64_t max_w8a16_tokens);
 
+void mla_layer_cpu(
+    at::Tensor& hidden_states, at::Tensor& positions, at::Tensor& out,
+    at::Tensor& kv_cache, at::Tensor& qkv_a_w8a16, at::Tensor& qkv_a_s8a16,
+    at::Tensor& q_b_w8a16, at::Tensor& q_b_s8a16, at::Tensor& qkv_a_w8a8,
+    at::Tensor& qkv_a_s8a8, at::Tensor& q_b_w8a8, at::Tensor& q_b_s8a8,
+    at::Tensor& w_kc, at::Tensor& w_vc, at::Tensor& q_a_layernorm_weight,
+    at::Tensor& kv_a_layernorm_weight, at::Tensor& cos_sin_cache,
+    std::optional<at::Tensor> w_scale, at::Tensor& scalars,
+    at::Tensor& slot_mapping, at::Tensor& dec_req_to_token,
+    at::Tensor& dec_req_pool_indices, at::Tensor& dec_seq_lens,
+    at::Tensor& pre_req_to_token, at::Tensor& pre_req_pool_indices,
+    at::Tensor& pre_seq_lens, at::Tensor& pre_extend_seq_lens,
+    at::Tensor& pre_extend_start_loc, double eps, int64_t q_lora_rank,
+    int64_t kv_lora_rank, int64_t qk_rope_head_dim, double sm_scale,
+    int64_t max_w8a16_tokens);
+
 void mla_decode_fused_cpu(
     at::Tensor& hidden_states, at::Tensor& qkv_a_proj_weight,
     at::Tensor& q_b_proj_weight, at::Tensor& w_kc, at::Tensor& w_vc,
@@ -841,6 +857,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "kv_lora_rank, int qk_rope_head_dim) -> (Tensor, Tensor, Tensor)");
   ops.impl("qkv_proj_with_rope_fused_weight", torch::kCPU,
            &qkv_proj_with_rope_fused_weight);
+
+  ops.def(
+      "mla_layer_cpu(Tensor hidden_states, Tensor positions, Tensor(a!) out, "
+      "Tensor(b!) kv_cache, Tensor qkv_a_w8a16, Tensor qkv_a_s8a16, Tensor "
+      "q_b_w8a16, Tensor q_b_s8a16, Tensor qkv_a_w8a8, Tensor qkv_a_s8a8, "
+      "Tensor q_b_w8a8, Tensor q_b_s8a8, Tensor w_kc, Tensor w_vc, Tensor "
+      "q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor "
+      "cos_sin_cache, Tensor? w_scale, Tensor scalars, Tensor slot_mapping, "
+      "Tensor dec_req_to_token, Tensor dec_req_pool_indices, Tensor "
+      "dec_seq_lens, Tensor pre_req_to_token, Tensor pre_req_pool_indices, "
+      "Tensor pre_seq_lens, Tensor pre_extend_seq_lens, Tensor "
+      "pre_extend_start_loc, float eps, int q_lora_rank, int kv_lora_rank, "
+      "int qk_rope_head_dim, float sm_scale, int max_w8a16_tokens) -> ()");
+  ops.impl("mla_layer_cpu", torch::kCPU, &mla_layer_cpu);
 
   ops.def(
       "mla_decode_fused_cpu(Tensor hidden_states, Tensor qkv_a_proj_weight, "

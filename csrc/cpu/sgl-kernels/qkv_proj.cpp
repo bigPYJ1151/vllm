@@ -274,6 +274,51 @@ extern void decode_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks);
 
+
+// stage 4 and 5 of the front end: absorb W_UK into the nope part of the query, rotate the rope parts.
+// qb: [num_seqs, num_heads * qk_head_dim] q_b_proj output; q_input/k_input are filled in place.
+static void absorb_and_rope(
+    at::Tensor& qb,
+    at::Tensor& q_input,
+    at::Tensor& k_input,
+    at::Tensor& w_kc,
+    const std::optional<at::Tensor>& w_scale,
+    at::Tensor& positions,
+    at::Tensor& cos_sin_cache,
+    int64_t kv_lora_rank,
+    int64_t qk_nope_head_dim) {
+  const int64_t num_seqs = q_input.size(0);
+  const int64_t num_heads = q_input.size(1);
+  const int64_t kv_dim = q_input.size(2);
+  const int64_t rotary_dim = cos_sin_cache.size(1);
+  const int64_t qk_head_dim = qk_nope_head_dim + rotary_dim;
+  const auto st = q_input.scalar_type();
+  qb.as_strided_({num_seqs, num_heads, qk_head_dim}, {num_heads * qk_head_dim, qk_head_dim, 1});
+
+  auto q_nope = qb.narrow(2, 0, qk_nope_head_dim).transpose_(0, 1);
+  auto q_nope_out = q_input.narrow(2, 0, kv_lora_rank).transpose_(0, 1);
+  bmm_cpu(q_nope_out, q_nope, w_kc, /*is_vnni=*/true, w_scale);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "rotary_emb_kernel_impl", [&] {
+    rotary_emb_kernel_impl<scalar_t>(
+        q_input.data_ptr<scalar_t>() + kv_lora_rank,
+        k_input.data_ptr<scalar_t>() + kv_lora_rank,
+        qb.data_ptr<scalar_t>() + qk_nope_head_dim,
+        k_input.data_ptr<scalar_t>() + kv_lora_rank,
+        positions.data_ptr<int64_t>(),
+        cos_sin_cache.data_ptr<scalar_t>(),
+        num_seqs,
+        num_heads,
+        rotary_dim,
+        num_heads * qk_head_dim,
+        qk_head_dim,
+        kv_dim,
+        num_heads * kv_dim,
+        kv_dim,
+        kv_dim);
+  });
+}
+
 // NB: shapes in DeepSeek R1 (per TP4 rank)
 //
 //   hidden_states         : [num_seqs, hidden_size]                 [1, 7168]
@@ -341,15 +386,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
   CHECK_EQ(q_b_proj_weight.size(1), q_lora_rank);
 
   // q_a_proj and kv_a_proj_with_mqa are row blocks of the fused weight and its scale
-  auto weight_chunks = at::split_with_sizes(qkv_a_proj_weight, {q_lora_rank, kv_dim}, 0);
-  auto scale_chunks = at::split_with_sizes(
-      qkv_a_proj_scale.value(), {div_up(q_lora_rank, block_size_N), div_up(kv_dim, block_size_N)}, 0);
-  at::Tensor q_a_proj_weight = weight_chunks[0];
-  at::Tensor kv_a_proj_weight = weight_chunks[1];
-  at::Tensor q_a_proj_s = scale_chunks[0];
-  at::Tensor kv_a_proj_s = scale_chunks[1];
-  CHECK_EQ(q_a_proj_s.size(1), div_up(hidden_size, block_size_K));
-  CHECK_EQ(kv_a_proj_s.size(1), div_up(hidden_size, block_size_K));
+  TORCH_CHECK(
+      qkv_a_proj_weight.is_contiguous() && qkv_a_proj_scale.value().is_contiguous(),
+      "qkv_a_proj weight and scale must be contiguous.");
+  const int64_t scale_cols = div_up(hidden_size, block_size_K);
+  const int64_t q_a_scale_rows = div_up(q_lora_rank, block_size_N);
+  CHECK_EQ(qkv_a_proj_scale.value().size(0), q_a_scale_rows + div_up(kv_dim, block_size_N));
+  CHECK_EQ(qkv_a_proj_scale.value().size(1), scale_cols);
+  auto* q_a_proj_weight = qkv_a_proj_weight.data_ptr<at::Float8_e4m3fn>();
+  auto* kv_a_proj_weight = q_a_proj_weight + q_lora_rank * hidden_size;
+  auto* q_a_proj_s = qkv_a_proj_scale.value().data_ptr<float>();
+  auto* kv_a_proj_s = q_a_proj_s + q_a_scale_rows * scale_cols;
 
   const auto options = hidden_states.options();
   auto q_input = at::empty({num_seqs, num_heads, kv_dim}, options);
@@ -361,16 +408,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "qkv_proj_kernel_impl", [&] {
     const int BLOCK_N = block_size_n();
     const int num_threads = at::get_num_threads();
-    auto buffer = at::empty({num_threads, BLOCK_N * hidden_size}, options);
+    // per-thread dequantized weight tile; kept across calls to avoid re-faulting pages
+    static thread_local at::Tensor buffer_cache;
+    const int64_t buffer_numel = static_cast<int64_t>(num_threads) * BLOCK_N * hidden_size;
+    if (!buffer_cache.defined() || buffer_cache.numel() < buffer_numel || buffer_cache.scalar_type() != st) {
+      buffer_cache = at::empty({buffer_numel}, options);
+    }
     segment_gemm_kernel_impl<scalar_t>(
         qa.data_ptr<scalar_t>(),
         k_input.data_ptr<scalar_t>(),
         hidden_states.data_ptr<scalar_t>(),
-        q_a_proj_weight.data_ptr<at::Float8_e4m3fn>(),
-        kv_a_proj_weight.data_ptr<at::Float8_e4m3fn>(),
-        q_a_proj_s.data_ptr<float>(),
-        kv_a_proj_s.data_ptr<float>(),
-        buffer.data_ptr<scalar_t>(),
+        q_a_proj_weight,
+        kv_a_proj_weight,
+        q_a_proj_s,
+        kv_a_proj_s,
+        buffer_cache.data_ptr<scalar_t>(),
         num_seqs,
         q_lora_rank,
         kv_dim,
@@ -396,32 +448,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
   // stage 3: q_b_proj
   std::optional<at::Tensor> bias;
   at::Tensor qb = fp8_scaled_mm_cpu(qa, q_b_proj_weight, q_b_proj_scale.value(), block_size.value(), bias, st, is_vnni);
-  qb.as_strided_({num_seqs, num_heads, qk_head_dim}, {num_heads * qk_head_dim, qk_head_dim, 1});
 
-  // stage 4: absorb W_UK into the nope part of the query
-  auto q_nope = qb.narrow(2, 0, qk_nope_head_dim).transpose_(0, 1);
-  auto q_nope_out = q_input.narrow(2, 0, kv_lora_rank).transpose_(0, 1);
-  bmm_cpu(q_nope_out, q_nope, w_kc, is_vnni, w_scale);
-
-  // stage 5: rope
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "rotary_emb_kernel_impl", [&] {
-    rotary_emb_kernel_impl<scalar_t>(
-        q_input.data_ptr<scalar_t>() + kv_lora_rank,
-        k_input.data_ptr<scalar_t>() + kv_lora_rank,
-        qb.data_ptr<scalar_t>() + qk_nope_head_dim,
-        k_input.data_ptr<scalar_t>() + kv_lora_rank,
-        positions.data_ptr<int64_t>(),
-        cos_sin_cache.data_ptr<scalar_t>(),
-        num_seqs,
-        num_heads,
-        rotary_dim,
-        num_heads * qk_head_dim,
-        qk_head_dim,
-        kv_dim,
-        num_heads * kv_dim,
-        kv_dim,
-        kv_dim);
-  });
+  absorb_and_rope(qb, q_input, k_input, w_kc, w_scale, positions, cos_sin_cache, kv_lora_rank, qk_nope_head_dim);
 
   return std::make_tuple(q_input, k_input, v_input);
 }
@@ -522,6 +550,292 @@ void mla_decode_fused_cpu(
       std::nullopt);
 
   auto out_view = out.view({num_seqs, num_heads, v_head_dim}).transpose(0, 1);
+  auto o_t = o.transpose(0, 1);
+  bmm_cpu(out_view, o_t, w_vc, /*is_vnni=*/true, w_scale);
+}
+
+extern at::Tensor fp8_scaled_mm_with_quant(
+    const at::Tensor& act,
+    const std::optional<at::Tensor>& act_scales,
+    bool channelwise,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType output_dtype);
+
+extern void extend_attention_cpu(
+    at::Tensor& q_extend,
+    const std::optional<at::Tensor>& k_extend_opt,
+    const std::optional<at::Tensor>& v_extend_opt,
+    at::Tensor& o_extend,
+    at::Tensor& k_buffer,
+    at::Tensor& v_buffer,
+    at::Tensor& req_to_token,
+    at::Tensor& req_pool_indices,
+    at::Tensor& seq_lens,
+    at::Tensor& extend_seq_lens,
+    at::Tensor& extend_start_loc,
+    int64_t max_len_extend,
+    double sm_scale,
+    double logit_cap,
+    bool is_cross_attn,
+    int64_t sliding_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks,
+    std::optional<at::Tensor> tree_mask);
+
+extern void concat_and_cache_mla_cpu(
+    const at::Tensor& kv_c_normed, const at::Tensor& k_pe, at::Tensor& kv_cache, const at::Tensor& slot_mapping);
+
+// Front end of an MLA layer for any number of tokens, up to the absorbed query and the new latent K:
+// qkv_a_proj, q/kv_a layernorm, q_b_proj, W_UK absorption and RoPE. Up to `max_w8a16_tokens` tokens it uses
+// the fused W8A16 kernels, above that the W8A8 AMX GEMMs. Returns q_input [M, H, kv_lora + rope] and
+// k_input [M, 1, kv_lora + rope] (the latent K row of each token, already normed and rotated).
+static std::tuple<at::Tensor, at::Tensor> mla_front_end(
+    at::Tensor& hidden_states,
+    at::Tensor& qkv_a_w8a16,
+    at::Tensor& qkv_a_s8a16,
+    at::Tensor& q_b_w8a16,
+    at::Tensor& q_b_s8a16,
+    at::Tensor& qkv_a_w8a8,
+    at::Tensor& qkv_a_s8a8,
+    at::Tensor& q_b_w8a8,
+    at::Tensor& q_b_s8a8,
+    at::Tensor& w_kc,
+    at::Tensor& q_a_layernorm_weight,
+    at::Tensor& kv_a_layernorm_weight,
+    at::Tensor& positions,
+    at::Tensor& cos_sin_cache,
+    const std::optional<at::Tensor>& w_scale,
+    double eps,
+    int64_t q_lora_rank,
+    int64_t kv_lora_rank,
+    int64_t qk_rope_head_dim,
+    int64_t max_w8a16_tokens) {
+  const int64_t num_seqs = hidden_states.size(0);
+  if (num_seqs <= max_w8a16_tokens) {
+    auto [q_input, k_input, v_input] = qkv_proj_with_rope_fused_weight(
+        hidden_states,
+        qkv_a_w8a16,
+        q_b_w8a16,
+        w_kc,
+        q_a_layernorm_weight,
+        kv_a_layernorm_weight,
+        positions,
+        cos_sin_cache,
+        eps,
+        /*use_int8_w8a8=*/false,
+        /*use_fp8_w8a16=*/true,
+        qkv_a_s8a16,
+        q_b_s8a16,
+        w_scale,
+        /*is_vnni=*/true,
+        std::vector<int64_t>{128, 128},
+        q_lora_rank,
+        kv_lora_rank,
+        qk_rope_head_dim);
+    return std::make_tuple(q_input, k_input);
+  }
+
+  const auto st = hidden_states.scalar_type();
+  const int64_t num_heads = w_kc.size(0);
+  const int64_t qk_nope_head_dim = w_kc.size(2);
+  const int64_t kv_dim = kv_lora_rank + qk_rope_head_dim;
+  const auto options = hidden_states.options();
+
+  auto fused = fp8_scaled_mm_with_quant(hidden_states, std::nullopt, /*channelwise=*/true, qkv_a_w8a8, qkv_a_s8a8, std::nullopt, st);
+  auto qa = fused.narrow(1, 0, q_lora_rank).contiguous();
+  auto k_input = at::empty({num_seqs, 1, kv_dim}, options);
+  k_input.view({num_seqs, kv_dim}).copy_(fused.narrow(1, q_lora_rank, kv_dim));
+  auto v_input = k_input.narrow(-1, 0, kv_lora_rank);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "rms_norm_kernel_impl", [&] {
+    rms_norm_kernel_impl<scalar_t>(
+        qa.data_ptr<scalar_t>(),
+        v_input.data_ptr<scalar_t>(),
+        q_a_layernorm_weight.data_ptr<scalar_t>(),
+        kv_a_layernorm_weight.data_ptr<scalar_t>(),
+        num_seqs,
+        q_lora_rank,
+        kv_lora_rank,
+        kv_dim,
+        eps);
+  });
+
+  auto qb = fp8_scaled_mm_with_quant(qa, std::nullopt, /*channelwise=*/true, q_b_w8a8, q_b_s8a8, std::nullopt, st);
+  auto q_input = at::empty({num_seqs, num_heads, kv_dim}, options);
+  absorb_and_rope(qb, q_input, k_input, w_kc, w_scale, positions, cos_sin_cache, kv_lora_rank, qk_nope_head_dim);
+  return std::make_tuple(q_input, k_input);
+}
+
+constexpr int64_t kSmallBatchTokens = 16;
+
+// A whole MLA layer for a batch of decode tokens followed by prefill tokens (the scheduler's order):
+// front end, KV-cache write, decode attention for the first `scalars[0]` tokens, extend attention for the
+// next `scalars[1]` tokens, and one W_UV de-absorption. `out` is [num_tokens, num_heads * v_head_dim].
+//
+// scalars (int64, CPU): [decode tokens (one per request), prefill tokens, prefill requests, decode kv splits].
+// The per-request tensors are fixed-capacity buffers whose first rows are valid.
+void mla_layer_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& positions,
+    at::Tensor& out,
+    at::Tensor& kv_cache,
+    at::Tensor& qkv_a_w8a16,
+    at::Tensor& qkv_a_s8a16,
+    at::Tensor& q_b_w8a16,
+    at::Tensor& q_b_s8a16,
+    at::Tensor& qkv_a_w8a8,
+    at::Tensor& qkv_a_s8a8,
+    at::Tensor& q_b_w8a8,
+    at::Tensor& q_b_s8a8,
+    at::Tensor& w_kc,
+    at::Tensor& w_vc,
+    at::Tensor& q_a_layernorm_weight,
+    at::Tensor& kv_a_layernorm_weight,
+    at::Tensor& cos_sin_cache,
+    std::optional<at::Tensor> w_scale,
+    at::Tensor& scalars,
+    at::Tensor& slot_mapping,
+    at::Tensor& dec_req_to_token,
+    at::Tensor& dec_req_pool_indices,
+    at::Tensor& dec_seq_lens,
+    at::Tensor& pre_req_to_token,
+    at::Tensor& pre_req_pool_indices,
+    at::Tensor& pre_seq_lens,
+    at::Tensor& pre_extend_seq_lens,
+    at::Tensor& pre_extend_start_loc,
+    double eps,
+    int64_t q_lora_rank,
+    int64_t kv_lora_rank,
+    int64_t qk_rope_head_dim,
+    double sm_scale,
+    int64_t max_w8a16_tokens) {
+  const int64_t num_tokens = hidden_states.size(0);
+  const int64_t num_heads = w_kc.size(0);
+  const int64_t v_head_dim = w_vc.size(1);
+  const int64_t kv_dim = kv_lora_rank + qk_rope_head_dim;
+  TORCH_CHECK(scalars.scalar_type() == at::kLong && scalars.numel() >= 4, "mla_layer_cpu: bad scalars.");
+  const int64_t* sc = scalars.data_ptr<int64_t>();
+  const int64_t num_decode = sc[0];
+  const int64_t num_prefill = sc[1];
+  const int64_t num_prefill_reqs = sc[2];
+  const int64_t num_kv_splits = sc[3];
+  CHECK_EQ(out.size(0), num_tokens);
+  CHECK_EQ(out.size(1), num_heads * v_head_dim);
+  if (num_decode + num_prefill == 0) {
+    // a step without requests (the dummy run that traces the graph): nothing to attend to
+    out.zero_();
+    return;
+  }
+  TORCH_CHECK(num_decode + num_prefill == num_tokens, "mla_layer_cpu: decode + prefill tokens != num tokens.");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong && slot_mapping.size(0) >= num_tokens, "mla_layer_cpu: bad slot_mapping.");
+
+  auto pos = positions.narrow(0, 0, num_tokens);
+  auto [q_input, k_input] = mla_front_end(
+      hidden_states,
+      qkv_a_w8a16,
+      qkv_a_s8a16,
+      q_b_w8a16,
+      q_b_s8a16,
+      qkv_a_w8a8,
+      qkv_a_s8a8,
+      q_b_w8a8,
+      q_b_s8a8,
+      w_kc,
+      q_a_layernorm_weight,
+      kv_a_layernorm_weight,
+      pos,
+      cos_sin_cache,
+      w_scale,
+      eps,
+      q_lora_rank,
+      kv_lora_rank,
+      qk_rope_head_dim,
+      max_w8a16_tokens);
+
+  auto kv_flat = kv_cache.view({-1, 1, kv_dim});
+  CHECK_EQ(kv_flat.scalar_type(), k_input.scalar_type());
+  if (num_tokens <= kSmallBatchTokens) {
+    // a parallel region costs more than copying a few rows
+    const size_t row_bytes = kv_dim * k_input.element_size();
+    const char* src = static_cast<const char*>(k_input.data_ptr());
+    char* dst = static_cast<char*>(kv_flat.data_ptr());
+    const int64_t* slot_ids = slot_mapping.data_ptr<int64_t>();
+    for (int64_t i = 0; i < num_tokens; ++i) {
+      if (slot_ids[i] >= 0) {
+        std::memcpy(dst + slot_ids[i] * row_bytes, src + i * row_bytes, row_bytes);
+      }
+    }
+  } else {
+    auto slots = slot_mapping.narrow(0, 0, num_tokens);
+    auto kv_c = k_input.narrow(-1, 0, kv_lora_rank).select(1, 0);
+    auto k_pe = k_input.narrow(-1, kv_lora_rank, qk_rope_head_dim).select(1, 0);
+    concat_and_cache_mla_cpu(kv_c, k_pe, kv_cache, slots);
+  }
+
+  auto v_buffer = kv_flat.narrow(-1, 0, kv_lora_rank);
+  // both attention kernels write every element of `o` and of the logits before reading them
+  auto o = at::empty({num_tokens, num_heads, kv_lora_rank}, q_input.options());
+
+  if (num_decode > 0) {
+    auto q_dec = q_input.narrow(0, 0, num_decode);
+    auto o_dec = o.narrow(0, 0, num_decode);
+    auto seq_lens = dec_seq_lens.narrow(0, 0, num_decode);
+    auto attn_logits =
+        at::empty({num_decode, num_heads, num_kv_splits, kv_lora_rank + 1}, q_input.options().dtype(at::kFloat));
+    decode_attention_cpu(
+        q_dec,
+        kv_flat,
+        v_buffer,
+        o_dec,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        attn_logits,
+        dec_req_to_token,
+        dec_req_pool_indices,
+        seq_lens,
+        sm_scale,
+        0.0,
+        false,
+        0,
+        std::nullopt,
+        std::nullopt);
+  }
+
+  if (num_prefill > 0) {
+    auto q_pre = q_input.narrow(0, num_decode, num_prefill);
+    auto k_pre = k_input.narrow(0, num_decode, num_prefill);
+    auto v_pre = k_pre.narrow(-1, 0, kv_lora_rank);
+    auto o_pre = o.narrow(0, num_decode, num_prefill);
+    auto req_pool = pre_req_pool_indices.narrow(0, 0, num_prefill_reqs);
+    auto seq_lens = pre_seq_lens.narrow(0, 0, num_prefill_reqs);
+    auto extend_lens = pre_extend_seq_lens.narrow(0, 0, num_prefill_reqs);
+    auto extend_start = pre_extend_start_loc.narrow(0, 0, num_prefill_reqs);
+    extend_attention_cpu(
+        q_pre,
+        k_pre,
+        v_pre,
+        o_pre,
+        kv_flat,
+        v_buffer,
+        pre_req_to_token,
+        req_pool,
+        seq_lens,
+        extend_lens,
+        extend_start,
+        /*max_len_extend=*/-1,
+        sm_scale,
+        0.0,
+        false,
+        0,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt);
+  }
+
+  auto out_view = out.view({num_tokens, num_heads, v_head_dim}).transpose(0, 1);
   auto o_t = o.transpose(0, 1);
   bmm_cpu(out_view, o_t, w_vc, /*is_vnni=*/true, w_scale);
 }

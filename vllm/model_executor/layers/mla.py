@@ -14,7 +14,10 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import _encode_layer_name
 
 if TYPE_CHECKING:
-    from vllm.v1.attention.backends.mla.amx_mla import AMXMLAFusedDecode
+    from vllm.v1.attention.backends.mla.amx_mla import (
+        AMXMLADirect,
+        AMXMLAFusedDecode,
+    )
     from vllm.v1.attention.backends.mla.index_group import (
         SparseMLAIndexGroupBuilder,
     )
@@ -164,6 +167,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # CPU decode fast path, see `enable_cpu_fused_decode`
         self._cpu_fused: AMXMLAFusedDecode | None = None
+        self._cpu_direct: AMXMLADirect | None = None
         if current_platform.is_cpu():
             for proj in (self.fused_qkv_a_proj, self.q_b_proj, self.o_proj):
                 if proj is not None:
@@ -173,9 +177,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
     def enable_cpu_fused_decode(self) -> None:
         """Called once the weights are loaded: use the fused native decode op
         when this layer's weights and backend support it."""
-        from vllm.v1.attention.backends.mla.amx_mla import AMXMLAFusedDecode
+        from vllm.v1.attention.backends.mla.amx_mla import (
+            AMXMLADirect,
+            AMXMLAFusedDecode,
+        )
 
-        self._cpu_fused = AMXMLAFusedDecode.create(self)
+        self._cpu_direct = AMXMLADirect.create(self)
+        if self._cpu_direct is None:
+            self._cpu_fused = AMXMLAFusedDecode.create(self)
 
     def forward(
         self,
@@ -183,6 +192,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._cpu_direct is not None and llama_4_scaling is None:
+            attn_out = torch.empty(
+                hidden_states.shape[0],
+                self.num_heads * self.v_head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            self._cpu_direct(hidden_states, positions, attn_out)
+            return self.o_proj(attn_out)[0]
         if self._cpu_fused is not None and llama_4_scaling is None:
             attn_out = torch.empty(
                 hidden_states.shape[0],

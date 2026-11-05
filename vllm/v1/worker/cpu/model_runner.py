@@ -4,6 +4,7 @@
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.cpu_attn import init_direct_forward_layers
+from vllm.v1.attention.backends.mla.amx_mla import init_direct_mla_layers
 from vllm.v1.attention.backends.registry import (
     MambaAttentionBackendEnum,
     register_backend,
@@ -34,9 +35,9 @@ class CPUModelRunner(GPUModelRunner):
         logger.info("Warming up model for the compilation...")
         # Layers called directly from compiled code need their metadata
         # attribute to exist when the model is traced.
-        init_direct_forward_layers(
-            self.vllm_config.compilation_config.static_forward_context.values()
-        )
+        layers = self.vllm_config.compilation_config.static_forward_context.values()
+        init_direct_forward_layers(layers)
+        init_direct_mla_layers(layers, self.vllm_config)
         # Only generate graph for the generic shape
         self.profile_run()
         logger.info("Warming up done.")
