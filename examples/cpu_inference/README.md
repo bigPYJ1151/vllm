@@ -9,6 +9,7 @@ vLLM CPU backend (Intel Xeon with AMX). Each model has its own script:
 | `qwen3.5-9b.sh` | Qwen3.5-9B | `bf16` |
 | `qwen3.5-35b-a3b.sh` | Qwen3.5-35B-A3B | `bf16` (default), `fp8` |
 | `gemma4-26b-a4b.sh` | gemma-4-26B-A4B | `bf16` |
+| `deepseek-r1.sh` | DeepSeek-R1 (671B, native FP8 blocks) | `fp8` |
 
 ```bash
 bash <model>.sh <latency|throughput|acc> [precision]
@@ -84,6 +85,7 @@ bash qwen3.5-9b.sh latency
 bash qwen3.5-35b-a3b.sh latency bf16
 bash qwen3.5-35b-a3b.sh latency fp8
 bash gemma4-26b-a4b.sh latency
+bash deepseek-r1.sh latency
 
 # Throughput (BS=30 for Llama, BS=25 for the others)
 bash llama3.1-8b.sh throughput bf16
@@ -94,6 +96,7 @@ bash qwen3.5-9b.sh throughput
 bash qwen3.5-35b-a3b.sh throughput bf16
 bash qwen3.5-35b-a3b.sh throughput fp8
 bash gemma4-26b-a4b.sh throughput
+bash deepseek-r1.sh throughput
 
 # MMLU 5-shot (40 questions per subject, 2280 questions)
 bash llama3.1-8b.sh acc bf16
@@ -104,6 +107,7 @@ bash qwen3.5-9b.sh acc
 bash qwen3.5-35b-a3b.sh acc bf16
 bash qwen3.5-35b-a3b.sh acc fp8
 bash gemma4-26b-a4b.sh acc
+bash deepseek-r1.sh acc
 ```
 
 Or all of them in a loop:
@@ -113,7 +117,8 @@ export TP=4 OUTPUT_DIR=$PWD/results_tp4
 for mode in latency throughput acc; do
   for cfg in "llama3.1-8b bf16" "llama3.1-8b fp16" "llama3.1-8b int8" \
              "llama3.1-8b fp8" "qwen3.5-9b bf16" \
-             "qwen3.5-35b-a3b bf16" "qwen3.5-35b-a3b fp8" "gemma4-26b-a4b bf16"; do
+             "qwen3.5-35b-a3b bf16" "qwen3.5-35b-a3b fp8" "gemma4-26b-a4b bf16" \
+             "deepseek-r1 fp8"; do
     set -- $cfg
     bash "$1.sh" "$mode" "$2"
   done
@@ -140,10 +145,11 @@ decode throughput at the throughput batch size):
 | Qwen3.5-35B-A3B BF16 | 14.6 | 617 | 19.4 | 464 |
 | Qwen3.5-35B-A3B FP8 | 14.8 | 633 | 20.6 | 497 |
 | gemma-4-26B-A4B | 17.2 | 472 | 22.7 | 397 |
+| DeepSeek-R1 FP8 | 73.9 | 60.5 | not run | not run |
 
 Expected MMLU (2280-question subset): about 0.68–0.69 for every Llama variant,
 0.59–0.60 for Qwen3.5-9B, 0.81–0.85 for Qwen3.5-35B-A3B and 0.78 for
-gemma-4-26B-A4B. Run-to-run spread of latency and throughput is 1–4%.
+gemma-4-26B-A4B and 0.87 for DeepSeek-R1. Run-to-run spread of latency and throughput is 1–4%.
 
 ## Prerequisites
 
