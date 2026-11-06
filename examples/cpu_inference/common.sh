@@ -18,6 +18,9 @@ ACC_PER_SUBJECT=${ACC_PER_SUBJECT:-40}     # MMLU questions per subject, 0 = all
 ACC_CONCURRENCY=${ACC_CONCURRENCY:-64}
 MMLU_DATA_DIR=${MMLU_DATA_DIR:-$OUTPUT_DIR/mmlu_data}
 DRY_RUN=${DRY_RUN:-0}                      # 1: only print the commands
+# DP=<n>: throughput only; n independent TP=1 instances, one per die/NUMA node,
+# each at the full batch size. Exclusive with TP.
+DP=${DP:-}
 
 # ---- Topology: one TP rank per CBB (die) or per NUMA node -------------------
 detect_topology() {
@@ -42,6 +45,22 @@ detect_topology() {
 	TP=${TP:-$tp}
 }
 
+# CPUs of die <i> (same die ids as detect_topology), comma separated.
+die_cpus() {
+	local die_id
+	die_id=$(cat /sys/devices/system/cpu/cpu*/topology/die_id | sort -nu | sed -n "$(($1 + 1))p")
+	grep -lx "$die_id" /sys/devices/system/cpu/cpu*/topology/die_id |
+		sed 's#.*/cpu\([0-9]*\)/.*#\1#' | sort -n | paste -sd,
+}
+
+# NUMA node of a CPU, and the <i>-th NUMA node.
+cpu_node() {
+	ls -d /sys/devices/system/cpu/cpu"$1"/node* | sed 's#.*node##'
+}
+numa_node() {
+	ls -d /sys/devices/system/node/node* | sed 's#.*node##' | sort -n | sed -n "$(($1 + 1))p"
+}
+
 setup_cpu_env() {
 	detect_topology
 	export VLLM_CPU_OMP_THREADS_BIND=auto
@@ -57,7 +76,16 @@ setup_cpu_env() {
 		export VLLM_MQ_BUSY_LOOP_SECONDS=${VLLM_MQ_BUSY_LOOP_SECONDS:-1.0}
 	fi
 	mkdir -p "$OUTPUT_DIR"
-	echo "Topology: ${TOPO_MODE} granularity, ${NUM_INSTANCES} instances, TP=${TP}"
+	if [[ -n "$DP" ]]; then
+		if ((DP < 1 || DP > NUM_INSTANCES)); then
+			echo "DP=$DP needs between 1 and $NUM_INSTANCES (${TOPO_MODE} instances)"
+			return 1
+		fi
+		TP=1
+		echo "Topology: ${TOPO_MODE} granularity, ${NUM_INSTANCES} instances, DP=${DP} x TP=1"
+	else
+		echo "Topology: ${TOPO_MODE} granularity, ${NUM_INSTANCES} instances, TP=${TP}"
+	fi
 }
 
 run() {
@@ -80,6 +108,51 @@ one_batch() {
 	local rc=${PIPESTATUS[0]}
 	grep -aE '^(Prefill|Decode|Total)\.' "${base}.log"
 	return "$rc"
+}
+
+# ---- throughput with data parallelism: independent one-batch instances -------
+# one_batch_dp <tag> <model> <batch size> <extra args...>
+# Instance i runs the full batch on die i (cbb) or NUMA node i; vLLM binds the
+# cores from the visible memory node, and from the allowed CPUs under cbb (one
+# node holds several dies there). The decode throughputs are summed.
+one_batch_dp() {
+	local tag=$1 model=$2 bs=$3
+	shift 3
+	local base="${OUTPUT_DIR}/${tag}_dp${DP}_bs${bs}_in${INPUT_TOKEN}_out${OUTPUT_TOKEN}"
+	rm -rf /dev/shm/* 2>/dev/null
+	echo "Results: ${base}.json, per instance ${base}_<i>.{json,log}"
+
+	local i cpus node pin pid pids=() jsons=() rc=0
+	for ((i = 0; i < DP; i++)); do
+		if [[ "$TOPO_MODE" == cbb ]]; then
+			cpus=$(die_cpus "$i")
+			node=$(cpu_node "${cpus%%,*}")
+			pin="taskset -c $cpus"
+		else
+			node=$(numa_node "$i")
+			pin=
+		fi
+		local cmd=(env CPU_VISIBLE_MEMORY_NODES="$node" $pin
+			python -m vllm.entrypoints.cli.main bench one-batch --model "$model"
+			--tensor-parallel-size 1 --batch-size "$bs" --input-len "$INPUT_TOKEN"
+			--output-len "$OUTPUT_TOKEN" --temperature 0
+			--output-json "${base}_${i}.json" "$@")
+		echo "+ ${cmd[*]} > ${base}_${i}.log"
+		jsons+=("${base}_${i}.json")
+		[[ "$DRY_RUN" == 1 ]] && continue
+		"${cmd[@]}" >"${base}_${i}.log" 2>&1 &
+		pids+=($!)
+	done
+	[[ "$DRY_RUN" == 1 ]] && return 0
+
+	for pid in "${pids[@]}"; do
+		wait "$pid" || rc=$?
+	done
+	if ((rc != 0)); then
+		echo "An instance failed, see ${base}_<i>.log"
+		return "$rc"
+	fi
+	python "${SCRIPT_DIR}/sum_dp.py" --output-json "${base}.json" "${jsons[@]}"
 }
 
 # ---- accuracy: vllm serve + MMLU 5-shot client -------------------------------
@@ -143,10 +216,20 @@ accuracy() {
 main() {
 	local mode=${1,,} tag=$2 model=$3 tput_bs=$4
 	shift 4
-	setup_cpu_env
+	if [[ -n "$DP" ]]; then
+		[[ -z "$TP" ]] || { echo "DP and TP are exclusive"; return 1; }
+		[[ "$mode" == throughput ]] || { echo "DP is only supported for throughput"; return 1; }
+	fi
+	setup_cpu_env || return 1
 	case "$mode" in
 	latency) one_batch "$tag" "$model" "${BATCH_SIZE:-1}" "$@" ;;
-	throughput) one_batch "$tag" "$model" "${BATCH_SIZE:-$tput_bs}" "$@" ;;
+	throughput)
+		if [[ -n "$DP" ]]; then
+			one_batch_dp "$tag" "$model" "${BATCH_SIZE:-$tput_bs}" "$@"
+		else
+			one_batch "$tag" "$model" "${BATCH_SIZE:-$tput_bs}" "$@"
+		fi
+		;;
 	acc | accuracy) accuracy "$tag" "$model" "$@" ;;
 	*)
 		echo "Unknown mode '$mode': use latency, throughput or acc"

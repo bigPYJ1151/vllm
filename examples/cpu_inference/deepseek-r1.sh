@@ -9,6 +9,7 @@ source "$(dirname "$0")/common.sh"
 
 MODE=${1:?usage: bash $0 <latency|throughput|acc> [fp8]}
 PRECISION=${2:-fp8}
+[[ -z "$DP" ]] || { echo "DP is not supported: the model needs all dies (use TP)"; exit 1; }
 case "$PRECISION" in
 fp8) MODEL=deepseek-ai/DeepSeek-R1 EXTRA=(--dtype bfloat16) ;;
 *)

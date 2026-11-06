@@ -24,7 +24,7 @@ bash qwen3.5-35b-a3b.sh acc fp8
 | Mode | Command | Reports |
 |---|---|---|
 | `latency` | `vllm bench one-batch`, batch size 1 | prefill latency, median decode step latency, total latency |
-| `throughput` | `vllm bench one-batch`, batch size 30 (Llama) or 25 (others) | the same, plus decode and overall tokens/s |
+| `throughput` | `vllm bench one-batch`, batch size 30 (Llama) or 25 (others); with `DP=<n>`, `n` instances at that batch size | the same, plus decode and overall tokens/s (summed over the instances with `DP`) |
 | `acc` | `vllm serve` + MMLU 5-shot client | average accuracy |
 
 `vllm bench one-batch` builds one static batch (1024 input and 1024 output
@@ -55,7 +55,8 @@ can be overridden through the environment.
 | `OUTPUT_DIR` | `./cpu_inference_results` | Logs and JSON results |
 | `INPUT_TOKEN` / `OUTPUT_TOKEN` | 1024 / 1024 | Prompt and generation length (latency, throughput) |
 | `BATCH_SIZE` | 1 (latency), 30 or 25 (throughput) | Batch size |
-| `TP` | detected | Tensor-parallel size |
+| `TP` | detected | Tensor-parallel size (exclusive with `DP`) |
+| `DP` | unset | Data-parallel instances for `throughput` (see below; exclusive with `TP`) |
 | `BIND_GRANULARITY` | detected (`cbb` or `numa`) | Thread binding granularity |
 | `ACC_PER_SUBJECT` | 40 | MMLU questions per subject, 0 for all |
 | `ACC_CONCURRENCY` | 64 | Concurrent MMLU requests |
@@ -66,6 +67,27 @@ can be overridden through the environment.
 Results are written to `$OUTPUT_DIR/<model>_<precision>_bs<N>_in<I>_out<O>.{json,log}`
 for `latency`/`throughput` and `$OUTPUT_DIR/<model>_<precision>_mmlu.{json,log}`
 (plus `_server.log`) for `acc`.
+
+## Data-parallel throughput
+
+`DP=<n>` replaces tensor parallelism in the `throughput` mode: it starts `n`
+independent `vllm bench one-batch` instances with TP=1, one per die (or NUMA
+node), waits for all of them and reports the sum of their decode throughputs.
+Every instance runs the full batch size (`BATCH_SIZE` is not divided by `n`),
+so the total batch is `n` times larger. `DP` and `TP` cannot be set together, and
+`DP` is rejected for `latency` and `acc` and for DeepSeek-R1 (it needs all dies).
+
+```bash
+DP=4 bash llama3.1-8b.sh throughput bf16
+```
+
+Each instance sees only its memory node (`CPU_VISIBLE_MEMORY_NODES`) and, with
+die binding, only the cores of its die (`taskset`); vLLM then binds the
+threads automatically. Results are written to
+`$OUTPUT_DIR/<model>_<precision>_dp<n>_bs<N>_in<I>_out<O>.json` (the sum and the
+per-instance results) and `..._<i>.{json,log}` per instance. The instances are
+only launched together, not synchronized, so the sum is accurate when their
+decode phases overlap, which holds for instances of equal speed.
 
 ## Reproducing the TP4 results
 
