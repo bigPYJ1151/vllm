@@ -147,6 +147,20 @@ for mode in latency throughput acc; do
 done
 ```
 
+Data-parallel throughput with a larger batch per instance (no `TP`):
+
+```bash
+unset TP; export DP=4 OUTPUT_DIR=$PWD/results_dp4
+BATCH_SIZE=348 bash llama3.1-8b.sh throughput bf16
+BATCH_SIZE=348 bash llama3.1-8b.sh throughput fp16
+BATCH_SIZE=296 bash llama3.1-8b.sh throughput int8
+BATCH_SIZE=296 bash llama3.1-8b.sh throughput fp8
+BATCH_SIZE=108 bash qwen3.5-9b.sh throughput
+BATCH_SIZE=320 bash qwen3.5-35b-a3b.sh throughput bf16
+BATCH_SIZE=320 bash qwen3.5-35b-a3b.sh throughput fp8
+BATCH_SIZE=96 bash gemma4-26b-a4b.sh throughput
+```
+
 Per host, the scripts pick the binding that the reference runs used:
 
 | Host | Detected binding | Equivalent explicit setting |
