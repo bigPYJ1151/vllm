@@ -38,6 +38,7 @@ detect_topology() {
 		NUM_INSTANCES=$numa_count
 	fi
 	TOPO_MODE=${BIND_GRANULARITY:-$TOPO_MODE}
+	DIES_PER_NODE=$((die_count > numa_count ? die_count / numa_count : 1))
 
 	# TP must divide the head counts: use the largest power of two that fits.
 	local tp=1
@@ -123,6 +124,10 @@ one_batch_dp() {
 	echo "Results: ${base}.json, per instance ${base}_<i>.{json,log}"
 
 	local i cpus node pin pid pids=() jsons=() rc=0
+	# Under taskset a rank sees one die and would claim its whole memory node
+	# for the KV cache, so scale the share by the dies on a node.
+	local mem_util=0.92
+	[[ "$TOPO_MODE" == cbb ]] && mem_util=$(awk -v d="$DIES_PER_NODE" 'BEGIN {printf "%.3f", 0.92 / d}')
 	for ((i = 0; i < DP; i++)); do
 		if [[ "$TOPO_MODE" == cbb ]]; then
 			cpus=$(die_cpus "$i")
@@ -136,6 +141,7 @@ one_batch_dp() {
 			python -m vllm.entrypoints.cli.main bench one-batch --model "$model"
 			--tensor-parallel-size 1 --batch-size "$bs" --input-len "$INPUT_TOKEN"
 			--output-len "$OUTPUT_TOKEN" --temperature 0
+			--gpu-memory-utilization "$mem_util"
 			--output-json "${base}_${i}.json" "$@")
 		echo "+ ${cmd[*]} > ${base}_${i}.log"
 		jsons+=("${base}_${i}.json")
