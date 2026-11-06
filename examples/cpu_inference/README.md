@@ -137,15 +137,15 @@ decode throughput at the throughput batch size):
 
 | Model | DMR decode ms | DMR tok/s | GNR decode ms | GNR tok/s |
 |---|---|---|---|---|
-| Llama-3.1-8B BF16 | 19.7 | 1038 | 25.8 | 835 |
-| Llama-3.1-8B FP16 | 19.5 | 997 | 25.3 | 744 |
-| Llama-3.1-8B INT8 | 11.9 | 1422 | 15.6 | 1127 |
-| Llama-3.1-8B FP8 (Intel) | 12.9 | 1398 | not run | not run |
-| Qwen3.5-9B | 21.9 | 855 | 28.6 | 662 |
-| Qwen3.5-35B-A3B BF16 | 14.6 | 617 | 19.4 | 464 |
-| Qwen3.5-35B-A3B FP8 | 14.8 | 633 | 20.6 | 497 |
-| gemma-4-26B-A4B | 17.2 | 472 | 22.7 | 397 |
-| DeepSeek-R1 FP8 | 73.9 | 60.5 | not run | not run |
+| Llama-3.1-8B BF16 | 19.7 | 1035 | 25.8 | 835 |
+| Llama-3.1-8B FP16 | 19.5 | 1002 | 25.3 | 744 |
+| Llama-3.1-8B INT8 | 11.9 | 1407 | 15.6 | 1127 |
+| Llama-3.1-8B FP8 (Intel) | 12.9 | 1397 | not run | not run |
+| Qwen3.5-9B | 21.9 | 852 | 28.6 | 662 |
+| Qwen3.5-35B-A3B BF16 | 14.6 | 616 | 19.4 | 464 |
+| Qwen3.5-35B-A3B FP8 | 14.4 | 636 | 20.6 | 497 |
+| gemma-4-26B-A4B | 17.2 | 474 | 22.7 | 397 |
+| DeepSeek-R1 FP8 | 73.6 | 58.9 | not run | not run |
 
 Expected MMLU (2280-question subset): about 0.68–0.69 for every Llama variant,
 0.59–0.60 for Qwen3.5-9B, 0.81–0.85 for Qwen3.5-35B-A3B and 0.78 for

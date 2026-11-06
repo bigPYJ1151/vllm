@@ -122,7 +122,7 @@ accuracy() {
 	trap stop_server EXIT
 
 	# The first start compiles for several minutes.
-	until curl -s "localhost:${PORT}/v1/models" >/dev/null; do
+	until curl -s "127.0.0.1:${PORT}/v1/models" >/dev/null; do
 		if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 			echo "Server failed, see ${base}_server.log"
 			return 1
