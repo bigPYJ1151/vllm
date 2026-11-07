@@ -20,4 +20,5 @@ fp8) MODEL=Intel/llama-3.1-8b-instruct-fp8 EXTRA=(--dtype bfloat16) ;;
 	;;
 esac
 
+KV_KIB_PER_TOKEN=${KV_KIB_PER_TOKEN-128}
 main "$MODE" "llama3.1-8b_${PRECISION}" "$MODEL" 30 "${EXTRA[@]}"

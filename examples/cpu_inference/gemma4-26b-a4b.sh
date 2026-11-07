@@ -17,4 +17,5 @@ bf16) MODEL=google/gemma-4-26B-A4B EXTRA=(--dtype bfloat16) ;;
 	;;
 esac
 
+KV_KIB_PER_TOKEN=${KV_KIB_PER_TOKEN-233}
 main "$MODE" "gemma4-26b-a4b_${PRECISION}" "$MODEL" 25 "${EXTRA[@]}"

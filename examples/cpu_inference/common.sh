@@ -94,6 +94,17 @@ run() {
 	[[ "$DRY_RUN" == 1 ]] || "$@"
 }
 
+# Size the KV cache for the batch instead of letting each rank claim its whole
+# memory share: <batch size> x (input + output) tokens, plus 25% for block
+# rounding. KV_KIB_PER_TOKEN is per rank, set by the model scripts; unset keeps
+# the default sizing from --gpu-memory-utilization.
+kv_cache_args() {
+	KV_ARGS=()
+	[[ -n "$KV_KIB_PER_TOKEN" ]] || return 0
+	local bytes=$(($1 * (INPUT_TOKEN + OUTPUT_TOKEN) * KV_KIB_PER_TOKEN * 1024 * 5 / 4))
+	KV_ARGS=(--kv-cache-memory-bytes "$bytes")
+}
+
 # ---- latency / throughput: `vllm bench one-batch` ----------------------------
 # one_batch <tag> <model> <batch size> <extra args...>
 one_batch() {
@@ -102,10 +113,11 @@ one_batch() {
 	local base="${OUTPUT_DIR}/${tag}_bs${bs}_in${INPUT_TOKEN}_out${OUTPUT_TOKEN}"
 	rm -rf /dev/shm/* 2>/dev/null
 	echo "Results: ${base}.{json,log}"
+	kv_cache_args "$bs"
 	run torchrun --standalone --nproc-per-node="$TP" -m vllm.entrypoints.cli.main \
 		bench one-batch --model "$model" --tensor-parallel-size "$TP" \
 		--batch-size "$bs" --input-len "$INPUT_TOKEN" --output-len "$OUTPUT_TOKEN" \
-		--temperature 0 --output-json "${base}.json" "$@" 2>&1 | tee "${base}.log"
+		--temperature 0 "${KV_ARGS[@]}" --output-json "${base}.json" "$@" 2>&1 | tee "${base}.log"
 	local rc=${PIPESTATUS[0]}
 	grep -aE '^(Prefill|Decode|Total)\.' "${base}.log"
 	return "$rc"
@@ -128,6 +140,7 @@ one_batch_dp() {
 	# for the KV cache, so scale the share by the dies on a node.
 	local mem_util=0.92
 	[[ "$TOPO_MODE" == cbb ]] && mem_util=$(awk -v d="$DIES_PER_NODE" 'BEGIN {printf "%.3f", 0.92 / d}')
+	kv_cache_args "$bs"
 	for ((i = 0; i < DP; i++)); do
 		if [[ "$TOPO_MODE" == cbb ]]; then
 			cpus=$(die_cpus "$i")
@@ -141,7 +154,7 @@ one_batch_dp() {
 			python -m vllm.entrypoints.cli.main bench one-batch --model "$model"
 			--tensor-parallel-size 1 --batch-size "$bs" --input-len "$INPUT_TOKEN"
 			--output-len "$OUTPUT_TOKEN" --temperature 0
-			--gpu-memory-utilization "$mem_util"
+			--gpu-memory-utilization "$mem_util" "${KV_ARGS[@]}"
 			--output-json "${base}_${i}.json" "$@")
 		echo "+ ${cmd[*]} > ${base}_${i}.log"
 		jsons+=("${base}_${i}.json")

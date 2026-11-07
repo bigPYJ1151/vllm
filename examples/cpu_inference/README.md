@@ -57,6 +57,7 @@ can be overridden through the environment.
 | `BATCH_SIZE` | 1 (latency), 30 or 25 (throughput) | Batch size |
 | `TP` | detected | Tensor-parallel size (exclusive with `DP`) |
 | `DP` | unset | Data-parallel instances for `throughput` (see below; exclusive with `TP`) |
+| `KV_KIB_PER_TOKEN` | per model | KV cache bytes per token and rank, in KiB; sizes the KV cache (see below) |
 | `BIND_GRANULARITY` | detected (`cbb` or `numa`) | Thread binding granularity |
 | `ACC_PER_SUBJECT` | 40 | MMLU questions per subject, 0 for all |
 | `ACC_CONCURRENCY` | 64 | Concurrent MMLU requests |
@@ -67,6 +68,18 @@ can be overridden through the environment.
 Results are written to `$OUTPUT_DIR/<model>_<precision>_bs<N>_in<I>_out<O>.{json,log}`
 for `latency`/`throughput` and `$OUTPUT_DIR/<model>_<precision>_mmlu.{json,log}`
 (plus `_server.log`) for `acc`.
+
+## KV cache size
+
+`latency` and `throughput` pass `--kv-cache-memory-bytes` to `vllm bench
+one-batch`: batch size x (input + output tokens) x `KV_KIB_PER_TOKEN` x 1.25
+(block rounding). Without it every rank would claim its whole memory share for
+the KV cache, which can exhaust the host memory with several ranks or DP
+instances on one node (for example DP=4 at batch size 320). The per-model
+defaults come from the auto-sized caches (KiB per token and rank: Llama 128,
+Qwen3.5-9B 70, Qwen3.5-35B-A3B 57, gemma-4-26B-A4B 233, DeepSeek-R1 73); set
+`KV_KIB_PER_TOKEN=` (empty) to size the cache from `--gpu-memory-utilization`
+instead.
 
 ## Data-parallel throughput
 

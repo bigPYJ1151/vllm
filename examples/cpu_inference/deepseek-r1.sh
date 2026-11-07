@@ -18,4 +18,5 @@ fp8) MODEL=deepseek-ai/DeepSeek-R1 EXTRA=(--dtype bfloat16) ;;
 	;;
 esac
 
+KV_KIB_PER_TOKEN=${KV_KIB_PER_TOKEN-73}
 main "$MODE" "deepseek-r1_${PRECISION}" "$MODEL" 25 "${EXTRA[@]}"

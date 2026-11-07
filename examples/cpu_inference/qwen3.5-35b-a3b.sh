@@ -18,4 +18,5 @@ fp8) MODEL=Qwen/Qwen3.5-35B-A3B-FP8 EXTRA=(--dtype bfloat16) ;;
 	;;
 esac
 
+KV_KIB_PER_TOKEN=${KV_KIB_PER_TOKEN-57}
 main "$MODE" "qwen3.5-35b-a3b_${PRECISION}" "$MODEL" 25 "${EXTRA[@]}"
