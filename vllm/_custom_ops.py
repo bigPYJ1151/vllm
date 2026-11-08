@@ -3545,6 +3545,7 @@ def fused_experts_cpu(
     a1_scale: torch.Tensor | None = None,
     act_method: CPUActMethod = CPUActMethod.SILU_AND_MUL,
 ) -> None:
+    block_size_n, block_size_k = block_size or (0, 0)
     torch.ops._C.fused_experts_cpu(
         out,
         hidden_states,
@@ -3558,7 +3559,8 @@ def fused_experts_cpu(
         w1_zero,
         w2_zero,
         a1_scale,
-        block_size,
+        block_size_n,
+        block_size_k,
         w1_bias,
         w2_bias,
         alpha,

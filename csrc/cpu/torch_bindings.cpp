@@ -81,6 +81,29 @@ void fused_experts_cpu(at::Tensor& out, at::Tensor& hidden_states,
                        const std::optional<double>& limit, bool is_vnni,
                        int64_t act_method);
 
+// Inductor's cpp_wrapper calls an op natively only if its schema has no list
+// argument, so the block size is passed as two ints (0 means no block size).
+void fused_experts_cpu_scalar_block(
+    at::Tensor& out, at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
+    at::Tensor& topk_weights, at::Tensor& topk_ids, int64_t moe_comp_method,
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& w1_zero,
+    const std::optional<at::Tensor>& w2_zero,
+    const std::optional<at::Tensor>& a1_scale, int64_t block_size_n,
+    int64_t block_size_k, const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias, const std::optional<double>& alpha,
+    const std::optional<double>& limit, bool is_vnni, int64_t act_method) {
+  std::optional<std::vector<int64_t>> block_size;
+  if (block_size_n > 0) {
+    block_size = std::vector<int64_t>{block_size_n, block_size_k};
+  }
+  fused_experts_cpu(out, hidden_states, w1, w2, topk_weights, topk_ids,
+                    moe_comp_method, w1_scale, w2_scale, w1_zero, w2_zero,
+                    a1_scale, block_size, w1_bias, w2_bias, alpha, limit,
+                    is_vnni, act_method);
+}
+
 at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2,
                                      at::Tensor& scales2,
                                      const std::optional<at::Tensor>& bias,
@@ -788,11 +811,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "fused_experts_cpu(Tensor(a0!) out, Tensor hidden_states, Tensor w1, "
       "Tensor w2, Tensor topk_weights, Tensor topk_ids, "
       "int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, Tensor? a1_scale, int[]? block_size, "
-      "Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? limit, "
-      "bool is_vnni, int act_method) -> "
+      "Tensor? w1_zero, Tensor? w2_zero, Tensor? a1_scale, int block_size_n, "
+      "int block_size_k, Tensor? w1_bias, Tensor? w2_bias, float? alpha, "
+      "float? limit, bool is_vnni, int act_method) -> "
       "()");
-  ops.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+  ops.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu_scalar_block);
   ops.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, "
       "Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");
