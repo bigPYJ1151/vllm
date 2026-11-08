@@ -206,3 +206,11 @@ A vLLM CPU build (see the CPU installation guide), the model weights
 reachable from the Hugging Face cache or hub, `torchrun`, `curl` and `wget`.
 The accuracy client needs `aiohttp` and `tiktoken`. Setting `LD_PRELOAD` to
 tcmalloc and Intel OpenMP, as in the CPU Docker image, is recommended.
+
+## Building the CPU image from a clone
+
+`docker/Dockerfile.cpu` installs the pinned torch wheel from `prebuilt/`, which
+is stored with Git LFS. Run `git lfs install` before cloning (or `git lfs
+install && git lfs pull` in an existing clone). Without it `prebuilt/*.whl` is a
+134-byte pointer file, and the image build fails at the first requirements
+install with `torch==... has an invalid package format`.
