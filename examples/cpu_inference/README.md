@@ -240,6 +240,11 @@ docker run --rm -it --privileged --net host --shm-size 64g --entrypoint bash \
     vllm-cpu-bench -lc "cd /vllm-workspace/examples/cpu_inference && bash llama3.1-8b.sh latency"
 ```
 
+The image also carries an `as` wrapper (`docker/cpu_as_shim.sh`, found through
+`COMPILER_PATH`) so that Triton-CPU kernels, such as the sampler's, assemble on
+AVX10.2/APX hosts (Diamond Rapids), where the pinned binutils rejects some LLVM
+output. No extra mount or setting is needed.
+
 `--privileged` and `--net host` are what the reference runs used; add
 `-e HF_TOKEN=<token>` for gated models (for example `Intel/llama-3.1-8b-instruct-fp8`).
 Models are downloaded on first use, so keep only the checkpoint under test on
