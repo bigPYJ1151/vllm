@@ -149,6 +149,10 @@ ENV UV_COMPILE_BYTECODE=1
 # GPU torch-nightly lane); default 0 keeps the pinned release CPU build.
 ARG PYTORCH_NIGHTLY=0
 ARG PYTORCH_CPU_INDEX_BASE_URL=https://download.pytorch.org/whl
+# The pinned x86_64 torch nightly is older than any torchvision release that
+# depends on it, so the resolver falls back to a torchvision 0.2.0 placeholder.
+# Install a real one without dependency resolution after the requirements.
+ARG TORCHVISION_X86_VERSION=0.29.1
 
 # Copy requirements files for installation
 COPY requirements/common.txt requirements/common.txt
@@ -170,7 +174,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         && uv pip install -r requirements/cpu.txt \
             --extra-index-url ${PYTORCH_CPU_INDEX_BASE_URL}/nightly/cpu; \
     else \
-        uv pip install -r requirements/cpu.txt --torch-backend cpu; \
+        uv pip install -r requirements/cpu.txt --torch-backend cpu \
+        && if [ "$(uname -m)" = "x86_64" ]; then \
+            uv pip install --no-deps --reinstall torchvision==${TORCHVISION_X86_VERSION} \
+                --index-url ${PYTORCH_CPU_INDEX_BASE_URL}/cpu; \
+        fi; \
     fi
 
 ######################### x86_64 BASE IMAGE #########################
