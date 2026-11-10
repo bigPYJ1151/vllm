@@ -214,3 +214,33 @@ is stored with Git LFS. Run `git lfs install` before cloning (or `git lfs
 install && git lfs pull` in an existing clone). Without it `prebuilt/*.whl` is a
 134-byte pointer file, and the image build fails at the first requirements
 install with `torch==... has an invalid package format`.
+
+```bash
+# 1. Clone with LFS (replace the URL and branch with the ones under test)
+git lfs install
+git clone -b <branch> <repo url> vllm
+cd vllm
+ls -l prebuilt/*.whl        # must be ~190 MB, not 134 bytes
+
+# 2. Build the dev image (compiles the CPU kernels, takes 15 to 20 minutes)
+docker build -f docker/Dockerfile.cpu --target vllm-dev -t vllm-cpu-dev .
+
+# 3. The image ships a placeholder torchvision (0.2.0) that breaks the Hugging
+#    Face image processors of Qwen3.5 and gemma-4. Install a real one on top:
+cat > Dockerfile.tv <<'EOF'
+FROM vllm-cpu-dev
+RUN uv pip install --no-deps --reinstall --index-url https://download.pytorch.org/whl/cpu torchvision==0.29.1
+EOF
+docker build -f Dockerfile.tv -t vllm-cpu-bench .
+
+# 4. Run the scripts in the container; the examples are baked into the image
+docker run --rm -it --privileged --net host --shm-size 64g --entrypoint bash \
+    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -e OUTPUT_DIR=/results -v $PWD/results:/results \
+    vllm-cpu-bench -lc "cd /vllm-workspace/examples/cpu_inference && bash llama3.1-8b.sh latency"
+```
+
+`--privileged` and `--net host` are what the reference runs used; add
+`-e HF_TOKEN=<token>` for gated models (for example `Intel/llama-3.1-8b-instruct-fp8`).
+Models are downloaded on first use, so keep only the checkpoint under test on
+disk when space is tight (DeepSeek-R1 alone needs about 650 GB).
