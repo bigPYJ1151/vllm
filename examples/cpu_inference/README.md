@@ -1,7 +1,54 @@
 # CPU model benchmarks
 
 One-line latency, throughput and accuracy tests for the models validated on the
-vLLM CPU backend (Intel Xeon with AMX). Each model has its own script:
+vLLM CPU backend (Intel Xeon with AMX).
+
+## Prerequisites
+
+A vLLM CPU build (see the CPU installation guide, or the Docker image below),
+the model weights reachable from the Hugging Face cache or hub, `torchrun`,
+`curl` and `wget`. The accuracy client needs `aiohttp` and `tiktoken`. Setting
+`LD_PRELOAD` to tcmalloc and Intel OpenMP, as in the CPU Docker image, is
+recommended.
+
+## Building the CPU image from a clone
+
+`docker/Dockerfile.cpu` installs the pinned torch wheel from `prebuilt/`, which
+is stored with Git LFS. Run `git lfs install` before cloning (or `git lfs
+install && git lfs pull` in an existing clone). Without it `prebuilt/*.whl` is a
+134-byte pointer file, and the image build fails at the first requirements
+install with `torch==... has an invalid package format`.
+
+```bash
+# 1. Clone with LFS (replace the URL and branch with the ones under test)
+git lfs install
+git clone -b <branch> <repo url> vllm
+cd vllm
+ls -l prebuilt/*.whl        # must be ~190 MB, not 134 bytes
+
+# 2. Build the dev image (compiles the CPU kernels, takes 15 to 20 minutes)
+docker build -f docker/Dockerfile.cpu --target vllm-dev -t vllm-cpu-dev .
+
+# 3. Run the scripts in the container; the examples are baked into the image
+docker run --rm -it --privileged --net host --shm-size 64g --entrypoint bash \
+    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -e OUTPUT_DIR=/results -v $PWD/results:/results \
+    vllm-cpu-dev -lc "cd /vllm-workspace/examples/cpu_inference && bash llama3.1-8b.sh latency"
+```
+
+`--privileged` and `--net host` are what the reference runs used; add
+`-e HF_TOKEN=<token>` for gated models (for example `Intel/llama-3.1-8b-instruct-fp8`).
+Models are downloaded on first use, so keep only the checkpoint under test on
+disk when space is tight (DeepSeek-R1 alone needs about 650 GB).
+
+The image also carries an `as` wrapper (`docker/cpu_as_shim.sh`, found through
+`COMPILER_PATH`) so that Triton-CPU kernels, such as the sampler's, assemble on
+AVX10.2/APX hosts (Diamond Rapids), where the pinned binutils rejects some LLVM
+output. No extra mount or setting is needed.
+
+## Models and scripts
+
+Each model has its own script:
 
 | Script | Model | Precisions |
 |---|---|---|
@@ -47,6 +94,13 @@ otherwise (e.g. Granite Rapids). TP is the largest power of two that fits the
 instance count, so that it divides the head counts. The engine core sleeps
 between requests with die binding and spins with NUMA binding. Everything below
 can be overridden through the environment.
+
+Per host, the scripts pick the binding that the reference runs used:
+
+| Host | Detected binding | Equivalent explicit setting |
+|---|---|---|
+| Diamond Rapids (256 cores, 4 dies) | one rank per die (`cbb`), engine core sleeps | `TP=4 BIND_GRANULARITY=cbb VLLM_MQ_BUSY_LOOP_SECONDS=0` |
+| Granite Rapids (384 cores, 6 NUMA nodes) | one rank per NUMA node (`numa`), engine core spins, 4 of the 6 nodes used | `TP=4 BIND_GRANULARITY=numa VLLM_MQ_BUSY_LOOP_SECONDS=1.0` |
 
 ## Environment variables
 
@@ -102,16 +156,18 @@ per-instance results) and `..._<i>.{json,log}` per instance. The instances are
 only launched together, not synchronized, so the sum is accurate when their
 decode phases overlap, which holds for instances of equal speed.
 
-## Reproducing the TP4 results
+## Reproducing the reference runs
 
-All reference numbers use TP=4, 1024 input and 1024 output tokens, greedy
-sampling and 0 reserved cores. Pass `TP=4` explicitly to make that independent
-of the topology detection. Run from this folder; results go to `$OUTPUT_DIR`.
+All reference runs use 1024 input and 1024 output tokens, greedy sampling and
+0 reserved cores. TP runs use TP=4; pass it explicitly to make that independent
+of the topology detection. DP runs use four TP=1 instances with a larger batch
+per instance. Run from this folder; results go to `$OUTPUT_DIR`.
 
 ```bash
-export TP=4 OUTPUT_DIR=$PWD/results_tp4
+export OUTPUT_DIR=$PWD/results
 
-# Latency (BS=1)
+# TP=4: latency (BS=1)
+export TP=4
 bash llama3.1-8b.sh latency bf16
 bash llama3.1-8b.sh latency fp16
 bash llama3.1-8b.sh latency int8
@@ -122,7 +178,7 @@ bash qwen3.5-35b-a3b.sh latency fp8
 bash gemma4-26b-a4b.sh latency
 bash deepseek-r1.sh latency
 
-# Throughput (BS=30 for Llama, BS=25 for the others)
+# TP=4: throughput (BS=30 for Llama, BS=25 for the others)
 bash llama3.1-8b.sh throughput bf16
 bash llama3.1-8b.sh throughput fp16
 bash llama3.1-8b.sh throughput int8
@@ -133,7 +189,7 @@ bash qwen3.5-35b-a3b.sh throughput fp8
 bash gemma4-26b-a4b.sh throughput
 bash deepseek-r1.sh throughput
 
-# MMLU 5-shot (40 questions per subject, 2280 questions)
+# TP=4: MMLU 5-shot (40 questions per subject, 2280 questions)
 bash llama3.1-8b.sh acc bf16
 bash llama3.1-8b.sh acc fp16
 bash llama3.1-8b.sh acc int8
@@ -143,27 +199,10 @@ bash qwen3.5-35b-a3b.sh acc bf16
 bash qwen3.5-35b-a3b.sh acc fp8
 bash gemma4-26b-a4b.sh acc
 bash deepseek-r1.sh acc
-```
 
-Or all of them in a loop:
-
-```bash
-export TP=4 OUTPUT_DIR=$PWD/results_tp4
-for mode in latency throughput acc; do
-  for cfg in "llama3.1-8b bf16" "llama3.1-8b fp16" "llama3.1-8b int8" \
-             "llama3.1-8b fp8" "qwen3.5-9b bf16" \
-             "qwen3.5-35b-a3b bf16" "qwen3.5-35b-a3b fp8" "gemma4-26b-a4b bf16" \
-             "deepseek-r1 fp8"; do
-    set -- $cfg
-    bash "$1.sh" "$mode" "$2"
-  done
-done
-```
-
-Data-parallel throughput with a larger batch per instance (no `TP`):
-
-```bash
-unset TP; export DP=4 OUTPUT_DIR=$PWD/results_dp4
+# DP=4: throughput with a larger batch per instance (no TP; not for DeepSeek-R1)
+unset TP
+export DP=4
 BATCH_SIZE=348 bash llama3.1-8b.sh throughput bf16
 BATCH_SIZE=348 bash llama3.1-8b.sh throughput fp16
 BATCH_SIZE=296 bash llama3.1-8b.sh throughput int8
@@ -174,78 +213,6 @@ BATCH_SIZE=320 bash qwen3.5-35b-a3b.sh throughput fp8
 BATCH_SIZE=96 bash gemma4-26b-a4b.sh throughput
 ```
 
-Per host, the scripts pick the binding that the reference runs used:
-
-| Host | Detected binding | Equivalent explicit setting |
-|---|---|---|
-| Diamond Rapids (256 cores, 4 dies) | one rank per die (`cbb`), engine core sleeps | `TP=4 BIND_GRANULARITY=cbb VLLM_MQ_BUSY_LOOP_SECONDS=0` |
-| Granite Rapids (384 cores, 6 NUMA nodes) | one rank per NUMA node (`numa`), engine core spins, 4 of the 6 nodes used | `TP=4 BIND_GRANULARITY=numa VLLM_MQ_BUSY_LOOP_SECONDS=1.0` |
-
-Reference numbers from these commands (vLLM; median decode step at BS=1, and
-decode throughput at the throughput batch size):
-
-| Model | DMR decode ms | DMR tok/s | GNR decode ms | GNR tok/s |
-|---|---|---|---|---|
-| Llama-3.1-8B BF16 | 19.7 | 1035 | 25.8 | 835 |
-| Llama-3.1-8B FP16 | 19.5 | 1002 | 25.3 | 744 |
-| Llama-3.1-8B INT8 | 11.9 | 1407 | 15.6 | 1127 |
-| Llama-3.1-8B FP8 (Intel) | 12.9 | 1397 | not run | not run |
-| Qwen3.5-9B | 21.9 | 852 | 28.6 | 662 |
-| Qwen3.5-35B-A3B BF16 | 14.6 | 616 | 19.4 | 464 |
-| Qwen3.5-35B-A3B FP8 | 14.4 | 636 | 20.6 | 497 |
-| gemma-4-26B-A4B | 17.2 | 474 | 22.7 | 397 |
-| DeepSeek-R1 FP8 | 73.6 | 58.9 | not run | not run |
-
 Expected MMLU (2280-question subset): about 0.68–0.69 for every Llama variant,
 0.59–0.60 for Qwen3.5-9B, 0.81–0.85 for Qwen3.5-35B-A3B and 0.78 for
-gemma-4-26B-A4B and 0.87 for DeepSeek-R1. Run-to-run spread of latency and throughput is 1–4%.
-
-## Prerequisites
-
-A vLLM CPU build (see the CPU installation guide), the model weights
-reachable from the Hugging Face cache or hub, `torchrun`, `curl` and `wget`.
-The accuracy client needs `aiohttp` and `tiktoken`. Setting `LD_PRELOAD` to
-tcmalloc and Intel OpenMP, as in the CPU Docker image, is recommended.
-
-## Building the CPU image from a clone
-
-`docker/Dockerfile.cpu` installs the pinned torch wheel from `prebuilt/`, which
-is stored with Git LFS. Run `git lfs install` before cloning (or `git lfs
-install && git lfs pull` in an existing clone). Without it `prebuilt/*.whl` is a
-134-byte pointer file, and the image build fails at the first requirements
-install with `torch==... has an invalid package format`.
-
-```bash
-# 1. Clone with LFS (replace the URL and branch with the ones under test)
-git lfs install
-git clone -b <branch> <repo url> vllm
-cd vllm
-ls -l prebuilt/*.whl        # must be ~190 MB, not 134 bytes
-
-# 2. Build the dev image (compiles the CPU kernels, takes 15 to 20 minutes)
-docker build -f docker/Dockerfile.cpu --target vllm-dev -t vllm-cpu-dev .
-
-# 3. The image ships a placeholder torchvision (0.2.0) that breaks the Hugging
-#    Face image processors of Qwen3.5 and gemma-4. Install a real one on top:
-cat > Dockerfile.tv <<'EOF'
-FROM vllm-cpu-dev
-RUN uv pip install --no-deps --reinstall --index-url https://download.pytorch.org/whl/cpu torchvision==0.29.1
-EOF
-docker build -f Dockerfile.tv -t vllm-cpu-bench .
-
-# 4. Run the scripts in the container; the examples are baked into the image
-docker run --rm -it --privileged --net host --shm-size 64g --entrypoint bash \
-    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-    -e OUTPUT_DIR=/results -v $PWD/results:/results \
-    vllm-cpu-bench -lc "cd /vllm-workspace/examples/cpu_inference && bash llama3.1-8b.sh latency"
-```
-
-The image also carries an `as` wrapper (`docker/cpu_as_shim.sh`, found through
-`COMPILER_PATH`) so that Triton-CPU kernels, such as the sampler's, assemble on
-AVX10.2/APX hosts (Diamond Rapids), where the pinned binutils rejects some LLVM
-output. No extra mount or setting is needed.
-
-`--privileged` and `--net host` are what the reference runs used; add
-`-e HF_TOKEN=<token>` for gated models (for example `Intel/llama-3.1-8b-instruct-fp8`).
-Models are downloaded on first use, so keep only the checkpoint under test on
-disk when space is tight (DeepSeek-R1 alone needs about 650 GB).
+gemma-4-26B-A4B and 0.87 for DeepSeek-R1.
