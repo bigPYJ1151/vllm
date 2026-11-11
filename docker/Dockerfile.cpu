@@ -151,7 +151,9 @@ ARG PYTORCH_NIGHTLY=0
 ARG PYTORCH_CPU_INDEX_BASE_URL=https://download.pytorch.org/whl
 # The pinned x86_64 torch nightly is older than any torchvision release that
 # depends on it, so the resolver falls back to a torchvision 0.2.0 placeholder.
-# Install a real one without dependency resolution after the requirements.
+# Install a real one without dependency resolution after the requirements, and
+# drop its torch requirement from the metadata so that `setup.py develop`'s
+# dependency check does not reject the older pinned torch.
 ARG TORCHVISION_X86_VERSION=0.29.1
 
 # Copy requirements files for installation
@@ -177,7 +179,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         uv pip install -r requirements/cpu.txt --torch-backend cpu \
         && if [ "$(uname -m)" = "x86_64" ]; then \
             uv pip install --no-deps --reinstall torchvision==${TORCHVISION_X86_VERSION} \
-                --index-url ${PYTORCH_CPU_INDEX_BASE_URL}/cpu; \
+                --index-url ${PYTORCH_CPU_INDEX_BASE_URL}/cpu \
+            && sed -i -E '/^Requires-Dist: torch([^a-z]|$)/d' \
+                "$(python3 -c 'import importlib.metadata as m; print(m.distribution("torchvision")._path)')/METADATA"; \
         fi; \
     fi
 
