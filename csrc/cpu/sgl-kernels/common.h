@@ -12,6 +12,11 @@
 // changed them for fp8 packed KV-cache attention (new signatures that need
 // op-schema plumbing) and a topk.cpp rewrite that conflicts with the local
 // DeepSeek-V4 biased-topk. Reconcile them together in a full sync.
+//
+// FP8 W8A8 (DeepSeek-R1) update: bmm.cpp, gemm.h, gemm_fp8_w8a8.cpp, moe.cpp
+// and moe_fp8_w8a8.cpp were merged (3-way) from the Intel SGLang drop branch
+// dmr_2026_ww47_drop, commit ac1d8a60f ("[DMR] DS r1 W8A8 optimizations"),
+// on top of its parent c7a324442.
 
 // clang-format off
 

@@ -110,7 +110,15 @@ inline CPUActMethod act_method_from_int(int64_t act_method) {
   return static_cast<CPUActMethod>(act_method);
 }
 
-enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4, FP8_W8A8 = 5 };
+enum class CPUQuantMethod : int64_t {
+  BF16 = 0,
+  INT8_W8A8 = 1,
+  FP8_W8A16 = 2,
+  INT4_W4A8 = 3,
+  MXFP4 = 4,
+  FP8_W8A8 = 5,
+  FP8_W8A8_FULL = 6
+};
 
 constexpr bool operator==(CPUQuantMethod a, int64_t b) {
   return static_cast<int64_t>(a) == b;
@@ -215,6 +223,27 @@ void fused_experts_fp_kernel_impl(
     float limit,
     CPUActMethod act_func,
     bool with_bias);
+
+float quantize_fp8_cpu_row(const at::BFloat16* input, at::Float8_e4m3fn* output, int64_t count);
+
+void check_fp8_brgemm_cpu();
+
+void shared_expert_fp8_a8_kernel_impl(
+    at::BFloat16* output,
+    at::BFloat16* ic0,
+    at::BFloat16* silu_tmp,
+    at::Float8_e4m3fn* Aq_tmp,
+    float* As_tmp,
+    const at::BFloat16* input,
+    const at::Float8_e4m3fn* packed_w1,
+    const at::Float8_e4m3fn* packed_w2,
+    const float* w1s,
+    const float* w2s,
+    const at::BFloat16* fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K);
 
 // shared expert implementation for int8 w8a8
 template <typename scalar_t>
@@ -447,6 +476,9 @@ void fused_experts_fp8_a8_kernel_impl(
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     float* __restrict__ Ukernel_tmp,
+    at::Float8_e4m3fn* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    bool full_w8a8,
     const at::Float8_e4m3fn* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,

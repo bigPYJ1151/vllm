@@ -8,6 +8,7 @@
 #include <torch/all.h>
 
 #include "common.h"
+#include "gemm.h"
 #include "vec.h"
 
 // Runtime check for AMX-FP8, implemented in cpu_isa.cpp.
@@ -365,22 +366,42 @@ void _float8_linear_impl(
       int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
       zero_buffer(y_buf, m_size * block_n);
       for (int kci = 0; kci < Kc; ++kci) {
-        auto scales_a = a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
         auto scales_b = b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
-        _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
-            /* C */ y_buf,
-            /* A */ a_ptr + mci * block_m * K + kci * block_k,
-            /* scales_a */ scales_a,
-            /* B */ b_ptr + (nc * Kc + kci) * block_n * block_k,
-            /* scales_b */ scales_b,
-            /* M */ m_size,
-            /* K */ block_k,
-            /* lda */ K,
-            /* ldc */ block_n,
-            /* ldsa */ ldsa,
-            /* ukernel_buf */ ukernel_buf,
-            /* dqA_buf */ dqA_buffer,
-            /* dqB_buf */ dqB_buffer);
+        if constexpr (cpublas_can_pack && act_quant_mode != PER_GROUP && wei_quant_mode == PER_GROUP) {
+          tinygemm_kernel(
+              y_buf,
+              a_ptr + mci * block_m * K + kci * block_k,
+              a_scales_ptr + (act_quant_mode == PER_ROW ? mci * block_m : 0),
+              b_ptr + (nc * Kc + kci) * block_n * block_k,
+              scales_b,
+              m_size,
+              block_k,
+              K,
+              block_n,
+              ldsa,
+              ukernel_buf,
+              dqA_buffer,
+              dqB_buffer);
+        } else {
+          auto scales_a =
+              a_scales_ptr + (act_quant_mode == PER_GROUP ? mci * block_m * num_groups + kci / block_per_group
+                              : act_quant_mode == PER_ROW ? mci * block_m
+                                                          : 0);
+          _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
+              /* C */ y_buf,
+              /* A */ a_ptr + mci * block_m * K + kci * block_k,
+              /* scales_a */ scales_a,
+              /* B */ b_ptr + (nc * Kc + kci) * block_n * block_k,
+              /* scales_b */ scales_b,
+              /* M */ m_size,
+              /* K */ block_k,
+              /* lda */ K,
+              /* ldc */ block_n,
+              /* ldsa */ ldsa,
+              /* ukernel_buf */ ukernel_buf,
+              /* dqA_buf */ dqA_buffer,
+              /* dqB_buf */ dqB_buffer);
+        }
       }
       auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr
                       : act_quant_mode == PER_ROW  ? a_scales_ptr + mci * block_m
@@ -808,10 +829,53 @@ __attribute__((target("avx10.2"))) void quantize_bf16_block_avx10_2(
 }
 #endif  // CPU_CAPABILITY_AVX10_2
 
-std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(const at::Tensor& t) {
-  constexpr float quant_max = 448.0f;  // torch.finfo(torch.float8_e4m3fn).max
-  constexpr float eps = std::numeric_limits<float>::epsilon();
+void check_fp8_brgemm_cpu() {
+#if defined(CPU_CAPABILITY_AVX512) && defined(CPUBLAS_BRGEMM_F8F8F32)
+  static const bool available = at::native::cpublas::could_pack(at::kFloat8_e4m3fn);
+  TORCH_CHECK(available, "FP8 W8A8 requires CPU FP8 BRGEMM support.");
+#else
+  TORCH_CHECK(false, "FP8 W8A8 requires a PyTorch build with CPU FP8 BRGEMM support.");
+#endif
+}
 
+float quantize_fp8_cpu_row(const at::BFloat16* input, at::Float8_e4m3fn* output, int64_t count) {
+  constexpr float quant_max = 448.0f;
+  assert(count > 0 && count % 32 == 0);
+  __m512 max_vec = _mm512_setzero_ps();
+  for (int64_t i = 0; i < count; i += 32) {
+    const __m256i src0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + i));
+    const __m256i src1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + i + 16));
+    const __m512 fp0 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src0), 16));
+    const __m512 fp1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src1), 16));
+    max_vec = _mm512_max_ps(max_vec, _mm512_max_ps(_mm512_abs_ps(fp0), _mm512_abs_ps(fp1)));
+  }
+  const float scale = std::max(_mm512_reduce_max_ps(max_vec) / quant_max, std::numeric_limits<float>::epsilon());
+  const float reciprocal = 1.0f / scale;
+#ifdef CPU_CAPABILITY_AVX10_2
+  if (avx10_2_available()) {
+    quantize_bf16_block_avx10_2(input, output, count, reciprocal);
+    return scale;
+  }
+#endif
+  {
+    const __m512 reciprocal_vec = _mm512_set1_ps(reciprocal);
+    const __m512 limit = _mm512_set1_ps(quant_max);
+    const __m512 neg_limit = _mm512_set1_ps(-quant_max);
+    for (int64_t i = 0; i < count; i += 32) {
+      const __m256i src0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + i));
+      const __m256i src1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + i + 16));
+      __m512 fp0 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src0), 16));
+      __m512 fp1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src1), 16));
+      __m512 scaled0 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(fp0, reciprocal_vec), neg_limit), limit);
+      __m512 scaled1 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(fp1, reciprocal_vec), neg_limit), limit);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(output + i), cvtfp32_fp8e4m3(scaled0));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(output + i + 16), cvtfp32_fp8e4m3(scaled1));
+    }
+  }
+  return scale;
+}
+
+std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(const at::Tensor& t) {
   // Input validation and preparation
   assert(t.scalar_type() == at::ScalarType::BFloat16);
   auto t_bf16 = t.contiguous();
@@ -830,71 +894,7 @@ std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(co
       const at::BFloat16* channel_src = t_bf16.data_ptr<at::BFloat16>() + c * elements_per_channel;
       at::Float8_e4m3fn* quant_dst = quant_t.data_ptr<at::Float8_e4m3fn>() + c * elements_per_channel;
 
-      // Step 1: Compute channel-wise max using AVX512
-      float channel_max = 0.0f;
-      int64_t i = 0;
-
-      // Process 32 elements at a time for max computation
-      for (; i <= elements_per_channel - 32; i += 32) {
-        // Load 32 BF16 values (2x 256-bit vectors)
-        __m256i src_vec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&channel_src[i]));
-        __m256i src_vec2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&channel_src[i + 16]));
-
-        // Convert BF16 to FP32
-        __m512i fp32_int1 = _mm512_cvtepu16_epi32(src_vec1);
-        __m512 fp32_vec1 = _mm512_castsi512_ps(_mm512_slli_epi32(fp32_int1, 16));
-
-        __m512i fp32_int2 = _mm512_cvtepu16_epi32(src_vec2);
-        __m512 fp32_vec2 = _mm512_castsi512_ps(_mm512_slli_epi32(fp32_int2, 16));
-
-        // Compute absolute values
-        __m512 abs_vec1 = _mm512_abs_ps(fp32_vec1);
-        __m512 abs_vec2 = _mm512_abs_ps(fp32_vec2);
-
-        // Find max in each vector
-        float max1 = _mm512_reduce_max_ps(abs_vec1);
-        float max2 = _mm512_reduce_max_ps(abs_vec2);
-        channel_max = std::max(channel_max, std::max(max1, max2));
-      }
-
-      // Step 2: Apply quant_max and EPS to compute scale
-      float scale_val = std::max(channel_max / quant_max, eps);
-      float scale_reciprocal = 1.0f / scale_val;
-      scale_data[c] = scale_val;
-
-      // Step 3: Scale and clamp using AVX512 (reuse the same loop structure)
-#ifdef CPU_CAPABILITY_AVX10_2
-      if (avx10_2_available()) {
-        quantize_bf16_block_avx10_2(channel_src, quant_dst, elements_per_channel, scale_reciprocal);
-        continue;
-      }
-#endif
-      i = 0;
-      const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
-      const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
-      const __m512 neg_quant_max_vec = _mm512_set1_ps(-quant_max);
-
-      for (; i <= elements_per_channel - 32; i += 32) {
-        // Load 32 BF16 values
-        __m256i src_vec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&channel_src[i]));
-        __m256i src_vec2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&channel_src[i + 16]));
-
-        // Convert BF16 to FP32
-        __m512 fp32_vec1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec1), 16));
-        __m512 fp32_vec2 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec2), 16));
-
-        // Scale and clamp
-        __m512 scaled_vec1 = _mm512_mul_ps(fp32_vec1, scale_recip_vec);
-        __m512 clamped_vec1 = _mm512_min_ps(_mm512_max_ps(scaled_vec1, neg_quant_max_vec), quant_max_vec);
-
-        __m512 scaled_vec2 = _mm512_mul_ps(fp32_vec2, scale_recip_vec);
-        __m512 clamped_vec2 = _mm512_min_ps(_mm512_max_ps(scaled_vec2, neg_quant_max_vec), quant_max_vec);
-
-        __m128i fp8_vec1 = cvtfp32_fp8e4m3(clamped_vec1);
-        __m128i fp8_vec2 = cvtfp32_fp8e4m3(clamped_vec2);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(quant_dst + i), fp8_vec1);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(quant_dst + i + 16), fp8_vec2);
-      }
+      scale_data[c] = quantize_fp8_cpu_row(channel_src, quant_dst, elements_per_channel);
     }
   });
 
@@ -1003,6 +1003,13 @@ at::Tensor fp8_scaled_mm_with_quant(
     const at::Tensor& weight_scales,
     const std::optional<at::Tensor>& bias,
     at::ScalarType output_dtype) {
+  if (act.numel() == 0) {
+    auto sizes = act.sizes().vec();
+    TORCH_CHECK(!sizes.empty() && sizes.back() > 0, "FP8 linear requires a positive input feature dimension.");
+    TORCH_CHECK(weight.dim() == 2 || weight.dim() == 4, "FP8 linear requires a 2D or packed 4D weight.");
+    sizes.back() = weight.dim() == 4 ? weight.size(0) * weight.size(3) : weight.size(0);
+    return at::empty(sizes, act.options().dtype(output_dtype));
+  }
   // TODO: refine here to use tensor ptr and in below dispatch api.
   std::tuple<at::Tensor, at::Tensor> quant_act = act.scalar_type() == at::ScalarType::BFloat16
                                                      ? _quantize_fp8e4m3_vec(act, channelwise, act_scales)
