@@ -73,6 +73,14 @@ _SPLIT_OCCUPANCY_MULTIPLIER = 8
 _MAX_KV_SPLITS = 64
 
 
+def _prepack_fp8_heads(weight: torch.Tensor) -> torch.Tensor:
+    """Prepack per-head FP8 weights (heads, out, in) for the FP8 x FP8 bmm."""
+    unit_scales = torch.ones(weight.size(1), weight.size(2) // 128)
+    return torch.stack(
+        [torch.ops._C.float8_linear_prepack_cpu(w, unit_scales)[0] for w in weight]
+    )
+
+
 def _block_quant_to_tensor_quant(
     weight: torch.Tensor,  # FP8 [N, K] block-quantized weight
     weight_scale: torch.Tensor,  # [ceil(N/bn), ceil(K/bk)] block scales
@@ -436,6 +444,19 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
         #   de-absorb: out(N,B,V)     = attn_out(N,B,L) @ w_uv_for_bmm(N,V,L)^T
         w_uk_for_bmm = w_uk.permute(1, 0, 2).contiguous()  # (N, L, P)
         w_uv_for_bmm = w_uv.permute(1, 2, 0).contiguous()  # (N, V, L)
+        if (
+            self._w_scale is not None
+            and envs.VLLM_CPU_FP8_MLA_BMM_W8A8
+            and ops.cpu_has_amx_fp8()
+            and self.kv_lora_rank % 128 == 0
+            and self.qk_nope_head_dim % 128 == 0
+            and self.v_head_dim % 32 == 0
+        ):
+            # FP8 x FP8 bmm: the weight stays per-tensor quantized, only the
+            # layout changes; bmm_cpu quantizes the activations per row.
+            self._w_uk_packed = _prepack_fp8_heads(w_uk_for_bmm)
+            self._w_uv_packed = _prepack_fp8_heads(w_uv_for_bmm)
+            return
         self._w_uk_packed = torch.ops._C.convert_weight_packed(w_uk_for_bmm)
         self._w_uv_packed = torch.ops._C.convert_weight_packed(w_uv_for_bmm)
 

@@ -88,6 +88,30 @@ def test_bmm_cpu_matches_torch_bmm():
     torch.testing.assert_close(out_vnni, ref, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.skipif(not ops.cpu_has_amx_fp8(), reason="requires AMX-FP8")
+@pytest.mark.parametrize("n,b,p,l", [(8, 1, 128, 64), (4, 40, 512, 128)])  # noqa: E741
+def test_bmm_cpu_fp8_w8a8_matches_reference(n, b, p, l):  # noqa: E741
+    """FP8 x FP8 bmm with a per-tensor weight scale and per-row activation
+    quantization, against dequantized torch ops."""
+    set_random_seed(0)
+    mat1 = torch.randn(n, b, p, dtype=DTYPE)
+    weight = (torch.randn(n, l, p) * 0.1).to(torch.float8_e4m3fn)
+    w_scale = torch.tensor(0.02, dtype=torch.float32)  # 0-dim, as in AMXMLAImpl
+
+    unit_scales = torch.ones(l, p // 128)
+    packed = torch.stack(
+        [torch.ops._C.float8_linear_prepack_cpu(w, unit_scales)[0] for w in weight]
+    )
+    out = torch.empty(n, b, l, dtype=DTYPE)
+    ops.bmm_cpu(out, mat1, packed, True, w_scale)
+
+    q, s = torch.ops._C.quantize_fp8e4m3_vec(mat1.reshape(-1, p), True, None)
+    a_dq = (q.float() * s.float().view(-1, 1)).view(n, b, p)
+    ref = torch.bmm(a_dq, weight.float().transpose(1, 2) * w_scale)
+    rel_err = (out.float() - ref).norm() / ref.norm()
+    assert rel_err < 2e-2, f"relative error {rel_err:.4f}"
+
+
 def test_concat_and_cache_mla_round_trip():
     set_random_seed(0)
     num_tokens = 37

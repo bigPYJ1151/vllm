@@ -275,6 +275,16 @@ extern void decode_attention_cpu(
     std::optional<at::Tensor> sinks);
 
 
+// The absorbed W_UK / W_UV weights are [heads, out, in], or the FP8 W8A8 prepack
+// [heads, out / BLOCK_N, in / BLOCK_K, BLOCK_K, BLOCK_N].
+static inline int64_t bmm_weight_out_dim(const at::Tensor& w) {
+  return w.dim() == 5 ? w.size(1) * block_size_n() : w.size(1);
+}
+
+static inline int64_t bmm_weight_in_dim(const at::Tensor& w) {
+  return w.dim() == 5 ? w.size(2) * BLOCK_K : w.size(2);
+}
+
 // stage 4 and 5 of the front end: absorb W_UK into the nope part of the query, rotate the rope parts.
 // qb: [num_seqs, num_heads * qk_head_dim] q_b_proj output; q_input/k_input are filled in place.
 static void absorb_and_rope(
@@ -360,7 +370,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
   CHECK_EQ(positions.scalar_type(), at::kLong);
   CHECK_EQ(cos_sin_cache.scalar_type(), st);
   CHECK_DIM(2, hidden_states);
-  CHECK_DIM(3, w_kc);
+  TORCH_CHECK(w_kc.dim() == 3 || w_kc.dim() == 5, "w_kc must be 3D or the 5D FP8 prepack.");
   CHECK_DIM(1, q_a_layernorm_weight);
   CHECK_DIM(1, kv_a_layernorm_weight);
   CHECK_DIM(1, positions);
@@ -370,7 +380,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
   const int64_t hidden_size = hidden_states.size(1);
   const int64_t num_heads = w_kc.size(0);
   const int64_t qk_head_dim = q_b_proj_weight.size(0) / num_heads;
-  const int64_t qk_nope_head_dim = w_kc.size(2);
+  const int64_t qk_nope_head_dim = bmm_weight_in_dim(w_kc);
   const int64_t rotary_dim = cos_sin_cache.size(1);
   const int64_t kv_dim = kv_lora_rank + qk_rope_head_dim;
   const int64_t block_size_N = block_size.value()[0];
@@ -378,7 +388,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
 
   CHECK_EQ(qkv_a_proj_weight.size(0), q_lora_rank + kv_dim);
   CHECK_EQ(qkv_a_proj_weight.size(1), hidden_size);
-  CHECK_EQ(w_kc.size(1), kv_lora_rank);
+  CHECK_EQ(bmm_weight_out_dim(w_kc), kv_lora_rank);
   CHECK_EQ(positions.numel(), num_seqs);
   CHECK_EQ(rotary_dim, qk_rope_head_dim);
   CHECK_EQ(q_a_layernorm_weight.numel(), q_lora_rank);
@@ -484,7 +494,7 @@ void mla_decode_fused_cpu(
     at::Tensor& out) {
   const int64_t num_seqs = hidden_states.size(0);
   const int64_t num_heads = w_kc.size(0);
-  const int64_t v_head_dim = w_vc.size(1);
+  const int64_t v_head_dim = bmm_weight_out_dim(w_vc);
   const int64_t kv_dim = kv_lora_rank + qk_rope_head_dim;
   CHECK_EQ(slot_mapping.numel(), num_seqs);
   CHECK_EQ(out.size(0), num_seqs);
@@ -639,7 +649,7 @@ static std::tuple<at::Tensor, at::Tensor> mla_front_end(
 
   const auto st = hidden_states.scalar_type();
   const int64_t num_heads = w_kc.size(0);
-  const int64_t qk_nope_head_dim = w_kc.size(2);
+  const int64_t qk_nope_head_dim = bmm_weight_in_dim(w_kc);
   const int64_t kv_dim = kv_lora_rank + qk_rope_head_dim;
   const auto options = hidden_states.options();
 
@@ -713,7 +723,7 @@ void mla_layer_cpu(
     int64_t max_w8a16_tokens) {
   const int64_t num_tokens = hidden_states.size(0);
   const int64_t num_heads = w_kc.size(0);
-  const int64_t v_head_dim = w_vc.size(1);
+  const int64_t v_head_dim = bmm_weight_out_dim(w_vc);
   const int64_t kv_dim = kv_lora_rank + qk_rope_head_dim;
   TORCH_CHECK(scalars.scalar_type() == at::kLong && scalars.numel() >= 4, "mla_layer_cpu: bad scalars.");
   const int64_t* sc = scalars.data_ptr<int64_t>();

@@ -18,7 +18,6 @@ void bmm_fp8_w8a8(
   CHECK_DIM(3, input);
   CHECK_DIM(3, out);
   CHECK_DIM(5, weight);
-  CHECK_DIM(4, scales);
   CHECK_EQ(input.scalar_type(), at::kBFloat16);
   CHECK_EQ(out.scalar_type(), at::kBFloat16);
   CHECK_EQ(weight.scalar_type(), at::kFloat8_e4m3fn);
@@ -36,7 +35,10 @@ void bmm_fp8_w8a8(
   TORCH_CHECK(
       weight.size(0) == B && weight.size(3) == BLOCK_K && weight.size(4) == BN && KB * BLOCK_K == K,
       "FP8 W8A8 bmm weight shape mismatch.");
-  TORCH_CHECK(scales.sizes() == at::IntArrayRef({B, NB, KB, BN}), "FP8 W8A8 bmm scale shape mismatch.");
+  // a single scale (per-tensor quantized weights) or one scale per output column and K block
+  const bool per_tensor = scales.numel() == 1;
+  TORCH_CHECK(
+      per_tensor || scales.sizes() == at::IntArrayRef({B, NB, KB, BN}), "FP8 W8A8 bmm scale shape mismatch.");
   TORCH_CHECK(out.sizes() == at::IntArrayRef({B, M, N}), "FP8 W8A8 bmm output shape mismatch.");
   if (M == 0) {
     return;
@@ -59,6 +61,10 @@ void bmm_fp8_w8a8(
   at::parallel_for(0, B * MB * NB, 0, [&](int64_t begin, int64_t end) {
     alignas(64) float C[BM * BN];
     alignas(64) float ukernel[BM * BN];
+    alignas(64) float tensor_scale[BN];
+    if (per_tensor) {
+      std::fill_n(tensor_scale, BN, *Ws);
+    }
     for (int64_t i = begin; i < end; ++i) {
       const int64_t bs = i / (MB * NB);
       const int64_t mb = (i / NB) % MB;
@@ -71,7 +77,7 @@ void bmm_fp8_w8a8(
             Aq + (bs * M + mb * BM) * K + kb * BLOCK_K,
             As + bs * M + mb * BM,
             W + bs * N * K + (nb * KB + kb) * BN * BLOCK_K,
-            Ws + bs * N * KB + (nb * KB + kb) * BN,
+            per_tensor ? tensor_scale : Ws + bs * N * KB + (nb * KB + kb) * BN,
             rows,
             BLOCK_K,
             K,

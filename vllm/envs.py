@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
     VLLM_CPU_INT4_W4A8: bool = True
     VLLM_CPU_FP8_MOE_FULL_W8A8: bool = False
+    VLLM_CPU_FP8_MLA_BMM_W8A8: bool = False
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
@@ -945,6 +946,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in FP8 (activations quantized per token) instead of BF16 x FP8.
     "VLLM_CPU_FP8_MOE_FULL_W8A8": lambda: bool(
         int(os.getenv("VLLM_CPU_FP8_MOE_FULL_W8A8", "0"))
+    ),
+    # (CPU backend only) whether the MLA absorb/de-absorb bmm of FP8
+    # checkpoints runs FP8 x FP8 (activations quantized per row) instead of
+    # BF16 x FP8.
+    "VLLM_CPU_FP8_MLA_BMM_W8A8": lambda: bool(
+        int(os.getenv("VLLM_CPU_FP8_MLA_BMM_W8A8", "0"))
     ),
     # Using a flag to control microbatch on XPU device, users on XPU device can
     # decide to disable it when they needed.
