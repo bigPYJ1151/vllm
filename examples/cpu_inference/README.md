@@ -178,16 +178,17 @@ bash qwen3.5-35b-a3b.sh latency fp8
 bash gemma4-26b-a4b.sh latency
 bash deepseek-r1.sh latency
 
-# TP=4: throughput (BS=30 for Llama, BS=25 for the others)
-bash llama3.1-8b.sh throughput bf16
-bash llama3.1-8b.sh throughput fp16
-bash llama3.1-8b.sh throughput int8
-bash llama3.1-8b.sh throughput fp8
-bash qwen3.5-9b.sh throughput
-bash qwen3.5-35b-a3b.sh throughput bf16
-bash qwen3.5-35b-a3b.sh throughput fp8
-bash gemma4-26b-a4b.sh throughput
-bash deepseek-r1.sh throughput
+# TP=4: throughput (BS=30 for Llama, BS=25 for the others), disabled by default;
+# the DP=4 runs below are the throughput reference
+# bash llama3.1-8b.sh throughput bf16
+# bash llama3.1-8b.sh throughput fp16
+# bash llama3.1-8b.sh throughput int8
+# bash llama3.1-8b.sh throughput fp8
+# bash qwen3.5-9b.sh throughput
+# bash qwen3.5-35b-a3b.sh throughput bf16
+# bash qwen3.5-35b-a3b.sh throughput fp8
+# bash gemma4-26b-a4b.sh throughput
+# bash deepseek-r1.sh throughput
 
 # TP=4: MMLU 5-shot (40 questions per subject, 2280 questions)
 bash llama3.1-8b.sh acc bf16
