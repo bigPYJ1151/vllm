@@ -699,7 +699,7 @@ def convert_to_fp8_moe_kernel_format(
         )
 
         w13, w13_scale, w2, w2_scale = prepare_fp8_w8a8_moe_layer_for_cpu(
-            w13, w2, w13_scale, w2_scale
+            w13, w2, w13_scale, w2_scale, envs.VLLM_CPU_FP8_MOE_FULL_W8A8
         )
     else:
         if fp8_backend not in [

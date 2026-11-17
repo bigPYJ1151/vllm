@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_CPU_ATTN_DIRECT: bool = False
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
     VLLM_CPU_INT4_W4A8: bool = True
+    VLLM_CPU_FP8_MOE_FULL_W8A8: bool = False
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
@@ -940,6 +941,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ, and
     # on Zen CPUs whether to serve int4 checkpoints as DA8W4 rather than W4A16.
     "VLLM_CPU_INT4_W4A8": lambda: bool(int(os.getenv("VLLM_CPU_INT4_W4A8", "1"))),
+    # (CPU backend only) whether the FP8 W8A8 MoE also runs the down projection
+    # in FP8 (activations quantized per token) instead of BF16 x FP8.
+    "VLLM_CPU_FP8_MOE_FULL_W8A8": lambda: bool(
+        int(os.getenv("VLLM_CPU_FP8_MOE_FULL_W8A8", "0"))
+    ),
     # Using a flag to control microbatch on XPU device, users on XPU device can
     # decide to disable it when they needed.
     "VLLM_XPU_PP_MICROBATCH": lambda: bool(

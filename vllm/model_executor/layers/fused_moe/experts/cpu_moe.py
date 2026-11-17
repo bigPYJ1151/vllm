@@ -1777,8 +1777,13 @@ def prepare_fp8_w8a8_moe_layer_for_cpu(
     w2: torch.Tensor,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    full_w8a8: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepack FP8 W8A8 MoE weights for CPU kernel."""
+    """Prepack FP8 W8A8 MoE weights for CPU kernel.
+
+    With `full_w8a8` the down projection is prepacked for FP8 x FP8 as well
+    (w2 gets the 5D layout of w13), otherwise it stays on the W8A16 path.
+    """
     E = w13.size(0)
 
     packed_w13_list = []
@@ -1801,6 +1806,28 @@ def prepare_fp8_w8a8_moe_layer_for_cpu(
 
     packed_w13 = torch.stack(packed_w13_list)
     packed_w13_scale = torch.stack(packed_w13_scale_list)
+
+    if full_w8a8:
+        # w2 runs FP8 x FP8 too: same per-expert prepack, scales per output row
+        packed_w2_list = []
+        packed_w2_scale_list = []
+        for i in range(E):
+            ws_exp = w2_scale[i]  # [K/128, N/128]
+            if ws_exp.size(0) < w2[i].size(0):
+                ws_exp = torch.repeat_interleave(
+                    ws_exp, w2[i].size(0) // ws_exp.size(0), dim=0
+                )
+            pw, ps = torch.ops._C.float8_linear_prepack_cpu(
+                w2[i], ws_exp.contiguous()
+            )
+            packed_w2_list.append(pw)
+            packed_w2_scale_list.append(ps)
+        return (
+            packed_w13,
+            packed_w13_scale,
+            torch.stack(packed_w2_list),
+            torch.stack(packed_w2_scale_list),
+        )
 
     # w2 uses the W8A16 path (BF16 activation × FP8 weight), VNNI packed
     packed_w2 = torch.ops._C.convert_weight_packed(w2)
@@ -1959,7 +1986,12 @@ class CPUExpertsFp8W8A8(mk.FusedMoEExpertsModular):
         x_fp8, x_scales = torch.ops._C.quantize_fp8e4m3_vec(
             hidden_states_2d, True, None
         )
-
+        # a 5D w2 is the FP8 x FP8 prepack (VLLM_CPU_FP8_MOE_FULL_W8A8)
+        moe_comp_method = (
+            CPUQuantMethod.FP8_W8A8_FULL
+            if w2.dim() == 5
+            else CPUQuantMethod.FP8_W8A8
+        )
         fused_experts_cpu(
             output,
             x_fp8,
@@ -1967,7 +1999,7 @@ class CPUExpertsFp8W8A8(mk.FusedMoEExpertsModular):
             w2,
             topk_weights,
             topk_ids,
-            CPUQuantMethod.FP8_W8A8,
+            moe_comp_method,
             self.w1_scale,  # w1_scale
             self.w2_scale,  # w2_scale
             None,  # w1_zero

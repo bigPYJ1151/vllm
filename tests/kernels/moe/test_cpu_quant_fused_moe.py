@@ -327,7 +327,97 @@ def test_w8a16_block_fp8_cpu_fused_moe_small_expert_blocks():
 
 
 # ===========================================================================
-# MXFP4 W4A16 MoE
+# FP8 W8A8 MoE (down projection in FP8 too)
+# ===========================================================================
+
+
+def _fp8_prepack_experts(
+    w: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepack expert weights for FP8 x FP8 with one scale row per output row."""
+    packed, packed_scales = [], []
+    for w_e, s_e in zip(w, scales):
+        s_rows = s_e.repeat_interleave(BLOCK_SIZE[0], dim=0).contiguous()
+        pw, ps = torch.ops._C.float8_linear_prepack_cpu(w_e, s_rows)
+        packed.append(pw)
+        packed_scales.append(ps)
+    return torch.stack(packed), torch.stack(packed_scales)
+
+
+def _quant_dequant_rows(x: torch.Tensor) -> torch.Tensor:
+    """Per-token FP8 quantize and dequantize, as the kernel does it."""
+    q, s = torch.ops._C.quantize_fp8e4m3_vec(x.bfloat16().contiguous(), True, None)
+    return q.float() * s.float().view(-1, 1)
+
+
+def ref_w8a8_block_fp8_moe(
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_s: torch.Tensor,
+    w2_s: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Reference FP8 W8A8 fused MoE: activations are per-token FP8 quantized."""
+    B, D = a.shape
+    topk = topk_ids.size(1)
+    w1_dq = _block_dequant_weight(w1, w1_s, BLOCK_SIZE)
+    w2_dq = _block_dequant_weight(w2, w2_s, BLOCK_SIZE)
+    a_exp = _quant_dequant_rows(a).view(B, 1, D).repeat(1, topk, 1).view(-1, D)
+    out = torch.zeros(B * topk, w2_dq.shape[1])
+    topk_ids_flat = topk_ids.view(-1)
+    for i in range(w1_dq.shape[0]):
+        mask = topk_ids_flat == i
+        if mask.any():
+            ic1 = _silu_and_mul(a_exp[mask] @ w1_dq[i].T)
+            out[mask] = _quant_dequant_rows(ic1) @ w2_dq[i].T
+    out = out.view(B, topk, -1) * topk_weight.view(B, topk, 1)
+    return out.sum(dim=1).to(a.dtype)
+
+
+@pytest.mark.skipif(not ops.cpu_has_amx_fp8(), reason="requires AMX-FP8")
+@pytest.mark.parametrize("M", [1, 2, 64, 121])
+@pytest.mark.parametrize(
+    "N,K,E,topk", [(256, 512, 8, 2), (512, 256, 8, 4), (768, 2048, 8, 4)]
+)
+def test_w8a8_full_block_fp8_cpu_fused_moe(M, N, K, E, topk):
+    """FP8_W8A8_FULL matches a reference with FP8-quantized activations."""
+    set_random_seed(0)
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+    w1, w2, w1_s, w2_s = _make_fp8_moe_weights(E, N, K, BLOCK_SIZE)
+    score = torch.softmax(torch.randn(M, E), dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+    topk_ids = topk_ids.to(torch.int32)
+
+    ref_out = ref_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids)
+
+    pw1, pw1_s = _fp8_prepack_experts(w1, w1_s)
+    pw2, pw2_s = _fp8_prepack_experts(w2, w2_s)
+    a_q, a_s = torch.ops._C.quantize_fp8e4m3_vec(a, True, None)
+    out = torch.empty_like(a)
+    ops.fused_experts_cpu(
+        out,
+        a_q,
+        pw1,
+        pw2,
+        topk_weight,
+        topk_ids,
+        ops.CPUQuantMethod.FP8_W8A8_FULL,
+        pw1_s,
+        pw2_s,
+        None,
+        None,
+        BLOCK_SIZE,
+        is_vnni=True,
+        a1_scale=a_s,
+    )
+
+    # FP8 rounding of the intermediate activations differs by a few percent
+    rel_err = (out.float() - ref_out.float()).norm() / ref_out.float().norm()
+    assert rel_err < 5e-2, f"relative error {rel_err:.4f}"
+
 # ===========================================================================
 
 

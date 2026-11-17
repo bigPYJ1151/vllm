@@ -3504,7 +3504,7 @@ class CPUQuantMethod(IntEnum):
     INT4_W4A8 = 3
     MXFP4 = 4
     FP8_W8A8 = 5
-
+    FP8_W8A8_FULL = 6
 
 if hasattr(torch.ops._C, "dynamic_4bit_int_moe"):
 
