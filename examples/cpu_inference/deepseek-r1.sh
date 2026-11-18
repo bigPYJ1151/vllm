@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# DeepSeek-R1 on CPU: latency (BS=1), throughput (BS=25) and MMLU.
+# DeepSeek-R1 on CPU: latency (BS=1), throughput (BS=96) and MMLU.
 # usage: bash deepseek-r1.sh <latency|throughput|acc> [fp8]
 
 source "$(dirname "$0")/common.sh"
@@ -19,4 +19,4 @@ fp8) MODEL=deepseek-ai/DeepSeek-R1 EXTRA=(--dtype bfloat16) ;;
 esac
 
 KV_KIB_PER_TOKEN=${KV_KIB_PER_TOKEN-73}
-main "$MODE" "deepseek-r1_${PRECISION}" "$MODEL" 25 "${EXTRA[@]}"
+main "$MODE" "deepseek-r1_${PRECISION}" "$MODEL" 96 "${EXTRA[@]}"
