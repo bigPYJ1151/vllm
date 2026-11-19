@@ -319,17 +319,26 @@ def test_mla(vllm_runner: type[VllmRunner], example_prompts: list[str]) -> None:
 
 
 @multi_gpu_test(num_gpus=2)
+@pytest.mark.parametrize(
+    "model",
+    [
+        "meta-llama/Llama-3.2-1B-Instruct",
+        # Fused qkv_proj sliced with global offsets in the forward
+        "microsoft/Phi-4-mini-instruct",
+    ],
+)
 def test_distributed(
     hf_runner: type[HfRunner],
     vllm_runner: type[VllmRunner],
     example_prompts,
+    model: str,
 ):
     kwargs = {"model_impl": "transformers", "tensor_parallel_size": 2}
     check_implementation(
         hf_runner,
         vllm_runner,
         example_prompts,
-        "meta-llama/Llama-3.2-1B-Instruct",
+        model,
         kwargs_test=kwargs,
     )
 
