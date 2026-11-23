@@ -37,7 +37,7 @@ docker run --rm -it --privileged --net host --shm-size 64g --entrypoint bash \
 ```
 
 `--privileged` and `--net host` are what the reference runs used; add
-`-e HF_TOKEN=<token>` for gated models (for example `Intel/llama-3.1-8b-instruct-fp8`).
+`-e HF_TOKEN=<token>` for gated models (for example `meta-llama/Llama-3.1-8B-Instruct` and `Intel/llama-3.1-8b-instruct-fp8`).
 Models are downloaded on first use, so keep only the checkpoint under test on
 disk when space is tight (DeepSeek-R1 alone needs about 650 GB).
 
