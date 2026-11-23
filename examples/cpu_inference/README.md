@@ -71,7 +71,7 @@ bash qwen3.5-35b-a3b.sh acc fp8
 | Mode | Command | Reports |
 |---|---|---|
 | `latency` | `vllm bench one-batch`, batch size 1 | prefill latency, median decode step latency, total latency |
-| `throughput` | `vllm bench one-batch`, batch size 30 (Llama), 96 (DeepSeek-R1) or 25 (others); with `DP=<n>`, `n` instances at that batch size | the same, plus decode and overall tokens/s (summed over the instances with `DP`) |
+| `throughput` | `vllm bench one-batch`, batch size 30 (Llama) or 25 (others); with `DP=<n>`, `n` instances at that batch size | the same, plus decode and overall tokens/s (summed over the instances with `DP`) |
 | `acc` | `vllm serve` + MMLU 5-shot client | average accuracy |
 
 `vllm bench one-batch` builds one static batch (1024 input and 1024 output
@@ -108,7 +108,7 @@ Per host, the scripts pick the binding that the reference runs used:
 |---|---|---|
 | `OUTPUT_DIR` | `./cpu_inference_results` | Logs and JSON results |
 | `INPUT_TOKEN` / `OUTPUT_TOKEN` | 1024 / 1024 | Prompt and generation length (latency, throughput) |
-| `BATCH_SIZE` | 1 (latency), 30, 96 (DeepSeek-R1) or 25 (throughput) | Batch size |
+| `BATCH_SIZE` | 1 (latency), 30 or 25 (throughput) | Batch size |
 | `TP` | detected | Tensor-parallel size (exclusive with `DP`) |
 | `DP` | unset | Data-parallel instances for `throughput` (see below; exclusive with `TP`) |
 | `KV_KIB_PER_TOKEN` | per model | KV cache bytes per token and rank, in KiB; sizes the KV cache (see below) |
@@ -179,8 +179,7 @@ bash gemma4-26b-a4b.sh latency
 bash deepseek-r1.sh latency
 
 # TP=4: throughput (BS=30 for Llama, BS=25 for the others), disabled by default;
-# the DP=4 runs below are the throughput reference (DeepSeek-R1 cannot use DP,
-# so its TP=4 BS=96 run is in that group)
+# the DP=4 runs below are the throughput reference
 # bash llama3.1-8b.sh throughput bf16
 # bash llama3.1-8b.sh throughput fp16
 # bash llama3.1-8b.sh throughput int8
@@ -189,6 +188,7 @@ bash deepseek-r1.sh latency
 # bash qwen3.5-35b-a3b.sh throughput bf16
 # bash qwen3.5-35b-a3b.sh throughput fp8
 # bash gemma4-26b-a4b.sh throughput
+# bash deepseek-r1.sh throughput
 
 # TP=4: MMLU 5-shot (40 questions per subject, 2280 questions)
 bash llama3.1-8b.sh acc bf16
@@ -213,10 +213,10 @@ BATCH_SIZE=320 bash qwen3.5-35b-a3b.sh throughput bf16
 BATCH_SIZE=320 bash qwen3.5-35b-a3b.sh throughput fp8
 BATCH_SIZE=96 bash gemma4-26b-a4b.sh throughput
 
-# DeepSeek-R1 needs all dies: TP=4 with BS=96 (the default batch size)
+# DeepSeek-R1 needs all dies, so it runs TP=4 with a larger batch instead of DP
 unset DP
 export TP=4
-bash deepseek-r1.sh throughput
+BATCH_SIZE=96 bash deepseek-r1.sh throughput
 ```
 
 Expected MMLU (2280-question subset): about 0.68–0.69 for every Llama variant,
