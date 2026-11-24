@@ -969,6 +969,35 @@ if not is_torch_equal_or_newer("2.16.0.dev"):
     _patch_inductor_pattern_matcher()
 
 # ============================================================
+# torch.library teardown lookup of deregistered ops
+# ============================================================
+# The JIT operator registry keys ops by a signature that ignores overload
+# names and alias annotations, so when two overloads share it (e.g.
+# vllm_ir::fused_add_rms_norm and its maybe_inplace overload), deregistering
+# them leaves a stale entry behind. torch.library._clear_torch_ops_cache runs
+# when a Library is destroyed (at interpreter exit for vLLM's libraries) and
+# uses hasattr() on the torch.ops namespace, which falls through to a JIT
+# lookup that hits the stale entry. That reads the freed op name and prints a
+# spurious UnicodeDecodeError traceback at exit. Only clear packets that are
+# actually cached on the namespace, which never triggers a lookup.
+
+
+def _clear_cached_torch_ops(op_defs):
+    for qualname in op_defs:
+        ns, name_with_overload = qualname.split("::")
+        name = name_with_overload.split(".")[0]
+        namespace = vars(torch.ops).get(ns)
+        if namespace is None or name not in vars(namespace):
+            continue
+        delattr(namespace, name)
+        if name in namespace._dir:
+            namespace._dir.remove(name)
+
+
+if hasattr(torch.library, "_clear_torch_ops_cache"):
+    torch.library._clear_torch_ops_cache = _clear_cached_torch_ops
+
+# ============================================================
 # Triton Autotuner determinism
 # ============================================================
 # Replace the Autotuner.run so it always pick the first running configuration.
